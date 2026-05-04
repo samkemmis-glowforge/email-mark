@@ -25,7 +25,7 @@ from dotenv import find_dotenv, load_dotenv  # noqa: E402
 from slack_bolt import App  # noqa: E402
 from slack_bolt.adapter.socket_mode import SocketModeHandler  # noqa: E402
 
-from email_mark.content import generate  # noqa: E402
+from email_mark.agent import chat  # noqa: E402
 
 load_dotenv(find_dotenv())
 logging.basicConfig(level=logging.INFO)
@@ -36,23 +36,7 @@ app = App(
 )
 
 
-SYSTEM_PROMPT = (
-    "You are an AI assistant for the Glowforge marketing team, available "
-    "in Slack. You help with lifecycle marketing tasks: drafting emails, "
-    "proposing audiences, exploring data, and answering questions about "
-    "marketing strategy. Keep responses friendly and concise; use Slack-style "
-    "formatting (no Markdown headers, light use of *bold*). You are early in "
-    "development — you do not yet have direct access to HubSpot or the "
-    "data warehouse, but you can help draft content and reason about plans."
-)
-
-
 _MENTION_RE = re.compile(r"<@[^>]+>\s*")
-
-
-def _ask_claude(user_message: str) -> str:
-    prompt = f"{SYSTEM_PROMPT}\n\nUser: {user_message}\n\nAssistant:"
-    return generate(prompt)
 
 
 @app.event("app_mention")
@@ -61,7 +45,7 @@ def handle_mention(event, say):
     if not text:
         say("Hi! Tag me with a question or request and I'll do my best.")
         return
-    say(_ask_claude(text))
+    say(chat(text))
 
 
 @app.event("message")
@@ -74,7 +58,7 @@ def handle_dm(event, say):
     text = (event.get("text") or "").strip()
     if not text:
         return
-    say(_ask_claude(text))
+    say(chat(text))
 
 
 def main() -> None:
