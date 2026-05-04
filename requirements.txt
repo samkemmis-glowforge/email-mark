@@ -4,5 +4,11 @@
 # Anthropic Claude SDK — content generation
 anthropic>=0.40.0
 
+# Slack Bolt — Slack app framework (Socket Mode for now)
+slack-bolt>=1.18.0
+
+# HubSpot — REST API via plain HTTP
+requests>=2.31.0
+
 # Loads environment variables from .env
 python-dotenv>=1.0.0
