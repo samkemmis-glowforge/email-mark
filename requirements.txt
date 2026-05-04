@@ -1,14 +1,8 @@
-# Glowforge Lifecycle Marketing Engine — Python dependencies
+# Python dependencies for email-mark.
+# We'll add packages as we wire up new connectors.
 
 # Anthropic Claude SDK — content generation
 anthropic>=0.40.0
 
-# Google BigQuery — warehouse audience queries
-google-cloud-bigquery>=3.20.0
-pandas>=2.0.0
-
-# HubSpot — REST API (using requests rather than the official SDK for flexibility)
-requests>=2.31.0
-
-# Environment variable loading from .env
+# Loads environment variables from .env
 python-dotenv>=1.0.0

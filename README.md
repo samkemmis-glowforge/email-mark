@@ -1,20 +1,30 @@
 # email-mark
 
-Lifecycle Marketing Engine — a custom layer between Glowforge's BigQuery warehouse and HubSpot. It defines audiences from warehouse signals, generates personalized email content with the Claude API, and pushes audience + content into HubSpot for sending, A/B testing, and measurement.
+A general email marketing engine for Glowforge. It connects three tools — BigQuery (warehouse audiences), the Claude API (content generation), and HubSpot (sending) — and lets you define and run programs that combine them.
 
-See [docs/concept.md](docs/concept.md) for the full project concept, architecture, and roadmap.
+The longer-term vision lives in [docs/concept.md](docs/concept.md). It's aspirational; the README describes what's actually built.
 
 ## Status
 
-Early scaffolding. Concept committed; project structure in place; code not yet written.
+Scaffolding only. Folders and config in place; no code yet.
+
+## Architecture
+
+Three tool connectors form the foundation:
+
+- **BigQuery client** — run audience queries, get back rows of users + signals.
+- **Claude client** — fill a prompt template with row data, get back generated content.
+- **HubSpot client** — push lists and content into HubSpot for sending.
+
+Programs (whatever they end up being — activation, conversion, save, etc.) are thin glue on top of these three.
 
 ## Project structure
 
-- `src/email_mark/` — Python package (BigQuery, Claude, and HubSpot clients live here)
-- `queries/` — SQL files for warehouse audience queries
-- `prompts/` — Claude prompt templates for content generation
-- `scripts/` — Entrypoint scripts run by the scheduler
-- `docs/` — Design notes and concept documents
+- `src/email_mark/` — Python package (the connectors live here)
+- `queries/` — SQL files for warehouse queries
+- `prompts/` — Claude prompt templates
+- `scripts/` — entrypoint scripts (run from CLI or scheduler)
+- `docs/` — design notes
 
 ## Setup
 
@@ -25,9 +35,3 @@ Early scaffolding. Concept committed; project structure in place; code not yet w
    source .venv/bin/activate
    pip install -r requirements.txt
    ```
-
-## Initial programs
-
-1. **Activation sequence** — triggered on first print, lifts activation rate.
-2. **Premium conversion** — targets active non-subscribers, lifts paid conversion.
-3. **Save campaign** — targets churn-signal subscribers, reduces churn.
