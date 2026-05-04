@@ -1,0 +1,39 @@
+# Secrets — never commit
+.env
+.env.local
+.env.*.local
+*.pem
+service-account*.json
+gcp-key*.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+
+# Local data / scratch
+scratch/
+data/local/
