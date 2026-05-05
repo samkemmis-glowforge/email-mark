@@ -1,8 +1,8 @@
 """Tool-using agent loop.
 
 Runs a multi-turn conversation with Claude where Claude can call tools
-to look things up in HubSpot (and eventually BigQuery, etc.) before
-producing a final text response.
+to look things up in HubSpot (and eventually BigQuery, etc.) and to
+take actions like creating draft emails.
 
 Public entrypoint:
     chat(user_message: str) -> str
@@ -12,20 +12,31 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from anthropic import Anthropic
 from dotenv import find_dotenv, load_dotenv
 
 from email_mark.hubspot_marketing import (
+    clone_marketing_email,
     get_email_statistics,
     list_marketing_emails,
+    update_email_body,
+    update_marketing_email,
 )
 
 load_dotenv(find_dotenv())
 
 MODEL = "claude-sonnet-4-5"
 MAX_AGENT_TURNS = 10  # Hard cap so a runaway loop can't burn through tokens.
+HUBSPOT_PORTAL_ID = "8614495"  # Glowforge HubSpot portal — used for UI URLs.
+
+# Conversation memory. Keyed by an external conversation_id (e.g., Slack
+# channel for DMs, thread_ts for channel mentions). In-memory only — wipes
+# on bot restart. Move to a persistent store (sqlite/redis) when needed.
+_conversations: Dict[str, List[Dict[str, Any]]] = {}
+MAX_CONVERSATION_MESSAGES = 60  # Cap to keep token usage bounded.
 
 _client: Optional[Anthropic] = None
 
@@ -37,28 +48,81 @@ def _get_client() -> Anthropic:
     return _client
 
 
-SYSTEM_PROMPT = """You are an AI coworker for the Glowforge marketing team, available in Slack.
+# ---------------------------------------------------------------------------
+# Brand-voice loading: an optional file at prompts/brand_voice.md gets
+# injected into the system prompt at startup.
+# ---------------------------------------------------------------------------
+
+
+def _load_brand_voice() -> str:
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    voice_file = repo_root / "prompts" / "brand_voice.md"
+    if not voice_file.exists():
+        return ""
+    text = voice_file.read_text().strip()
+    if not text:
+        return ""
+    return text
+
+
+_BRAND_VOICE = _load_brand_voice()
+
+
+def _brand_voice_section() -> str:
+    if not _BRAND_VOICE:
+        return ""
+    return (
+        "\n\nBrand voice and tone — apply these to ALL drafted email content:\n\n"
+        + _BRAND_VOICE
+    )
+
+
+SYSTEM_PROMPT = (
+    """You are an AI coworker for the Glowforge marketing team, available in Slack.
 
 You help with lifecycle marketing tasks: drafting emails, exploring data, proposing
 audiences, and answering questions about marketing performance. Keep responses
 friendly and concise; use Slack-style formatting (no Markdown headers; light
 use of *bold*; bullet points are fine).
 
-You have tools to look up real data in HubSpot — use them when the user asks
-about specific campaigns, emails, or A/B test results rather than guessing or
-asking for screenshots. When you call a tool, summarize what came back in
-plain language, not raw JSON. If a tool returns no data or fails, say so
-clearly and suggest what to try.
+You have tools to look up real data in HubSpot and to create draft emails.
+Use them rather than guessing. When a tool returns data, summarize in plain
+language — never paste raw JSON.
 
-What you don't have yet (be honest about gaps):
+DRAFTING EMAILS — workflow:
+1. Write the subject + body in chat for the user to review.
+2. AFTER presenting drafts, ALWAYS proactively ask whether to create them
+   as drafts in HubSpot. Don't wait for the user to think to ask. Phrase it
+   like: "Want me to create these in HubSpot as drafts? If yes, which existing
+   email should I clone as the template?" If you have a sensible template
+   guess from prior context, suggest it.
+3. Iterate based on user feedback (tone, length, structure).
+4. Once the user gives explicit approval ("yes," "create them," "go ahead"),
+   call create_email_draft for each one — passing the FULL body_text you wrote
+   in chat (subject, name, AND body all go in one call).
+5. create_email_draft clones a template, updates the subject/name, and replaces
+   the largest body text widget with your body_text. Other template modules
+   (header image, CTA button, footer) carry over unchanged. Always share the
+   edit_url back so the user can review.
+6. The body_update field in the response tells you whether body replacement
+   succeeded. If it failed, surface that to the user honestly so they know
+   to paste the body manually.
+7. If you don't know which template to use, call search_marketing_emails to
+   suggest 2-3 candidates and let the user pick.
+
+What you DO NOT have yet (be honest about gaps):
 - Direct access to the BigQuery data warehouse (in progress)
-- The ability to send emails or create lists (read-only for now)
+- The ability to send emails or schedule sends (drafts only — final send stays in HubSpot UI)
 - Access to forum/community data
+- Direct contact-list creation (CRM read access via the official HubSpot connector
+  is available in Cowork, but not yet wired in here)
 """
+    + _brand_voice_section()
+)
 
 
 # ---------------------------------------------------------------------------
-# Tool definitions: schema for Claude + Python handler.
+# Tool implementations
 # ---------------------------------------------------------------------------
 
 
@@ -116,15 +180,66 @@ def _tool_get_marketing_email_stats(args: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _tool_create_email_draft(args: Dict[str, Any]) -> Dict[str, Any]:
+    template_id = str(args["template_email_id"])
+    name = args["draft_name"]
+    subject = args["subject"]
+    body_text = args.get("body_text", "").strip()
+
+    # Step 1: Clone the template
+    cloned = clone_marketing_email(template_id, name)
+    new_id = cloned.get("id")
+    if not new_id:
+        return {"error": "Clone succeeded but no ID was returned.", "raw": cloned}
+
+    # Step 2: Update name + subject
+    updated = update_marketing_email(str(new_id), subject=subject, name=name)
+
+    result: Dict[str, Any] = {
+        "draft_id": new_id,
+        "draft_name": updated.get("name", name),
+        "subject": updated.get("subject", subject),
+        "edit_url": (
+            f"https://app.hubspot.com/email/{HUBSPOT_PORTAL_ID}/edit/{new_id}/content"
+        ),
+    }
+
+    # Step 3: Best-effort body replacement
+    if body_text:
+        try:
+            body_result = update_email_body(str(new_id), body_text)
+            if "error" in body_result:
+                result["body_update"] = (
+                    f"FAILED — {body_result['error']}. The draft exists with the "
+                    "right subject; user will need to paste body content manually."
+                )
+            else:
+                result["body_update"] = (
+                    f"Body replaced in widget {body_result['updated_widget_id']}. "
+                    "Other template modules (header image, CTA button, footer) "
+                    "carried over from the template — review in HubSpot."
+                )
+        except Exception as exc:
+            result["body_update"] = (
+                f"FAILED with exception — {exc}. Draft exists with right subject; "
+                "user will need to paste body manually."
+            )
+    else:
+        result["body_update"] = (
+            "No body_text provided — body content carried over from the template."
+        )
+
+    return result
+
+
 TOOLS: List[Dict[str, Any]] = [
     {
         "name": "search_marketing_emails",
         "description": (
             "Search HubSpot marketing emails by name substring (case-insensitive). "
             "Returns matching emails with id, name, state, and subject line. "
-            "Use this first when the user asks about a specific campaign, email, "
-            "or A/B test by name. The official HubSpot connector cannot query "
-            "marketing emails — only this tool can."
+            "Use this when the user asks about a specific campaign or email "
+            "by name, or to suggest templates the user could clone for a new draft."
         ),
         "input_schema": {
             "type": "object",
@@ -159,16 +274,65 @@ TOOLS: List[Dict[str, Any]] = [
             "required": ["email_id"],
         },
     },
+    {
+        "name": "create_email_draft",
+        "description": (
+            "Create a NEW draft marketing email in HubSpot by cloning an existing "
+            "email and updating its name, subject, and main body content. "
+            "ONLY call this after the user has explicitly approved the drafted "
+            "content. The tool will replace the largest text block in the "
+            "template with your body_text; other modules (header image, CTA "
+            "button, footer) carry over from the template. Tell the user to "
+            "review the draft in HubSpot before sending."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "template_email_id": {
+                    "type": "string",
+                    "description": (
+                        "The HubSpot ID of an existing marketing email to clone. "
+                        "Use search_marketing_emails to find candidates if "
+                        "the user hasn't specified one."
+                    ),
+                },
+                "draft_name": {
+                    "type": "string",
+                    "description": (
+                        "Internal name for the new draft (visible in HubSpot, "
+                        "not to recipients). Be descriptive."
+                    ),
+                },
+                "subject": {
+                    "type": "string",
+                    "description": "The subject line for the new email.",
+                },
+                "body_text": {
+                    "type": "string",
+                    "description": (
+                        "The body copy for the email. Plain text with double "
+                        "newlines between paragraphs. Light markdown supported: "
+                        "**bold**, *italic*, [link text](https://url). Don't "
+                        "include greeting/signature unless they're part of the "
+                        "main pitch — those usually live in separate template "
+                        "modules that carry over."
+                    ),
+                },
+            },
+            "required": ["template_email_id", "draft_name", "subject", "body_text"],
+        },
+    },
 ]
 
 TOOL_HANDLERS: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     "search_marketing_emails": _tool_search_marketing_emails,
     "get_marketing_email_stats": _tool_get_marketing_email_stats,
+    "create_email_draft": _tool_create_email_draft,
 }
 
 
 # ---------------------------------------------------------------------------
-# Agent loop.
+# Agent loop
 # ---------------------------------------------------------------------------
 
 
@@ -182,13 +346,33 @@ def _execute_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         return {"error": f"Tool {name} failed: {exc}"}
 
 
-def chat(user_message: str, *, system_prompt: str = SYSTEM_PROMPT) -> str:
-    """Run an agent loop until Claude produces a final text response."""
-    client = _get_client()
-    messages: List[Dict[str, Any]] = [
-        {"role": "user", "content": user_message}
-    ]
+def reset_conversation(conversation_id: str) -> None:
+    """Wipe the stored history for a single conversation."""
+    _conversations.pop(conversation_id, None)
 
+
+def chat(
+    user_message: str,
+    *,
+    conversation_id: Optional[str] = None,
+    system_prompt: str = SYSTEM_PROMPT,
+) -> str:
+    """Run an agent loop until Claude produces a final text response.
+
+    If conversation_id is provided, prior messages from that conversation
+    are loaded as context, and the updated history is saved back at the end.
+    Without conversation_id, every call is a fresh conversation.
+    """
+    client = _get_client()
+
+    if conversation_id is not None:
+        messages: List[Dict[str, Any]] = list(_conversations.get(conversation_id, []))
+    else:
+        messages = []
+
+    messages.append({"role": "user", "content": user_message})
+
+    final_text = ""
     for _ in range(MAX_AGENT_TURNS):
         response = client.messages.create(
             model=MODEL,
@@ -198,13 +382,14 @@ def chat(user_message: str, *, system_prompt: str = SYSTEM_PROMPT) -> str:
             messages=messages,
         )
 
-        # Always echo the assistant's full content back into the conversation.
         messages.append({"role": "assistant", "content": response.content})
 
         if response.stop_reason == "end_turn":
-            return "".join(
-                getattr(b, "text", "") for b in response.content if getattr(b, "type", None) == "text"
+            final_text = "".join(
+                getattr(b, "text", "") for b in response.content
+                if getattr(b, "type", None) == "text"
             )
+            break
 
         if response.stop_reason == "tool_use":
             tool_results = []
@@ -221,7 +406,14 @@ def chat(user_message: str, *, system_prompt: str = SYSTEM_PROMPT) -> str:
             messages.append({"role": "user", "content": tool_results})
             continue
 
-        # Unexpected stop reason — give up cleanly.
         break
+    else:
+        final_text = "(Agent loop exited without a final text response — likely hit the turn cap.)"
 
-    return "(Agent loop exited without producing a final text response — likely hit the turn cap.)"
+    if conversation_id is not None:
+        # Trim oldest first if we exceed the cap.
+        if len(messages) > MAX_CONVERSATION_MESSAGES:
+            messages = messages[-MAX_CONVERSATION_MESSAGES:]
+        _conversations[conversation_id] = messages
+
+    return final_text or "(no response)"

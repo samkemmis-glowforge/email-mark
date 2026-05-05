@@ -7,6 +7,7 @@ marketing emails or A/B test results. Uses the Private App token.
 from __future__ import annotations
 
 import os
+import re
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -83,3 +84,144 @@ def get_ab_test_variations(email_id: str) -> List[Dict[str, Any]]:
         return []
     response.raise_for_status()
     return response.json().get("results", [])
+
+
+def clone_marketing_email(source_id: str, new_name: str) -> Dict[str, Any]:
+    """Clone an existing marketing email. Returns the new email object."""
+    response = requests.post(
+        f"{HUBSPOT_BASE}/marketing/v3/emails/clone",
+        headers=_headers(),
+        json={"id": str(source_id), "cloneName": new_name},
+        timeout=30,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def update_marketing_email(email_id: str, **fields: Any) -> Dict[str, Any]:
+    """Update fields on an existing marketing email (subject, name, etc.)."""
+    response = requests.patch(
+        f"{HUBSPOT_BASE}/marketing/v3/emails/{email_id}",
+        headers=_headers(),
+        json=fields,
+        timeout=30,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+_TEXT_FIELDS_FOR_LENGTH = ("html", "text", "value")
+
+
+def _light_markdown_to_html(text: str) -> str:
+    """Convert a small subset of markdown to inline HTML."""
+    # Links: [text](url)
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2">\1</a>', text)
+    # Bold: **text**
+    text = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", text)
+    # Italic: *text* (after bold so we don't double-process)
+    text = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"<em>\1</em>", text)
+    return text
+
+
+def _build_body_html(new_body_text: str, p_style: str, span_style: str) -> str:
+    """Convert plain-text-with-paragraphs into the same HTML pattern as the
+    template's existing body widget."""
+    paragraphs = [p.strip() for p in new_body_text.strip().split("\n\n") if p.strip()]
+    parts: List[str] = []
+    for para in paragraphs:
+        para = _light_markdown_to_html(para).replace("\n", "<br>")
+        if p_style and span_style:
+            parts.append(
+                f'<p style="{p_style}"><span style="{span_style}">{para}</span></p>'
+            )
+        elif p_style:
+            parts.append(f'<p style="{p_style}">{para}</p>')
+        else:
+            parts.append(f"<p>{para}</p>")
+    return "".join(parts)
+
+
+def update_email_body(email_id: str, new_body_text: str) -> Dict[str, Any]:
+    """Best-effort replacement of the main body text in a HubSpot marketing email.
+
+    Strategy: fetch the email, find the widget whose `body.html` contains the
+    most readable text (the "main pitch" by length), preserve its <p>/<span>
+    styling, and replace its HTML with paragraphs built from `new_body_text`.
+
+    Returns a dict describing what was updated, or an error if no suitable
+    widget was found.
+    """
+    response = requests.get(
+        f"{HUBSPOT_BASE}/marketing/v3/emails/{email_id}",
+        headers=_headers(),
+        params={"includeStats": "true"},
+        timeout=30,
+    )
+    response.raise_for_status()
+    email = response.json()
+
+    content = email.get("content")
+    if not isinstance(content, dict):
+        return {"error": "Email has no content object — can't update body."}
+
+    widgets = content.get("widgets")
+    if not isinstance(widgets, dict):
+        return {"error": "Email has no widgets dict — can't update body."}
+
+    # Find the widget whose body.html contains the most readable text.
+    best_widget_id: Optional[str] = None
+    best_html = ""
+    best_length = 0
+    for wid, widget in widgets.items():
+        if not isinstance(widget, dict):
+            continue
+        body = widget.get("body")
+        if not isinstance(body, dict):
+            continue
+        html = body.get("html")
+        if not isinstance(html, str):
+            continue
+        text_only = re.sub(r"<[^>]+>", "", html).strip()
+        if len(text_only) > best_length:
+            best_length = len(text_only)
+            best_widget_id = wid
+            best_html = html
+
+    if not best_widget_id:
+        return {"error": "No text-bearing widget found to update."}
+
+    # Preserve the original <p> and <span> styling so the new copy looks right.
+    p_style_match = re.search(r'<p\s+style="([^"]*)"', best_html)
+    span_style_match = re.search(r'<span\s+style="([^"]*)"', best_html)
+    p_style = p_style_match.group(1) if p_style_match else ""
+    span_style = span_style_match.group(1) if span_style_match else ""
+
+    new_html = _build_body_html(new_body_text, p_style, span_style)
+
+    # Build the updated content. Replace just the one widget; keep everything else.
+    new_widgets = dict(widgets)
+    new_widget = dict(widgets[best_widget_id])
+    new_widget_body = dict(new_widget.get("body", {}))
+    new_widget_body["html"] = new_html
+    new_widget["body"] = new_widget_body
+    new_widgets[best_widget_id] = new_widget
+
+    new_content = dict(content)
+    new_content["widgets"] = new_widgets
+
+    patch_response = requests.patch(
+        f"{HUBSPOT_BASE}/marketing/v3/emails/{email_id}",
+        headers=_headers(),
+        json={"content": new_content},
+        timeout=30,
+    )
+    patch_response.raise_for_status()
+
+    return {
+        "updated_widget_id": best_widget_id,
+        "old_text_length": best_length,
+        "new_text_length": len(new_body_text),
+        "preserved_p_style": bool(p_style),
+        "preserved_span_style": bool(span_style),
+    }
