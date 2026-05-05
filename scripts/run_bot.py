@@ -45,11 +45,42 @@ def _is_reset(text: str) -> bool:
     return t in _RESET_KEYWORDS
 
 
+def _parse_csv(value: str) -> set:
+    return {item.strip() for item in (value or "").split(",") if item.strip()}
+
+
+# Optional access control. Empty = allow all (open mode).
+ALLOWED_USERS = _parse_csv(os.environ.get("SLACK_ALLOWED_USERS", ""))
+ALLOWED_CHANNELS = _parse_csv(os.environ.get("SLACK_ALLOWED_CHANNELS", ""))
+
+DENIAL_MESSAGE = (
+    "I'm gated to a specific list of users right now and you're not on it yet. "
+    "Reach out to Sam (sam.kemmis@glowforge.com) if you should have access."
+)
+
+
+def _user_allowed(user_id: str) -> bool:
+    return not ALLOWED_USERS or user_id in ALLOWED_USERS
+
+
+def _channel_allowed(channel_id: str) -> bool:
+    return not ALLOWED_CHANNELS or channel_id in ALLOWED_CHANNELS
+
+
 @app.event("app_mention")
 def handle_mention(event, say):
     text = _MENTION_RE.sub("", event.get("text", "")).strip()
     if not text:
         say("Hi! Tag me with a question or request and I'll do my best.")
+        return
+
+    # Access control — channel scope first, then user scope.
+    if not _channel_allowed(event.get("channel", "")):
+        # Silent — don't acknowledge in unallowed channels.
+        logging.info("Ignored mention in unallowed channel %s", event.get("channel"))
+        return
+    if not _user_allowed(event.get("user", "")):
+        say(text=DENIAL_MESSAGE, thread_ts=event.get("thread_ts") or event.get("ts"))
         return
 
     # Conversation scoping rules:
@@ -89,6 +120,12 @@ def handle_dm(event, say):
         return
     text = (event.get("text") or "").strip()
     if not text:
+        return
+
+    # Access control — channel allowlist doesn't apply to DMs (DMs are 1:1),
+    # but user allowlist still does.
+    if not _user_allowed(event.get("user", "")):
+        say(DENIAL_MESSAGE)
         return
 
     # Each DM channel is one ongoing conversation.
