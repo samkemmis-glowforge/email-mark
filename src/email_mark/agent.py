@@ -25,6 +25,11 @@ from email_mark.hubspot_marketing import (
     update_email_body,
     update_marketing_email,
 )
+from email_mark.warehouse import (
+    count_inactive_users,
+    get_print_recency_buckets,
+    get_subscription_distribution,
+)
 
 load_dotenv(find_dotenv())
 
@@ -110,9 +115,18 @@ DRAFTING EMAILS — workflow:
 7. If you don't know which template to use, call search_marketing_emails to
    suggest 2-3 candidates and let the user pick.
 
+DATA WAREHOUSE — what's wired up:
+- get_subscription_distribution: counts of subscribers by plan + state, with MRR
+- count_inactive_users: how many users haven't printed in N days
+- get_print_recency_buckets: distribution of users by how recently they last printed
+
+These are AGGREGATE-only — no individual user data ever returns. If a user
+asks for individual records (a specific customer's status, a list of names),
+refer them to HubSpot directly per the privacy rules below.
+
 What you DO NOT have yet (be honest about gaps):
-- Direct access to the BigQuery data warehouse (in progress)
 - The ability to send emails or schedule sends (drafts only — final send stays in HubSpot UI)
+- Per-user warehouse lookups (gated by privacy guardrails — only aggregates exposed)
 - Access to forum/community data
 - Direct contact-list creation (CRM read access via the official HubSpot connector
   is available in Cowork, but not yet wired in here)
@@ -166,7 +180,8 @@ def _extract_counters(email_obj: dict) -> dict:
 def _tool_search_marketing_emails(args: Dict[str, Any]) -> Dict[str, Any]:
     name_contains = args.get("name_contains", "")
     limit = int(args.get("limit", 100))
-    emails = list_marketing_emails(name_contains=name_contains, limit=limit)
+    state = args.get("state") or None
+    emails = list_marketing_emails(name_contains=name_contains, limit=limit, state=state)
     return {
         "found": len(emails),
         "emails": [
@@ -203,6 +218,20 @@ def _tool_get_marketing_email_stats(args: Dict[str, Any]) -> Dict[str, Any]:
         "click_rate_pct": round(clicks / sent * 100, 2) if sent else None,
         "unsub_rate_pct": round(unsubs / sent * 100, 2) if sent else None,
     }
+
+
+def _tool_get_subscription_distribution(args: Dict[str, Any]) -> Dict[str, Any]:
+    rows = get_subscription_distribution()
+    return {"rows": rows, "row_count": len(rows)}
+
+
+def _tool_count_inactive_users(args: Dict[str, Any]) -> Dict[str, Any]:
+    return count_inactive_users(inactive_days=int(args.get("inactive_days", 30)))
+
+
+def _tool_get_print_recency_buckets(args: Dict[str, Any]) -> Dict[str, Any]:
+    rows = get_print_recency_buckets()
+    return {"rows": rows, "row_count": len(rows)}
 
 
 def _tool_create_email_draft(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -263,8 +292,11 @@ TOOLS: List[Dict[str, Any]] = [
         "description": (
             "Search HubSpot marketing emails by name substring (case-insensitive). "
             "Returns matching emails with id, name, state, and subject line. "
-            "Use this when the user asks about a specific campaign or email "
-            "by name, or to suggest templates the user could clone for a new draft."
+            "Use this when the user asks about a specific campaign, email, or "
+            "draft by name. If the user asks specifically about drafts, pass "
+            "state=\"DRAFT\" (for standalone drafts) or state=\"AUTOMATED_DRAFT\" "
+            "(for automated draft emails) to surface them — HubSpot may exclude "
+            "drafts from the default unfiltered list."
         ),
         "input_schema": {
             "type": "object",
@@ -276,6 +308,15 @@ TOOLS: List[Dict[str, Any]] = [
                 "limit": {
                     "type": "integer",
                     "description": "Max emails to return (default 100).",
+                },
+                "state": {
+                    "type": "string",
+                    "description": (
+                        "Optional HubSpot email state filter. Common values: "
+                        "DRAFT, PUBLISHED, AUTOMATED, AUTOMATED_DRAFT, "
+                        "AUTOMATED_AB, AUTOMATED_DRAFT_AB. Omit to use HubSpot's "
+                        "default (which may exclude pure drafts)."
+                    ),
                 },
             },
             "required": ["name_contains"],
@@ -298,6 +339,45 @@ TOOLS: List[Dict[str, Any]] = [
             },
             "required": ["email_id"],
         },
+    },
+    {
+        "name": "get_subscription_distribution",
+        "description": (
+            "Get the current breakdown of customer subscriptions by plan and "
+            "state, with user counts and total MRR per group. Returns "
+            "aggregate data only — no individual customer info. Useful for "
+            "questions like 'how many active Premium subscribers do we have?' "
+            "or 'what's the revenue mix across plans?'"
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "count_inactive_users",
+        "description": (
+            "Count users who haven't printed in N days. Returns aggregate "
+            "count and average inactivity. No individual user data. Useful "
+            "for sizing churn-save audiences, e.g., 'how many users haven't "
+            "printed in 30 days?'"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "inactive_days": {
+                    "type": "integer",
+                    "description": "Inactivity threshold in days. Default 30.",
+                },
+            },
+        },
+    },
+    {
+        "name": "get_print_recency_buckets",
+        "description": (
+            "Distribution of users by how recently they last printed "
+            "(today, within 7d, 8-30d, 31-90d, 91-365d, 365+, never). "
+            "Returns aggregate counts per bucket — no individual users. "
+            "Useful for understanding the activation and churn funnel."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
     },
     {
         "name": "create_email_draft",
@@ -353,6 +433,9 @@ TOOL_HANDLERS: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     "search_marketing_emails": _tool_search_marketing_emails,
     "get_marketing_email_stats": _tool_get_marketing_email_stats,
     "create_email_draft": _tool_create_email_draft,
+    "get_subscription_distribution": _tool_get_subscription_distribution,
+    "count_inactive_users": _tool_count_inactive_users,
+    "get_print_recency_buckets": _tool_get_print_recency_buckets,
 }
 
 

@@ -34,16 +34,25 @@ def list_marketing_emails(
     *,
     name_contains: Optional[str] = None,
     limit: int = 100,
+    state: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """List marketing emails, optionally filtering by name substring.
+    """List marketing emails, optionally filtering by name and/or state.
 
-    The HubSpot list endpoint doesn't take a name-contains filter directly,
-    so we pull a page and filter client-side.
+    Common HubSpot email states:
+      DRAFT, PUBLISHED, AUTOMATED, AUTOMATED_DRAFT,
+      AUTOMATED_AB, AUTOMATED_DRAFT_AB, AUTOMATED_AB_VARIANT, AB_EMAIL.
+
+    Without `state`, HubSpot may exclude some draft variants from the
+    default response — pass state="DRAFT" or "AUTOMATED_DRAFT" to find
+    drafts specifically.
     """
+    params: Dict[str, Any] = {"limit": limit, "includeStats": "true"}
+    if state:
+        params["state"] = state
     response = requests.get(
         f"{HUBSPOT_BASE}/marketing/v3/emails/",
         headers=_headers(),
-        params={"limit": limit, "includeStats": True},
+        params=params,
         timeout=30,
     )
     response.raise_for_status()
