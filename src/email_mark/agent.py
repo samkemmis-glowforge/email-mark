@@ -26,6 +26,10 @@ from email_mark.hubspot_marketing import (
     update_email_body,
     update_marketing_email,
 )
+from email_mark.slack_helpers import (
+    lookup_user as slack_lookup_user,
+    send_dm as slack_send_dm,
+)
 from email_mark.warehouse import (
     count_inactive_users,
     get_print_recency_buckets,
@@ -230,6 +234,15 @@ def _tool_get_email_body(args: Dict[str, Any]) -> Dict[str, Any]:
     return get_email_body_text(str(args["email_id"]))
 
 
+def _tool_lookup_slack_user(args: Dict[str, Any]) -> Dict[str, Any]:
+    matches = slack_lookup_user(args.get("query", ""))
+    return {"matches": matches[:10], "total_matches": len(matches)}
+
+
+def _tool_send_slack_dm(args: Dict[str, Any]) -> Dict[str, Any]:
+    return slack_send_dm(str(args["user_id"]), str(args["text"]))
+
+
 def _tool_get_subscription_distribution(args: Dict[str, Any]) -> Dict[str, Any]:
     rows = get_subscription_distribution()
     return {"rows": rows, "row_count": len(rows)}
@@ -334,6 +347,57 @@ TOOLS: List[Dict[str, Any]] = [
                 },
             },
             "required": ["name_contains"],
+        },
+    },
+    {
+        "name": "lookup_slack_user",
+        "description": (
+            "Find Slack users by name, display name, or email substring "
+            "(case-insensitive). Returns matching users with their Slack IDs. "
+            "Use this when the user wants to mention or notify a teammate. "
+            "Once you have a user's ID, include it in your reply text using "
+            "the format <@USER_ID> — Slack will render it as a clickable "
+            "@-mention and the person will get a notification. Example: "
+            "'Draft created. <@U2DBJD0LU> please review when you get a chance.'"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "Name to search for. First name is usually enough "
+                        "(e.g., 'therese', 'sam'). If the search returns "
+                        "multiple matches, ask the user to clarify."
+                    ),
+                },
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "send_slack_dm",
+        "description": (
+            "Send a direct message to a specific Slack user. Use this when the "
+            "user asks to ping someone privately, send them an FYI, or alert "
+            "them to something — separate from the conversation you're in. "
+            "Look up the user with lookup_slack_user first to get their ID. "
+            "Don't use this just to mention someone in the current conversation "
+            "— for that, include <@USER_ID> in your normal reply instead."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "user_id": {
+                    "type": "string",
+                    "description": "Slack user ID (starts with U).",
+                },
+                "text": {
+                    "type": "string",
+                    "description": "The message to send.",
+                },
+            },
+            "required": ["user_id", "text"],
         },
     },
     {
@@ -471,6 +535,8 @@ TOOL_HANDLERS: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     "get_subscription_distribution": _tool_get_subscription_distribution,
     "count_inactive_users": _tool_count_inactive_users,
     "get_print_recency_buckets": _tool_get_print_recency_buckets,
+    "lookup_slack_user": _tool_lookup_slack_user,
+    "send_slack_dm": _tool_send_slack_dm,
 }
 
 
