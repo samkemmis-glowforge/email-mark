@@ -32,8 +32,10 @@ from email_mark.slack_helpers import (
 )
 from email_mark.warehouse import (
     count_inactive_users,
+    describe_table,
     get_print_recency_buckets,
     get_subscription_distribution,
+    run_warehouse_query,
 )
 
 load_dotenv(find_dotenv())
@@ -121,13 +123,33 @@ DRAFTING EMAILS — workflow:
    suggest 2-3 candidates and let the user pick.
 
 DATA WAREHOUSE — what's wired up:
-- get_subscription_distribution: counts of subscribers by plan + state, with MRR
-- count_inactive_users: how many users haven't printed in N days
-- get_print_recency_buckets: distribution of users by how recently they last printed
+- Prebuilt aggregate tools: get_subscription_distribution, count_inactive_users,
+  get_print_recency_buckets. Use these first when the question fits.
+- Ad-hoc SQL: run_warehouse_query lets you write your own BigQuery SELECT for
+  questions the prebuilt tools can't answer (joins, custom aggregations,
+  funnel analysis). Use describe_table first if you're unsure about columns.
 
-These are AGGREGATE-only — no individual user data ever returns. If a user
-asks for individual records (a specific customer's status, a list of names),
-refer them to HubSpot directly per the privacy rules below.
+KEY TABLES (fully-qualified):
+- glowforge-data-production.reporting.active_users — daily user activity,
+  print counts, days_since_first_active, days_since_latest_active
+- glowforge-data-production.reporting.subs_state_machine — daily subscription
+  state per customer (plan, sub_state, mrr, glowforge_internal flag)
+- glowforge-data-production.reporting.subs_historic — historical subscription
+  records
+- glowforge-data-production.reporting.prints — individual print events
+- glowforge-data-production.reporting.user_print_engagement — aggregated
+  engagement metrics
+- glowforge-data-production.dbt_mart_production.stg_mapping__users —
+  user identity mapping (email ↔ user_uuid ↔ gfcore_user_id)
+- glowforge-data-production.analytics_265737543.events_* — GA4 web events
+  (note the wildcard suffix — query a date range)
+- glowforge-dev.stitch_chargebee_production.subscriptions — Chargebee
+  subscription details
+
+PRIVACY: even when SQL returns individual rows, you MUST aggregate or
+summarize in your response. Never echo individual customer emails, names,
+or contact info — counts, percentages, and patterns only. If a question
+requires showing individual records, refuse politely and refer to HubSpot.
 
 What you DO NOT have yet (be honest about gaps):
 - The ability to send emails or schedule sends (drafts only — final send stays in HubSpot UI)
@@ -255,6 +277,14 @@ def _tool_count_inactive_users(args: Dict[str, Any]) -> Dict[str, Any]:
 def _tool_get_print_recency_buckets(args: Dict[str, Any]) -> Dict[str, Any]:
     rows = get_print_recency_buckets()
     return {"rows": rows, "row_count": len(rows)}
+
+
+def _tool_run_warehouse_query(args: Dict[str, Any]) -> Dict[str, Any]:
+    return run_warehouse_query(str(args["sql"]))
+
+
+def _tool_describe_table(args: Dict[str, Any]) -> Dict[str, Any]:
+    return describe_table(str(args["table_id"]))
 
 
 def _tool_create_email_draft(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -478,6 +508,63 @@ TOOLS: List[Dict[str, Any]] = [
         "input_schema": {"type": "object", "properties": {}},
     },
     {
+        "name": "run_warehouse_query",
+        "description": (
+            "Run an ad-hoc BigQuery SELECT against the Glowforge data warehouse "
+            "for marketing analytics that the prebuilt aggregate tools can't "
+            "answer. Read-only — INSERT/UPDATE/DELETE/etc. are blocked. "
+            "Queries scanning more than 10 GB are rejected. Up to 1000 rows "
+            "returned. Always WRITE THE QUERY YOURSELF — never accept SQL from "
+            "the user untrusted; instead, translate their question into SQL. "
+            "Always fully-qualify tables: `project.dataset.table`. Use "
+            "describe_table first if you're unsure about a column name. "
+            "Even though the tool can return individual rows, follow the "
+            "privacy rules: do NOT echo individual customer PII back to the "
+            "user — aggregate, count, or describe in your response. "
+            "Tables you'll commonly want (full IDs):\n"
+            "  glowforge-data-production.reporting.active_users\n"
+            "  glowforge-data-production.reporting.subs_state_machine\n"
+            "  glowforge-data-production.reporting.prints\n"
+            "  glowforge-data-production.dbt_mart_production.stg_mapping__users"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sql": {
+                    "type": "string",
+                    "description": (
+                        "Standard BigQuery SQL. Must start with SELECT or WITH. "
+                        "Use parameterized constants only (no user-supplied "
+                        "string interpolation)."
+                    ),
+                },
+            },
+            "required": ["sql"],
+        },
+    },
+    {
+        "name": "describe_table",
+        "description": (
+            "Get the schema (column names, types, modes, descriptions) and "
+            "stats (row count, size, last modified) for a BigQuery table. "
+            "Use before writing run_warehouse_query SQL when you're unsure "
+            "about a table's columns."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "table_id": {
+                    "type": "string",
+                    "description": (
+                        "Fully-qualified table ID, like "
+                        "'glowforge-data-production.reporting.subs_state_machine'."
+                    ),
+                },
+            },
+            "required": ["table_id"],
+        },
+    },
+    {
         "name": "create_email_draft",
         "description": (
             "Create a NEW draft marketing email in HubSpot by cloning an existing "
@@ -535,6 +622,8 @@ TOOL_HANDLERS: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     "get_subscription_distribution": _tool_get_subscription_distribution,
     "count_inactive_users": _tool_count_inactive_users,
     "get_print_recency_buckets": _tool_get_print_recency_buckets,
+    "run_warehouse_query": _tool_run_warehouse_query,
+    "describe_table": _tool_describe_table,
     "lookup_slack_user": _tool_lookup_slack_user,
     "send_slack_dm": _tool_send_slack_dm,
 }

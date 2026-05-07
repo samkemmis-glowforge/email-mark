@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Any, Dict, List, Optional
 
 from dotenv import find_dotenv, load_dotenv
@@ -30,6 +31,17 @@ from google.cloud import bigquery
 from google.oauth2 import service_account
 
 load_dotenv(find_dotenv())
+
+# Safety limits for ad-hoc SQL.
+MAX_BYTES_BILLED = 10 * 1024 * 1024 * 1024  # 10 GB per query
+MAX_RESULT_ROWS = 1000
+QUERY_TIMEOUT_SECONDS = 90
+
+_FORBIDDEN_SQL = re.compile(
+    r"\b(insert|update|delete|drop|create|alter|truncate|merge|grant|revoke|call|exec)\b",
+    re.IGNORECASE,
+)
+_STARTS_WITH_SELECT_OR_WITH = re.compile(r"^\s*(WITH|SELECT)\b", re.IGNORECASE)
 
 
 _credentials_cache: Optional[service_account.Credentials] = None
@@ -126,6 +138,100 @@ def count_inactive_users(inactive_days: int = 30) -> Dict[str, Any]:
     )
     rows = list(_client("data").query(query, job_config=cfg).result())
     return dict(rows[0]) if rows else {}
+
+
+def run_warehouse_query(sql: str) -> Dict[str, Any]:
+    """Execute an ad-hoc SELECT against BigQuery, with safety rails.
+
+    Rules:
+      - Must start with SELECT or WITH (CTEs ok).
+      - Forbidden: INSERT/UPDATE/DELETE/DROP/CREATE/ALTER/etc.
+      - Bytes scanned capped at MAX_BYTES_BILLED (query is rejected before run
+        if dry-run estimates more).
+      - Up to MAX_RESULT_ROWS rows returned; rest are dropped (truncated=True).
+      - Wall-clock timeout enforced.
+
+    Returns a dict with rows, row_count, bytes_processed, and truncated flag,
+    or {"error": "..."} if rejected or failed.
+    """
+    sql = (sql or "").strip().rstrip(";").strip()
+    if not sql:
+        return {"error": "Empty SQL."}
+    if not _STARTS_WITH_SELECT_OR_WITH.match(sql):
+        return {"error": "Only SELECT queries (or CTEs starting with WITH) are allowed."}
+    if _FORBIDDEN_SQL.search(sql):
+        return {
+            "error": (
+                "Query rejected — contains forbidden keywords. "
+                "Only read-only SELECT statements are allowed."
+            )
+        }
+
+    client = _client("data")  # billing project; cross-project SELECT works as long as SA has read.
+
+    # Dry-run to estimate bytes and reject expensive queries before execution.
+    dry_cfg = bigquery.QueryJobConfig(dry_run=True, use_query_cache=False)
+    try:
+        dry_job = client.query(sql, job_config=dry_cfg)
+        estimated_bytes = dry_job.total_bytes_processed or 0
+    except Exception as exc:
+        return {"error": f"Query validation failed: {exc}"}
+
+    if estimated_bytes > MAX_BYTES_BILLED:
+        gb = estimated_bytes / (1024 ** 3)
+        return {
+            "error": (
+                f"Query rejected — would scan {gb:.1f} GB, exceeding the "
+                f"{MAX_BYTES_BILLED / (1024**3):.0f} GB cap. Add date filters, "
+                "narrow column selection, or break the query into smaller pieces."
+            )
+        }
+
+    cfg = bigquery.QueryJobConfig(maximum_bytes_billed=MAX_BYTES_BILLED)
+    try:
+        job = client.query(sql, job_config=cfg, timeout=QUERY_TIMEOUT_SECONDS)
+        result = job.result(timeout=QUERY_TIMEOUT_SECONDS, max_results=MAX_RESULT_ROWS)
+        rows = [dict(row) for row in result]
+    except Exception as exc:
+        return {"error": f"Query failed: {exc}"}
+
+    return {
+        "row_count": len(rows),
+        "rows": rows,
+        "bytes_processed": job.total_bytes_processed,
+        "truncated": len(rows) >= MAX_RESULT_ROWS,
+    }
+
+
+def describe_table(fully_qualified_table_id: str) -> Dict[str, Any]:
+    """Return schema info for a BigQuery table.
+
+    `fully_qualified_table_id` should be in the form
+    'project.dataset.table' (e.g.,
+    'glowforge-data-production.reporting.subs_state_machine').
+    """
+    client = _client("data")
+    try:
+        table = client.get_table(fully_qualified_table_id)
+    except Exception as exc:
+        return {"error": f"Failed to describe table: {exc}"}
+
+    return {
+        "table_id": fully_qualified_table_id,
+        "row_count": table.num_rows,
+        "size_bytes": table.num_bytes,
+        "last_modified": str(table.modified),
+        "description": table.description or "",
+        "schema": [
+            {
+                "name": f.name,
+                "type": f.field_type,
+                "mode": f.mode,
+                "description": f.description or "",
+            }
+            for f in table.schema
+        ],
+    }
 
 
 def get_print_recency_buckets() -> List[Dict[str, Any]]:
