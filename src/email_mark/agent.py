@@ -191,6 +191,11 @@ def _tool_search_marketing_emails(args: Dict[str, Any]) -> Dict[str, Any]:
                 "name": e.get("name"),
                 "state": e.get("state"),
                 "subject": e.get("subject"),
+                "campaign_name": e.get("campaignName"),
+                # Timestamps (ISO 8601, UTC) — useful for send-time trend analysis.
+                "publish_date": e.get("publishDate"),
+                "created": e.get("created"),
+                "updated": e.get("updated"),
             }
             for e in emails
         ],
@@ -296,12 +301,16 @@ TOOLS: List[Dict[str, Any]] = [
         "name": "search_marketing_emails",
         "description": (
             "Search HubSpot marketing emails by name substring (case-insensitive). "
-            "Returns matching emails with id, name, state, and subject line. "
+            "Returns matching emails with id, name, state, subject, campaign, "
+            "and timestamps (publish_date, created, updated — all ISO 8601 UTC). "
             "Use this when the user asks about a specific campaign, email, or "
-            "draft by name. If the user asks specifically about drafts, pass "
-            "state=\"DRAFT\" (for standalone drafts) or state=\"AUTOMATED_DRAFT\" "
-            "(for automated draft emails) to surface them — HubSpot may exclude "
-            "drafts from the default unfiltered list."
+            "draft by name. For send-time / day-of-week trend analysis, pull a "
+            "broad set with state=\"PUBLISHED\" and use publish_date as the "
+            "ground-truth send time. AUTOMATED emails fire many times so don't "
+            "have a single send time — exclude them or treat differently. "
+            "If the user asks specifically about drafts, pass state=\"DRAFT\" "
+            "or state=\"AUTOMATED_DRAFT\" — HubSpot may exclude drafts from "
+            "the default unfiltered list."
         ),
         "input_schema": {
             "type": "object",
