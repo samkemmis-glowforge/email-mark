@@ -65,6 +65,55 @@ def list_marketing_emails(
     return results
 
 
+def get_email_body_text(email_id: str) -> Dict[str, Any]:
+    """Extract the readable body text of a marketing email by ID.
+
+    Returns subject, preview text, and the concatenated text content from all
+    text-bearing widgets (with HTML stripped). Useful when the bot needs to
+    review or quote actual draft copy rather than just metadata.
+    """
+    response = requests.get(
+        f"{HUBSPOT_BASE}/marketing/v3/emails/{email_id}",
+        headers=_headers(),
+        params={"includeStats": "true"},
+        timeout=30,
+    )
+    response.raise_for_status()
+    email = response.json()
+
+    content = email.get("content") if isinstance(email.get("content"), dict) else {}
+    widgets = (content or {}).get("widgets") if isinstance(content, dict) else {}
+
+    body_parts: List[str] = []
+    if isinstance(widgets, dict):
+        # Sort by widget id roughly preserves the visual order most templates use.
+        for _wid, widget in sorted(widgets.items()):
+            if not isinstance(widget, dict):
+                continue
+            body = widget.get("body")
+            if not isinstance(body, dict):
+                continue
+            for field in ("html", "text", "value", "rich_text"):
+                raw = body.get(field)
+                if raw and isinstance(raw, str):
+                    stripped = re.sub(r"<[^>]+>", "", raw).strip()
+                    # Collapse repeated whitespace.
+                    stripped = re.sub(r"\s+", " ", stripped)
+                    if stripped:
+                        body_parts.append(stripped)
+                    break
+
+    return {
+        "id": email.get("id"),
+        "name": email.get("name"),
+        "subject": email.get("subject"),
+        "preview_text": email.get("previewText") or "",
+        "state": email.get("state"),
+        "campaign_name": email.get("campaignName"),
+        "body_text": "\n\n".join(body_parts),
+    }
+
+
 def get_email_statistics(email_id: str) -> Dict[str, Any]:
     """Stats for a single marketing email.
 

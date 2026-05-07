@@ -20,6 +20,7 @@ from dotenv import find_dotenv, load_dotenv
 
 from email_mark.hubspot_marketing import (
     clone_marketing_email,
+    get_email_body_text,
     get_email_statistics,
     list_marketing_emails,
     update_email_body,
@@ -220,6 +221,10 @@ def _tool_get_marketing_email_stats(args: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _tool_get_email_body(args: Dict[str, Any]) -> Dict[str, Any]:
+    return get_email_body_text(str(args["email_id"]))
+
+
 def _tool_get_subscription_distribution(args: Dict[str, Any]) -> Dict[str, Any]:
     rows = get_subscription_distribution()
     return {"rows": rows, "row_count": len(rows)}
@@ -320,6 +325,26 @@ TOOLS: List[Dict[str, Any]] = [
                 },
             },
             "required": ["name_contains"],
+        },
+    },
+    {
+        "name": "get_email_body",
+        "description": (
+            "Get the full readable body text of a HubSpot marketing email by ID, "
+            "with HTML stripped. Returns subject, preview text, state, and the "
+            "concatenated body content from all text modules. Use this when the "
+            "user asks you to review, give feedback on, or quote actual copy "
+            "from a specific email — not just its metadata."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "email_id": {
+                    "type": "string",
+                    "description": "The marketing email's HubSpot ID.",
+                },
+            },
+            "required": ["email_id"],
         },
     },
     {
@@ -431,6 +456,7 @@ TOOLS: List[Dict[str, Any]] = [
 
 TOOL_HANDLERS: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     "search_marketing_emails": _tool_search_marketing_emails,
+    "get_email_body": _tool_get_email_body,
     "get_marketing_email_stats": _tool_get_marketing_email_stats,
     "create_email_draft": _tool_create_email_draft,
     "get_subscription_distribution": _tool_get_subscription_distribution,
