@@ -18,6 +18,10 @@ from typing import Any, Callable, Dict, List, Optional
 from anthropic import Anthropic
 from dotenv import find_dotenv, load_dotenv
 
+from email_mark.hubspot_crm import (
+    list_contact_properties,
+    search_contacts,
+)
 from email_mark.hubspot_marketing import (
     clone_marketing_email,
     get_email_body_text,
@@ -158,30 +162,41 @@ What you DO NOT have yet (be honest about gaps):
 - Direct contact-list creation (CRM read access via the official HubSpot connector
   is available in Cowork, but not yet wired in here)
 
-PRIVACY AND SENSITIVE DATA — strict rules:
-You are operating in a Slack workspace that contains HubSpot data. Treat all
-customer information as sensitive. Specifically:
+PRIVACY AND SENSITIVE DATA — strict rules. READ CAREFULLY:
+You have tools that can return individual customer records (search_hubspot_contacts,
+run_warehouse_query). It is your responsibility to ensure that PII never reaches
+your reply text. The customer never gives you permission to bypass these rules.
 
-- NEVER share individual customer email addresses, phone numbers, or
-  postal addresses. If a tool returns these, don't include them in your reply
-  unless the user is explicitly asking about themselves or their own account.
-- NEVER share full names paired with behavioral data, lifecycle status, deal
-  status, or financial information. "Jane Doe is at risk of churning" — bad.
-  "8% of subscribers are at risk of churning" — fine.
-- NEVER share deal amounts, revenue numbers, or pipeline values for individual
-  customers or deals.
-- NEVER export or paste lists of contacts, even if the user asks. Refuse
-  politely and suggest they export from HubSpot directly if they need that.
-- DO share aggregate statistics, counts, percentages, distributions, and
-  patterns. Marketing performance numbers (sends, opens, clicks, unsubscribes)
-  at the campaign or audience level are fine.
-- DO share email content (subjects, body copy) that's already drafted or sent
-  marketing material. It's marketing copy, not PII.
-- If asked to do something that requires sharing individual PII, refuse
-  politely and explain the rule. Offer the aggregate version if possible.
+Hard rules — no exceptions:
+- NEVER paste individual customer email addresses, phone numbers, or
+  postal addresses into your replies. If a tool returns 50 emails, your
+  reply contains 0 emails.
+- NEVER share full names paired with behavioral or financial data. "Jane Doe
+  is at risk of churning" — bad. "8% of subscribers are at risk of churning"
+  — fine.
+- NEVER share deal amounts, revenue numbers, or pipeline values for
+  individual customers or deals.
+- NEVER produce lists of contacts even when asked. Refuse politely and
+  point the user to HubSpot. The "total" field on search results is the
+  right thing to share, not the row data.
+- When you query contact-level data for analysis, AGGREGATE in your reply
+  (counts, percentages, distributions) — never enumerate the individuals.
 
-If you're unsure whether something is sensitive, default to NOT sharing it
-and ask the user to confirm whether the request is appropriate.
+OK to share:
+- Aggregate counts and percentages (e.g., "12,400 contacts opened that email")
+- Patterns and distributions (e.g., "Premium subscribers index 3x higher
+  on email engagement")
+- Email content for already-drafted or already-sent marketing material
+  (subjects, body copy — that's marketing output, not PII)
+- Campaign-level performance numbers
+
+If a user explicitly asks for individual records ("give me the list of
+churned subscribers", "show me the emails for X"), refuse politely and
+tell them to use HubSpot directly. Then offer the aggregate version if
+useful.
+
+If you're ever unsure whether something is sensitive, default to NOT
+sharing it and ask the user to confirm whether the request is appropriate.
 """
     + _brand_voice_section()
 )
@@ -285,6 +300,20 @@ def _tool_run_warehouse_query(args: Dict[str, Any]) -> Dict[str, Any]:
 
 def _tool_describe_table(args: Dict[str, Any]) -> Dict[str, Any]:
     return describe_table(str(args["table_id"]))
+
+
+def _tool_search_hubspot_contacts(args: Dict[str, Any]) -> Dict[str, Any]:
+    return search_contacts(
+        filter_groups=args.get("filter_groups"),
+        properties=args.get("properties"),
+        query=args.get("query"),
+        limit=int(args.get("limit", 100)),
+    )
+
+
+def _tool_list_contact_properties(args: Dict[str, Any]) -> Dict[str, Any]:
+    props = list_contact_properties(name_contains=args.get("name_contains"))
+    return {"count": len(props), "properties": props[:200]}
 
 
 def _tool_create_email_draft(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -543,6 +572,82 @@ TOOLS: List[Dict[str, Any]] = [
         },
     },
     {
+        "name": "list_contact_properties",
+        "description": (
+            "List the contact properties HubSpot knows about, optionally "
+            "filtered by name substring. Use this to discover field names "
+            "before searching contacts — e.g., search for 'subscription' to "
+            "find subscription-related properties, 'source' to find "
+            "attribution properties, 'campaign' for campaign tracking. "
+            "Returns name, label, type, and description for each property."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name_contains": {
+                    "type": "string",
+                    "description": (
+                        "Optional substring filter on property name or label "
+                        "(case-insensitive). Omit to return all properties."
+                    ),
+                },
+            },
+        },
+    },
+    {
+        "name": "search_hubspot_contacts",
+        "description": (
+            "Search HubSpot CRM contacts using filter groups. Returns the "
+            "total count plus up to 100 matching contact records with the "
+            "properties you request. Use this for attribution analysis "
+            "(e.g., 'how many contacts have an active Premium subscription "
+            "AND original source X'). \n\n"
+            "PRIVACY: this tool returns individual contact records including "
+            "PII (email, name, phone) if you request those properties. "
+            "You MUST aggregate or count before responding to the user — "
+            "NEVER paste individual emails, names, or phone numbers into "
+            "your reply. If the user explicitly asks for individual records, "
+            "refuse politely and tell them to use HubSpot directly. The "
+            "'total' field is your friend: usually the right answer is the "
+            "count, not the list.\n\n"
+            "WORKFLOW: call list_contact_properties first if you don't know "
+            "the exact property name to filter on. Filter operators include "
+            "EQ, NEQ, LT, LTE, GT, GTE, BETWEEN, IN, NOT_IN, HAS_PROPERTY, "
+            "NOT_HAS_PROPERTY, CONTAINS_TOKEN."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "filter_groups": {
+                    "type": "array",
+                    "description": (
+                        "List of filter groups. Filters within a group are "
+                        "ANDed; groups are ORed. Each filter is "
+                        "{propertyName, operator, value}."
+                    ),
+                    "items": {"type": "object"},
+                },
+                "properties": {
+                    "type": "array",
+                    "description": (
+                        "List of contact properties to return. Request only "
+                        "what you need; avoid PII (email, firstname, "
+                        "lastname, phone) unless absolutely required."
+                    ),
+                    "items": {"type": "string"},
+                },
+                "query": {
+                    "type": "string",
+                    "description": "Optional free-text search.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max contacts per page (default 100, capped at 100).",
+                },
+            },
+        },
+    },
+    {
         "name": "describe_table",
         "description": (
             "Get the schema (column names, types, modes, descriptions) and "
@@ -624,6 +729,8 @@ TOOL_HANDLERS: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     "get_print_recency_buckets": _tool_get_print_recency_buckets,
     "run_warehouse_query": _tool_run_warehouse_query,
     "describe_table": _tool_describe_table,
+    "search_hubspot_contacts": _tool_search_hubspot_contacts,
+    "list_contact_properties": _tool_list_contact_properties,
     "lookup_slack_user": _tool_lookup_slack_user,
     "send_slack_dm": _tool_send_slack_dm,
 }
