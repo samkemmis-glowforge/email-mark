@@ -480,6 +480,126 @@ def _build_body_html(new_body_text: str, p_style: str, span_style: str) -> str:
     return "".join(parts)
 
 
+def update_email_by_widget_map(
+    email_id: str,
+    content_by_role: Dict[str, str],
+    widget_map: Dict[str, str],
+) -> Dict[str, Any]:
+    """Update multiple widgets in a marketing email, mapped by semantic role.
+
+    Used for templates with stable widget IDs (i.e., always cloned from a
+    canonical master). The caller provides:
+      - content_by_role: e.g., {"intro_body": "...", "project_1_title": "..."}
+      - widget_map:      e.g., {"intro_body": "module_17734393985902", ...}
+
+    For each role with content provided, finds the widget by ID, preserves
+    its existing <p>/<span> styling, and replaces the body html with new
+    paragraphs built from the role's text (markdown supported). All widgets
+    are PATCHed in a single request.
+
+    Returns a structured report so the caller can verify exactly what
+    landed where, and bail clearly if the template's widget IDs have
+    drifted (template was edited, etc.).
+    """
+    response = requests.get(
+        f"{HUBSPOT_BASE}/marketing/v3/emails/{email_id}",
+        headers=_headers(),
+        params={"includeStats": "true"},
+        timeout=30,
+    )
+    response.raise_for_status()
+    email = response.json()
+
+    content = email.get("content")
+    if not isinstance(content, dict):
+        return {"error": "Email has no content object — can't update widgets."}
+
+    widgets = content.get("widgets")
+    if not isinstance(widgets, dict):
+        return {"error": "Email has no widgets dict — can't update widgets."}
+
+    # Validate that every role we want to update has its widget present.
+    # If the master template was edited and a widget id has shifted, we
+    # want to fail loudly with a remap hint, not silently drop content.
+    missing: List[Dict[str, str]] = []
+    for role, new_text in content_by_role.items():
+        widget_id = widget_map.get(role)
+        if not widget_id:
+            missing.append({"role": role, "reason": "no widget_id in map"})
+            continue
+        if widget_id not in widgets:
+            missing.append({"role": role, "widget_id": widget_id, "reason": "widget not found"})
+
+    if missing:
+        return {
+            "error": (
+                "Aborting update — some expected widgets are missing. The "
+                "template's widget IDs may have shifted (master template was "
+                "edited?). Re-run get_email_widget_structure to remap."
+            ),
+            "missing": missing,
+        }
+
+    new_widgets = dict(widgets)
+    updates: List[Dict[str, Any]] = []
+
+    for role, new_text in content_by_role.items():
+        widget_id = widget_map[role]
+        widget = widgets[widget_id]
+        if not isinstance(widget, dict):
+            updates.append({"role": role, "widget_id": widget_id, "status": "widget_not_dict"})
+            continue
+
+        body = widget.get("body")
+        if not isinstance(body, dict):
+            updates.append({"role": role, "widget_id": widget_id, "status": "no_body_dict"})
+            continue
+
+        old_html = body.get("html") if isinstance(body.get("html"), str) else ""
+        # Preserve the original <p>/<span> styling so the rendered email
+        # keeps the template's font, color, and spacing.
+        p_style_match = re.search(r'<p\s+style="([^"]*)"', old_html or "")
+        span_style_match = re.search(r'<span\s+style="([^"]*)"', old_html or "")
+        p_style = p_style_match.group(1) if p_style_match else ""
+        span_style = span_style_match.group(1) if span_style_match else ""
+
+        new_html = _build_body_html(new_text, p_style, span_style)
+
+        new_widget = dict(widget)
+        new_body = dict(body)
+        new_body["html"] = new_html
+        new_widget["body"] = new_body
+        new_widgets[widget_id] = new_widget
+
+        old_text_only = re.sub(r"<[^>]+>", "", old_html or "").strip()
+        updates.append({
+            "role": role,
+            "widget_id": widget_id,
+            "status": "updated",
+            "old_text_length": len(old_text_only),
+            "new_text_length": len(new_text),
+            "preserved_p_style": bool(p_style),
+            "preserved_span_style": bool(span_style),
+        })
+
+    new_content = dict(content)
+    new_content["widgets"] = new_widgets
+
+    patch_response = requests.patch(
+        f"{HUBSPOT_BASE}/marketing/v3/emails/{email_id}",
+        headers=_headers(),
+        json={"content": new_content},
+        timeout=30,
+    )
+    patch_response.raise_for_status()
+
+    return {
+        "email_id": email_id,
+        "total_updated": sum(1 for u in updates if u.get("status") == "updated"),
+        "updates": updates,
+    }
+
+
 def update_email_body(email_id: str, new_body_text: str) -> Dict[str, Any]:
     """Best-effort replacement of the main body text in a HubSpot marketing email.
 

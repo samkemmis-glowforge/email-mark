@@ -36,6 +36,7 @@ from email_mark.hubspot_marketing import (
     list_marketing_emails,
     list_workflows,
     update_email_body,
+    update_email_by_widget_map,
     update_marketing_email,
 )
 from email_mark.slack_helpers import (
@@ -55,6 +56,31 @@ load_dotenv(find_dotenv())
 MODEL = "claude-sonnet-4-5"
 MAX_AGENT_TURNS = 25  # Hard cap so a runaway loop can't burn through tokens.
 HUBSPOT_PORTAL_ID = "8614495"  # Glowforge HubSpot portal — used for UI URLs.
+
+# Canonical ICYMI master template. Mark always clones this for the weekly
+# ICYMI workflow. Widget IDs below were captured from this email's content
+# tree on 2026-05-08 — HubSpot preserves widget IDs across clones, so the
+# clone Mark creates will have the same IDs and the patcher can target
+# each module by role. If you ever rebuild this template, re-run
+# get_email_widget_structure on the new master and refresh ICYMI_WIDGET_MAP.
+ICYMI_MASTER_TEMPLATE_ID = "212542521240"
+ICYMI_WIDGET_MAP: Dict[str, str] = {
+    # Intro paragraph that sets up the week's theme.
+    "intro_body":       "module_17734393985902",
+    # Project 1 — visually first project module (title + body widgets).
+    "project_1_title":  "module_17606404695542",
+    "project_1_body":   "module_17606404695544",
+    # Project 2 — visually second project module.
+    "project_2_title":  "module-6-1-0",
+    "project_2_body":   "module-6-1-2",
+    # Project 3 — visually third project module.
+    "project_3_title":  "module_17606408446199",
+    "project_3_body":   "module_176064084461911",
+    # Laser Focus of the Week — title and body live in one widget.
+    "laser_focus_body": "module_17609870518031",
+    # "Happy Making! The Glowforge Team" sign-off.
+    "signoff_body":     "module_17636900856152",
+}
 
 # Conversation memory. Keyed by an external conversation_id (e.g., Slack
 # channel for DMs, thread_ts for channel mentions). In-memory only — wipes
@@ -245,27 +271,51 @@ Steps:
 6. Iterate on tone, theme, project order, subjects, Laser Focus, etc. as
    the user requests. After each revision, repeat the "ship it" reminder.
 
-7. ON SHIP-IT: confirm you have the chosen subject + preheader. Then
-   search_marketing_emails for a recent ICYMI email to use as the clone
-   template — pass name_contains="ICYMI" and pick the most recent by
-   publish_date or created. Call create_email_draft with:
-     - template_email_id = that recent ICYMI's id
+7. ON SHIP-IT: confirm you have the chosen subject AND preheader (ask if
+   the user only said "ship it" without specifying which option). Then
+   call create_icymi_draft — NOT create_email_draft — with the structured
+   content. The tool clones the canonical ICYMI master template
+   internally, sets subject + preheader + name, and patches each module
+   widget by role.
+
+   Pass:
      - draft_name = "ICYMI - <YYYY-MM-DD> - <short topic>"
-     - subject = the chosen subject line (NOT all the options — just the
-       one the user picked)
-     - body_text = the approved body, including hero line, intro, 3
-       project modules with links, and Laser Focus
-   Note: HubSpot's preheader is a separate field that update_email_body
-   doesn't touch yet, so call out the chosen preheader in your reply so
-   the user can paste it into the HubSpot UI manually.
+     - subject = the chosen subject line (just one)
+     - preheader = the chosen preheader (just one)
+     - content_by_role = an object with these keys:
+         intro_body         — just the intro paragraph(s); NO hero headline
+         project_1_title    — catchy module title
+         project_1_body     — 2-4 sentences, with @<maker> as a markdown
+                              link to community.glowforge.com/u/<maker>/summary,
+                              AND the forum post URL embedded as a markdown
+                              link inside the body
+         project_2_title    — same shape
+         project_2_body     — same shape
+         project_3_title    — same shape
+         project_3_body     — same shape
+         laser_focus_body   — INCLUDES both the title (e.g., "**Laser
+                              Focus: The X Secret**") and the 3-5 sentence
+                              body, separated by a blank line, since they
+                              share one widget
+         signoff_body       — usually omit (template default is "Happy
+                              Making! The Glowforge Team"); only set if
+                              the user explicitly wants a different signoff
+
+   Inspect the body_update field on the response. If total_updated is less
+   than expected or any update has a status other than "updated", surface
+   that to the user honestly — don't claim success.
 
 8. After the draft is created, give the user the following in one reply:
    a) The HubSpot edit_url so they can review the draft.
-   b) The chosen preheader, called out plainly so they can paste it into
-      HubSpot's preheader field manually.
-   c) A list of the image URLs from each project, labeled by project (e.g.
+   b) A list of the image URLs from each project, labeled by project (e.g.
       "Project 1 — <title> by @<maker> images: <url>, <url>") so the user
-      can manually upload them into HubSpot.
+      can manually upload them into HubSpot. The template's image modules
+      are NOT updated by the tool.
+   c) A note that each project's CTA button (the "View on the Forum" /
+      "Read more" button under each project) carries over from the master
+      template and likely points to LAST WEEK's URLs — the user should
+      update those button URLs in HubSpot to point to this week's forum
+      posts.
    d) A single-line log entry the user can paste into their tracking doc:
         ICYMI <YYYY-MM-DD> | <Project 1 title> by @<maker1> | <Project 2 title> by @<maker2> | <Project 3 title> by @<maker3> | Subject: "<subject>"
 
@@ -509,6 +559,54 @@ def _tool_search_hubspot_contacts(args: Dict[str, Any]) -> Dict[str, Any]:
 def _tool_list_contact_properties(args: Dict[str, Any]) -> Dict[str, Any]:
     props = list_contact_properties(name_contains=args.get("name_contains"))
     return {"count": len(props), "properties": props[:200]}
+
+
+def _tool_create_icymi_draft(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Clone the ICYMI master template, set subject/preheader/name, and
+    populate each per-role module via the widget map.
+
+    Returns the edit_url plus a per-module update report so we can see
+    whether every slot landed cleanly. If the body update reports an
+    error (e.g., template was edited and widget IDs drifted), surface
+    that to the user rather than pretending the draft is good.
+    """
+    name = str(args["draft_name"])
+    subject = str(args["subject"])
+    preheader = str(args.get("preheader", "") or "")
+    content_by_role = args["content_by_role"]
+    if not isinstance(content_by_role, dict):
+        return {"error": "content_by_role must be an object."}
+
+    # Step 1: Clone the canonical ICYMI master.
+    cloned = clone_marketing_email(ICYMI_MASTER_TEMPLATE_ID, name)
+    new_id = cloned.get("id")
+    if not new_id:
+        return {"error": "Clone failed — no ID returned.", "raw": cloned}
+
+    # Step 2: Set name, subject, and (now) preheader in one PATCH. HubSpot
+    # exposes preheader as the top-level `previewText` field.
+    update_fields: Dict[str, Any] = {"name": name, "subject": subject}
+    if preheader:
+        update_fields["previewText"] = preheader
+    updated = update_marketing_email(str(new_id), **update_fields)
+
+    # Step 3: Patch every content widget by role in a single request.
+    body_result = update_email_by_widget_map(
+        str(new_id),
+        content_by_role,
+        ICYMI_WIDGET_MAP,
+    )
+
+    return {
+        "draft_id": new_id,
+        "draft_name": updated.get("name", name),
+        "subject": updated.get("subject", subject),
+        "preheader": updated.get("previewText", preheader),
+        "edit_url": (
+            f"https://app.hubspot.com/email/{HUBSPOT_PORTAL_ID}/edit/{new_id}/content"
+        ),
+        "body_update": body_result,
+    }
 
 
 def _tool_create_email_draft(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -1061,6 +1159,128 @@ TOOLS: List[Dict[str, Any]] = [
         },
     },
     {
+        "name": "create_icymi_draft",
+        "description": (
+            "Create a new ICYMI weekly recap draft in HubSpot. Clones the "
+            "canonical ICYMI master template (handled internally — Mark does "
+            "not pass a template ID), sets subject/preheader/name, and "
+            "populates each per-role module: intro, three project modules "
+            "(title + body each), Laser Focus, and signoff.\n\n"
+            "Use this tool — NOT create_email_draft — for the ICYMI workflow. "
+            "Only call after the user has approved the draft with explicit "
+            "'ship it' or equivalent. The tool returns an edit_url plus a "
+            "body_update report; if any module reports anything other than "
+            "'updated' status, surface that to the user honestly so they "
+            "know to fix it in HubSpot.\n\n"
+            "Body formatting: each role's text supports light markdown — "
+            "**bold**, *italic*, [link text](url). Use double newlines "
+            "between paragraphs. The maker's @username MUST be a markdown "
+            "link to their community profile. The forum post URL should "
+            "be embedded as a markdown link inside the project body (e.g., "
+            "'... [View on the forum](https://...)' at the end). The "
+            "template's per-project CTA buttons are NOT updated and may "
+            "still point to the previous week's URLs — call this out in "
+            "the post-ship-it reply so the user can fix them in HubSpot."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "draft_name": {
+                    "type": "string",
+                    "description": (
+                        "Internal name for the new draft (visible in HubSpot, "
+                        "not to recipients). Use the format "
+                        "'ICYMI - <YYYY-MM-DD> - <short topic>'."
+                    ),
+                },
+                "subject": {
+                    "type": "string",
+                    "description": (
+                        "The chosen subject line — one final pick, NOT all "
+                        "the options the user reviewed."
+                    ),
+                },
+                "preheader": {
+                    "type": "string",
+                    "description": (
+                        "The chosen preheader (preview text). Will be set as "
+                        "the email's previewText field automatically."
+                    ),
+                },
+                "content_by_role": {
+                    "type": "object",
+                    "description": (
+                        "Structured body content. Each value is the plain "
+                        "text/markdown for that section — no need to add HTML "
+                        "tags; the tool builds them."
+                    ),
+                    "properties": {
+                        "intro_body": {
+                            "type": "string",
+                            "description": (
+                                "Just the intro paragraph(s) that set up the "
+                                "week's theme. Do NOT include the hero "
+                                "headline ('ICYMI: Glowforge Projects That "
+                                "Made Us Stop Scrolling') — that lives in a "
+                                "separate header image module."
+                            ),
+                        },
+                        "project_1_title": {
+                            "type": "string",
+                            "description": (
+                                "Catchy 4-8 word title for project 1. Riff "
+                                "on the project, don't just name it. Optional "
+                                "leading emoji."
+                            ),
+                        },
+                        "project_1_body": {
+                            "type": "string",
+                            "description": (
+                                "2-4 sentence body for project 1. Must "
+                                "include the maker handle as a markdown link "
+                                "to their community profile, AND the forum "
+                                "post URL as an inline markdown link "
+                                "somewhere in the body."
+                            ),
+                        },
+                        "project_2_title": {"type": "string"},
+                        "project_2_body": {"type": "string"},
+                        "project_3_title": {"type": "string"},
+                        "project_3_body": {"type": "string"},
+                        "laser_focus_body": {
+                            "type": "string",
+                            "description": (
+                                "Includes BOTH the Laser Focus title (e.g., "
+                                "'Laser Focus: The X Secret') and the 3-5 "
+                                "sentence body, since they share one widget "
+                                "in the template. Put the title on its own "
+                                "line in **bold**, then a blank line, then "
+                                "the body."
+                            ),
+                        },
+                        "signoff_body": {
+                            "type": "string",
+                            "description": (
+                                "Optional. If omitted, the template's "
+                                "default 'Happy Making! The Glowforge Team' "
+                                "carries over. Only override if the user "
+                                "wants something different."
+                            ),
+                        },
+                    },
+                    "required": [
+                        "intro_body",
+                        "project_1_title", "project_1_body",
+                        "project_2_title", "project_2_body",
+                        "project_3_title", "project_3_body",
+                        "laser_focus_body",
+                    ],
+                },
+            },
+            "required": ["draft_name", "subject", "preheader", "content_by_role"],
+        },
+    },
+    {
         "name": "create_email_draft",
         "description": (
             "Create a NEW draft marketing email in HubSpot by cloning an existing "
@@ -1121,6 +1341,7 @@ TOOL_HANDLERS: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     "get_workflow_details": _tool_get_workflow_details,
     "get_workflow_enrollments": _tool_get_workflow_enrollments,
     "get_marketing_email_stats": _tool_get_marketing_email_stats,
+    "create_icymi_draft": _tool_create_icymi_draft,
     "create_email_draft": _tool_create_email_draft,
     "get_subscription_distribution": _tool_get_subscription_distribution,
     "count_inactive_users": _tool_count_inactive_users,
