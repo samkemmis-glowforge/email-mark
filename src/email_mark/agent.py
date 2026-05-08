@@ -205,9 +205,15 @@ Steps:
           e.g. "Taking the Cake" for a wedding cake topper, not "Cake
           Topper"). 4-8 words.
         - 2-4 sentences. Lead with the hook. Credit the maker by their
-          forum username with the @ prefix. Weave materials/techniques
-          into the prose, not as a spec sheet. Each summary should make
-          the reader think "I want to try that" or "that's clever."
+          forum username with the @ prefix, and ALWAYS make the maker's
+          handle a link to their community profile, formatted as markdown:
+            [@<username>](https://community.glowforge.com/u/<username>/summary)
+          Use the username exactly as fetch_forum_post returned it (no
+          spaces, no transformation). Don't append UTM or HubSpot tracking
+          params — HubSpot adds those automatically when the email sends.
+        - Weave materials/techniques into the prose, not as a spec sheet.
+          Each summary should make the reader think "I want to try that"
+          or "that's clever."
         - The forum URL for the project, on its own line at the bottom of
           the module.
         - Strategic emoji: max 1-2 per module, only when they add energy.
