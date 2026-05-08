@@ -145,27 +145,50 @@ def get_ab_test_variations(email_id: str) -> List[Dict[str, Any]]:
 
 
 def get_workflow_details(workflow_id: str) -> Dict[str, Any]:
-    """Get metadata for a HubSpot workflow.
+    """Get metadata for a HubSpot workflow / flow.
 
-    Useful to confirm the workflow exists, see its name, and check its
-    enrollment trigger before calling get_workflow_enrollments.
+    Tries the v4 Flows API first (modern workflows created in the UI),
+    falls back to the v3 Workflows API (legacy).
     """
-    response = requests.get(
+    # Try v4 flows first — the modern API.
+    v4_response = requests.get(
+        f"{HUBSPOT_BASE}/automation/v4/flows/{workflow_id}",
+        headers=_headers(),
+        timeout=30,
+    )
+    if v4_response.status_code == 200:
+        data = v4_response.json()
+        data["_api_version"] = "v4"
+        return data
+    if v4_response.status_code == 403:
+        return {
+            "error": "Access denied to v4 flows API. Check 'automation' scope on Service Key."
+        }
+
+    # Fall back to v3 workflows.
+    v3_response = requests.get(
         f"{HUBSPOT_BASE}/automation/v3/workflows/{workflow_id}",
         headers=_headers(),
         timeout=30,
     )
-    if response.status_code == 403:
+    if v3_response.status_code == 200:
+        data = v3_response.json()
+        data["_api_version"] = "v3"
+        return data
+    if v3_response.status_code == 403:
         return {
-            "error": (
-                "Access denied. The Service Key likely needs the "
-                "'automation' scope to read workflows."
-            )
+            "error": "Access denied to v3 workflows API. Check 'automation' scope on Service Key."
         }
-    if response.status_code == 404:
-        return {"error": f"Workflow {workflow_id} not found."}
-    response.raise_for_status()
-    return response.json()
+
+    return {
+        "error": (
+            f"Workflow {workflow_id} not found in either v3 or v4 APIs. "
+            "The ID may be wrong, or the Service Key may not have access "
+            "to this specific workflow. Check the workflow URL in HubSpot — "
+            "if it contains '/platform/flow/' it's a v4 flow; if it contains "
+            "'/main/edit/' it's a v3 workflow."
+        )
+    }
 
 
 def get_workflow_enrollments(workflow_id: str, limit: int = 250) -> Dict[str, Any]:
