@@ -46,7 +46,7 @@ from email_mark.warehouse import (
 load_dotenv(find_dotenv())
 
 MODEL = "claude-sonnet-4-5"
-MAX_AGENT_TURNS = 10  # Hard cap so a runaway loop can't burn through tokens.
+MAX_AGENT_TURNS = 25  # Hard cap so a runaway loop can't burn through tokens.
 HUBSPOT_PORTAL_ID = "8614495"  # Glowforge HubSpot portal — used for UI URLs.
 
 # Conversation memory. Keyed by an external conversation_id (e.g., Slack
