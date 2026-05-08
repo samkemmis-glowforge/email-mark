@@ -311,12 +311,7 @@ Steps:
       "Project 1 — <title> by @<maker> images: <url>, <url>") so the user
       can manually upload them into HubSpot. The template's image modules
       are NOT updated by the tool.
-   c) A note that each project's CTA button (the "View on the Forum" /
-      "Read more" button under each project) carries over from the master
-      template and likely points to LAST WEEK's URLs — the user should
-      update those button URLs in HubSpot to point to this week's forum
-      posts.
-   d) A single-line log entry the user can paste into their tracking doc:
+   c) A single-line log entry the user can paste into their tracking doc:
         ICYMI <YYYY-MM-DD> | <Project 1 title> by @<maker1> | <Project 2 title> by @<maker2> | <Project 3 title> by @<maker3> | Subject: "<subject>"
 
 9. End with a brief reminder that the draft is in HubSpot only — Mark
@@ -1177,10 +1172,7 @@ TOOLS: List[Dict[str, Any]] = [
             "between paragraphs. The maker's @username MUST be a markdown "
             "link to their community profile. The forum post URL should "
             "be embedded as a markdown link inside the project body (e.g., "
-            "'... [View on the forum](https://...)' at the end). The "
-            "template's per-project CTA buttons are NOT updated and may "
-            "still point to the previous week's URLs — call this out in "
-            "the post-ship-it reply so the user can fix them in HubSpot."
+            "'... [View on the forum](https://...)' at the end)."
         ),
         "input_schema": {
             "type": "object",
