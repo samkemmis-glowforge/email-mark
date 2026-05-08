@@ -144,6 +144,30 @@ def get_ab_test_variations(email_id: str) -> List[Dict[str, Any]]:
     return response.json().get("results", [])
 
 
+def list_workflows(limit: int = 100) -> Dict[str, Any]:
+    """List workflows accessible to the Service Key.
+
+    Returns whatever the v3 workflows API exposes. If empty or 403, the
+    automation scope isn't doing what we need (or modern flows aren't
+    accessible via this API).
+    """
+    response = requests.get(
+        f"{HUBSPOT_BASE}/automation/v3/workflows",
+        headers=_headers(),
+        params={"limit": int(limit)},
+        timeout=30,
+    )
+    if response.status_code == 403:
+        return {
+            "error": (
+                "Access denied. Service Key likely missing automation scope, "
+                "or scope not yet active (try regenerating the key)."
+            )
+        }
+    response.raise_for_status()
+    return response.json()
+
+
 def get_workflow_details(workflow_id: str) -> Dict[str, Any]:
     """Get metadata for a HubSpot workflow / flow.
 

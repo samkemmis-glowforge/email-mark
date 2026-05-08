@@ -31,6 +31,7 @@ from email_mark.hubspot_marketing import (
     get_workflow_details,
     get_workflow_enrollments,
     list_marketing_emails,
+    list_workflows,
     update_email_body,
     update_marketing_email,
 )
@@ -299,6 +300,10 @@ def _tool_get_email_engagement_contacts(args: Dict[str, Any]) -> Dict[str, Any]:
     )
 
 
+def _tool_list_workflows(args: Dict[str, Any]) -> Dict[str, Any]:
+    return list_workflows(limit=int(args.get("limit", 100)))
+
+
 def _tool_get_workflow_details(args: Dict[str, Any]) -> Dict[str, Any]:
     return get_workflow_details(str(args["workflow_id"]))
 
@@ -505,6 +510,25 @@ TOOLS: List[Dict[str, Any]] = [
                 },
             },
             "required": ["user_id", "text"],
+        },
+    },
+    {
+        "name": "list_workflows",
+        "description": (
+            "List workflows accessible to the Service Key via HubSpot's "
+            "v3 workflows API. Use this to diagnose whether the automation "
+            "scope is working and which workflows are actually accessible. "
+            "If this returns nothing or errors, the v3 API isn't seeing "
+            "modern flows — meaning we likely can't query them at all."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "description": "Max workflows to return (default 100).",
+                },
+            },
         },
     },
     {
@@ -900,6 +924,7 @@ TOOL_HANDLERS: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     "get_email_body": _tool_get_email_body,
     "get_email_engagement_contacts": _tool_get_email_engagement_contacts,
     "get_contact_email_events": _tool_get_contact_email_events,
+    "list_workflows": _tool_list_workflows,
     "get_workflow_details": _tool_get_workflow_details,
     "get_workflow_enrollments": _tool_get_workflow_enrollments,
     "get_marketing_email_stats": _tool_get_marketing_email_stats,
