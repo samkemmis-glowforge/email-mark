@@ -18,6 +18,7 @@ from typing import Any, Callable, Dict, List, Optional
 from anthropic import Anthropic
 from dotenv import find_dotenv, load_dotenv
 
+from email_mark.forum import fetch_forum_post
 from email_mark.hubspot_crm import (
     list_contact_properties,
     search_contacts,
@@ -146,6 +147,53 @@ DRAFTING EMAILS — workflow:
    to paste the body manually.
 7. If you don't know which template to use, call search_marketing_emails to
    suggest 2-3 candidates and let the user pick.
+
+ICYMI WORKFLOW — the weekly "In Case You Missed It" project highlight email:
+This is a recurring task. The user (Sam or another marketer) will send you
+3 URLs from community.glowforge.com — each links to a maker's project share.
+Your job is to draft an email celebrating those 3 projects.
+
+Steps:
+1. The trigger is "ICYMI" or "in case you missed it" plus 3 URLs (or the user
+   pasting URLs after explicitly mentioning ICYMI). If you only get 1-2 URLs,
+   ask politely for the rest before starting.
+2. For EACH url, call fetch_forum_post. You'll get back title, author username,
+   body_text (HTML stripped), and image_urls. The author's username is the
+   "maker" credit.
+3. Draft the email — keep it short and warm:
+   - Catchy subject line referencing one or all three projects.
+   - A brief 1-2 line opener celebrating community creativity (apply brand voice).
+   - For each of the 3 projects: a 2-4 sentence write-up. Lead with what makes
+     the project striking (the hook), credit the maker by username, and link
+     out to their forum post. Don't just paraphrase the body — pull out the
+     specific detail that will make a reader want to click.
+   - Optional "Laser Focus of the Week" section if the user requests one
+     (a single material, technique, or design tip lifted from the projects).
+4. After presenting the draft in chat, remind the user with EXACTLY this kind
+   of phrasing: "Looks good? Say 'ship it' and I'll build the HubSpot draft."
+   Don't auto-create the draft. Wait for explicit "ship it" (or equivalent
+   approval like "yes ship it", "go ahead", "looks good ship it").
+5. Iterate on tone, length, project order, etc. as the user requests. After
+   each revision, repeat the "ship it" reminder.
+6. ON SHIP-IT: search_marketing_emails for a recent ICYMI email to use as the
+   clone template — pass name_contains="ICYMI" and pick the most recent by
+   publish_date or created. Then call create_email_draft with:
+     - template_email_id = that recent ICYMI's id
+     - draft_name = "ICYMI - <YYYY-MM-DD> - <short topic>"
+     - subject = the approved subject line
+     - body_text = the approved body with project links
+7. After the draft is created, give the user TWO things in the same reply:
+   a) The HubSpot edit_url so they can review the draft.
+   b) A list of the image URLs from each project (label them by project,
+      e.g. "Project 1 (laser-engraved jewelry box) images: <url>, <url>") so
+      the user can manually upload them into HubSpot — we don't have an API
+      for image upload yet.
+   c) A single-line log entry the user can paste into their tracking doc,
+      formatted like:
+        ICYMI <YYYY-MM-DD> | <Project 1 title> by @<maker1> | <Project 2 title>
+        by @<maker2> | <Project 3 title> by @<maker3> | Subject: "<subject>"
+8. End with a brief reminder that the draft is in HubSpot only — Mark doesn't
+   send.
 
 DATA WAREHOUSE — what's wired up:
 - Prebuilt aggregate tools: get_subscription_distribution, count_inactive_users,
@@ -324,6 +372,10 @@ def _tool_get_contact_email_events(args: Dict[str, Any]) -> Dict[str, Any]:
     )
 
 
+def _tool_fetch_forum_post(args: Dict[str, Any]) -> Dict[str, Any]:
+    return fetch_forum_post(str(args["url"]))
+
+
 def _tool_lookup_slack_user(args: Dict[str, Any]) -> Dict[str, Any]:
     matches = slack_lookup_user(args.get("query", ""))
     return {"matches": matches[:10], "total_matches": len(matches)}
@@ -459,6 +511,31 @@ TOOLS: List[Dict[str, Any]] = [
                 },
             },
             "required": ["name_contains"],
+        },
+    },
+    {
+        "name": "fetch_forum_post",
+        "description": (
+            "Fetch a project share from community.glowforge.com. Returns "
+            "the topic title, author username (the 'maker'), the original "
+            "post body with HTML stripped, and a list of image URLs from "
+            "the post. Use this in the ICYMI workflow: the user gives you "
+            "3 forum URLs and you call this tool once per URL to get the "
+            "raw material for the email. Only works on community.glowforge.com "
+            "URLs — for any other domain it returns an error."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": (
+                        "Full community.glowforge.com topic URL "
+                        "(e.g. https://community.glowforge.com/t/<slug>/<id>)."
+                    ),
+                },
+            },
+            "required": ["url"],
         },
     },
     {
@@ -921,6 +998,7 @@ TOOLS: List[Dict[str, Any]] = [
 
 TOOL_HANDLERS: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     "search_marketing_emails": _tool_search_marketing_emails,
+    "fetch_forum_post": _tool_fetch_forum_post,
     "get_email_body": _tool_get_email_body,
     "get_email_engagement_contacts": _tool_get_email_engagement_contacts,
     "get_contact_email_events": _tool_get_contact_email_events,
