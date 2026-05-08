@@ -1212,6 +1212,28 @@ def chat(
     turn_count = 0
     tool_call_count = 0
 
+    # ----- Prompt caching setup -----
+    # The system prompt and tool definitions don't change between turns,
+    # so we mark them as cacheable. Anthropic caches the prefix up to (and
+    # including) each cache_control marker. With markers on the last tool
+    # AND the system prompt, both blocks get reused on subsequent turns
+    # within the 5-minute cache window. For Mark's usage pattern — multi-
+    # turn ICYMI iteration sessions — every turn after the first should
+    # hit the cache for the ~14k of static prompt prefix.
+    system_blocks = [
+        {
+            "type": "text",
+            "text": system_prompt,
+            "cache_control": {"type": "ephemeral"},
+        }
+    ]
+    tools_for_call: List[Dict[str, Any]] = [dict(t) for t in TOOLS]
+    if tools_for_call:
+        tools_for_call[-1] = {
+            **tools_for_call[-1],
+            "cache_control": {"type": "ephemeral"},
+        }
+
     final_text = ""
     for turn_idx in range(MAX_AGENT_TURNS):
         turn_count = turn_idx + 1
@@ -1220,8 +1242,8 @@ def chat(
         response = client.messages.create(
             model=MODEL,
             max_tokens=4096,
-            system=system_prompt,
-            tools=TOOLS,
+            system=system_blocks,
+            tools=tools_for_call,
             messages=messages,
         )
         inference_elapsed = time.perf_counter() - inference_start
@@ -1229,10 +1251,15 @@ def chat(
         usage = getattr(response, "usage", None)
         in_tokens = getattr(usage, "input_tokens", "?") if usage else "?"
         out_tokens = getattr(usage, "output_tokens", "?") if usage else "?"
+        # cache_creation_input_tokens = tokens written to cache (first turn)
+        # cache_read_input_tokens     = tokens served FROM cache (the win)
+        cache_create = getattr(usage, "cache_creation_input_tokens", 0) if usage else 0
+        cache_read = getattr(usage, "cache_read_input_tokens", 0) if usage else 0
         print(
             f"[timing] inference turn={turn_count} "
             f"elapsed={inference_elapsed:.2f}s "
             f"in_tokens={in_tokens} out_tokens={out_tokens} "
+            f"cache_create={cache_create} cache_read={cache_read} "
             f"stop_reason={response.stop_reason}",
             flush=True,
         )
