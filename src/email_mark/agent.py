@@ -30,6 +30,7 @@ from email_mark.hubspot_marketing import (
     get_email_body_text,
     get_email_engagement_contacts,
     get_email_statistics,
+    get_email_widget_structure,
     get_workflow_details,
     get_workflow_enrollments,
     list_marketing_emails,
@@ -423,6 +424,10 @@ def _tool_get_marketing_email_stats(args: Dict[str, Any]) -> Dict[str, Any]:
 
 def _tool_get_email_body(args: Dict[str, Any]) -> Dict[str, Any]:
     return get_email_body_text(str(args["email_id"]))
+
+
+def _tool_get_email_widget_structure(args: Dict[str, Any]) -> Dict[str, Any]:
+    return get_email_widget_structure(str(args["email_id"]))
 
 
 def _tool_get_email_engagement_contacts(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -842,6 +847,30 @@ TOOLS: List[Dict[str, Any]] = [
         },
     },
     {
+        "name": "get_email_widget_structure",
+        "description": (
+            "Diagnostic tool for inspecting the widget layout of a HubSpot "
+            "marketing email. Returns each widget's id, type, label, HTML "
+            "text length, and a short text preview — sorted by widget id "
+            "(roughly visual order). Use this to figure out how a template "
+            "is structured before trying to populate it programmatically. "
+            "Useful when create_email_draft produced a result that didn't "
+            "land in the right modules — running this on the template "
+            "you cloned shows whether the template uses one big text "
+            "widget or multiple per-section widgets."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "email_id": {
+                    "type": "string",
+                    "description": "The marketing email's HubSpot ID.",
+                },
+            },
+            "required": ["email_id"],
+        },
+    },
+    {
         "name": "get_marketing_email_stats",
         "description": (
             "Get send/open/click/unsubscribe statistics for a specific marketing "
@@ -1085,6 +1114,7 @@ TOOL_HANDLERS: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     "search_marketing_emails": _tool_search_marketing_emails,
     "fetch_forum_post": _tool_fetch_forum_post,
     "get_email_body": _tool_get_email_body,
+    "get_email_widget_structure": _tool_get_email_widget_structure,
     "get_email_engagement_contacts": _tool_get_email_engagement_contacts,
     "get_contact_email_events": _tool_get_contact_email_events,
     "list_workflows": _tool_list_workflows,

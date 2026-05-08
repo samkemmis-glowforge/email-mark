@@ -114,6 +114,55 @@ def get_email_body_text(email_id: str) -> Dict[str, Any]:
     }
 
 
+def get_email_widget_structure(email_id: str) -> Dict[str, Any]:
+    """Return the widget layout of a marketing email — for diagnosing
+    template structure before trying to populate it programmatically.
+
+    For each widget we return its id, type, length of HTML text content,
+    and a short text preview (first ~200 chars, HTML-stripped). Sorted by
+    widget id so the order roughly matches visual order in the email.
+    """
+    response = requests.get(
+        f"{HUBSPOT_BASE}/marketing/v3/emails/{email_id}",
+        headers=_headers(),
+        params={"includeStats": "true"},
+        timeout=30,
+    )
+    response.raise_for_status()
+    email = response.json()
+
+    content = email.get("content") if isinstance(email.get("content"), dict) else {}
+    widgets = (content or {}).get("widgets") if isinstance(content, dict) else {}
+
+    rows: List[Dict[str, Any]] = []
+    if isinstance(widgets, dict):
+        for wid, widget in sorted(widgets.items()):
+            if not isinstance(widget, dict):
+                continue
+            body = widget.get("body") if isinstance(widget.get("body"), dict) else {}
+            html = body.get("html") if isinstance(body.get("html"), str) else ""
+            text_only = re.sub(r"<[^>]+>", " ", html or "")
+            text_only = re.sub(r"\s+", " ", text_only).strip()
+            rows.append(
+                {
+                    "widget_id": wid,
+                    "widget_type": widget.get("type") or widget.get("name") or "",
+                    "label": widget.get("label") or "",
+                    "html_text_length": len(text_only),
+                    "text_preview": text_only[:200],
+                    "has_html_field": bool(html),
+                }
+            )
+
+    return {
+        "email_id": email.get("id"),
+        "email_name": email.get("name"),
+        "subject": email.get("subject"),
+        "widget_count": len(rows),
+        "widgets": rows,
+    }
+
+
 def get_email_statistics(email_id: str) -> Dict[str, Any]:
     """Stats for a single marketing email.
 
