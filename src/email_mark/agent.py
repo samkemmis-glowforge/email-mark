@@ -24,6 +24,7 @@ from email_mark.hubspot_crm import (
 )
 from email_mark.hubspot_marketing import (
     clone_marketing_email,
+    get_contact_email_events,
     get_email_body_text,
     get_email_engagement_contacts,
     get_email_statistics,
@@ -280,6 +281,15 @@ def _tool_get_email_engagement_contacts(args: Dict[str, Any]) -> Dict[str, Any]:
     )
 
 
+def _tool_get_contact_email_events(args: Dict[str, Any]) -> Dict[str, Any]:
+    return get_contact_email_events(
+        contact_email=str(args["contact_email"]),
+        email_ids=args.get("email_ids"),
+        event_types=args.get("event_types"),
+        limit=int(args.get("limit", 100)),
+    )
+
+
 def _tool_lookup_slack_user(args: Dict[str, Any]) -> Dict[str, Any]:
     matches = slack_lookup_user(args.get("query", ""))
     return {"matches": matches[:10], "total_matches": len(matches)}
@@ -466,6 +476,44 @@ TOOLS: List[Dict[str, Any]] = [
                 },
             },
             "required": ["user_id", "text"],
+        },
+    },
+    {
+        "name": "get_contact_email_events",
+        "description": (
+            "Get email engagement events for a specific contact, looked up "
+            "by their email address. Use this for REVERSE attribution: "
+            "instead of asking 'which contacts got email X?' (which doesn't "
+            "work for automated emails), ask 'what emails did this contact "
+            "receive/open/click?' and filter to a campaign's email IDs. "
+            "Pass email_ids to get only events matching the campaign's emails. "
+            "PRIVACY: requires a contact's email — only use this in service of "
+            "aggregate analysis, never echo individual emails or events back "
+            "to the user."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "contact_email": {
+                    "type": "string",
+                    "description": "Contact's email address.",
+                },
+                "email_ids": {
+                    "type": "array",
+                    "description": "Optional list of marketing email IDs to filter events by.",
+                    "items": {"type": "string"},
+                },
+                "event_types": {
+                    "type": "array",
+                    "description": "Optional event type filter: DELIVERED, OPEN, CLICK, BOUNCE, UNSUBSCRIBE.",
+                    "items": {"type": "string"},
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max events returned (default 100, max 1000).",
+                },
+            },
+            "required": ["contact_email"],
         },
     },
     {
@@ -772,6 +820,7 @@ TOOL_HANDLERS: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     "search_marketing_emails": _tool_search_marketing_emails,
     "get_email_body": _tool_get_email_body,
     "get_email_engagement_contacts": _tool_get_email_engagement_contacts,
+    "get_contact_email_events": _tool_get_contact_email_events,
     "get_marketing_email_stats": _tool_get_marketing_email_stats,
     "create_email_draft": _tool_create_email_draft,
     "get_subscription_distribution": _tool_get_subscription_distribution,

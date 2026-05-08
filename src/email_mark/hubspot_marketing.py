@@ -144,6 +144,71 @@ def get_ab_test_variations(email_id: str) -> List[Dict[str, Any]]:
     return response.json().get("results", [])
 
 
+def get_contact_email_events(
+    contact_email: str,
+    email_ids: Optional[List[str]] = None,
+    event_types: Optional[List[str]] = None,
+    limit: int = 100,
+) -> Dict[str, Any]:
+    """Get email engagement events for a specific contact (queried by their email).
+
+    Used for the REVERSE attribution query: instead of "which contacts got
+    email X?" (which doesn't work for automated emails), we ask "what emails
+    did this contact receive?" and filter to the campaign's email IDs.
+
+    Args:
+      contact_email: The contact's email address.
+      email_ids: Optional list of marketing email IDs. If provided, only
+        events matching these emailIds are returned.
+      event_types: Optional list of event types (DELIVERED, OPEN, CLICK,
+        BOUNCE, UNSUBSCRIBE). HubSpot v1 events API only takes one at a time;
+        if multiple are passed, we filter client-side.
+      limit: Max events returned (HubSpot caps at 1000).
+
+    Returns dict with event_count, matched_email_ids (the unique email IDs
+    the contact engaged with from the filter list), and the events themselves.
+    """
+    params: Dict[str, Any] = {"recipient": contact_email, "limit": min(int(limit), 1000)}
+    if event_types and len(event_types) == 1:
+        params["eventType"] = event_types[0]
+
+    response = requests.get(
+        f"{HUBSPOT_BASE}/email/public/v1/events",
+        headers=_headers(),
+        params=params,
+        timeout=30,
+    )
+    if response.status_code == 403:
+        return {"error": "Access denied to Email Events API."}
+    response.raise_for_status()
+    data = response.json()
+    events = data.get("events", []) or []
+
+    # Apply client-side filters not handled by the API.
+    if email_ids:
+        target = {str(e) for e in email_ids}
+        events = [e for e in events if str(e.get("emailId")) in target]
+    if event_types and len(event_types) > 1:
+        target_types = {t.upper() for t in event_types}
+        events = [e for e in events if str(e.get("type", "")).upper() in target_types]
+
+    matched_ids = sorted({str(e.get("emailId")) for e in events if e.get("emailId") is not None})
+
+    return {
+        "contact_email": contact_email,
+        "event_count": len(events),
+        "matched_email_ids": matched_ids,
+        "events": [
+            {
+                "emailId": e.get("emailId"),
+                "type": e.get("type"),
+                "created": e.get("created"),
+            }
+            for e in events[:50]  # cap raw events to keep response small
+        ],
+    }
+
+
 def get_email_engagement_contacts(
     email_id: str,
     event_type: str = "DELIVERED",
