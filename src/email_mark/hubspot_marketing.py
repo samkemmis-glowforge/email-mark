@@ -144,6 +144,73 @@ def get_ab_test_variations(email_id: str) -> List[Dict[str, Any]]:
     return response.json().get("results", [])
 
 
+def get_email_engagement_contacts(
+    email_id: str,
+    event_type: str = "DELIVERED",
+    max_unique: int = 5000,
+) -> Dict[str, Any]:
+    """Pull unique HubSpot contact IDs who had a specific event with a
+    marketing email — used for attribution analysis.
+
+    `event_type` options: DELIVERED, SENT, OPEN, CLICK, BOUNCE,
+    UNSUBSCRIBE, DROPPED, SPAMREPORT.
+
+    Returns the count and a list of contact IDs (vids only — no emails or
+    names). Caps pagination at max_unique IDs to prevent runaway calls
+    on huge campaigns. The returned IDs can be passed to
+    search_hubspot_contacts with a `hs_object_id IN [...]` filter to
+    aggregate by subscription status, lifecycle stage, etc.
+    """
+    vids: set = set()
+    offset: Optional[str] = None
+    pages = 0
+    MAX_PAGES = 30
+
+    while pages < MAX_PAGES:
+        params: Dict[str, Any] = {
+            "emailId": str(email_id),
+            "eventType": event_type,
+            "limit": 1000,
+        }
+        if offset:
+            params["offset"] = offset
+
+        response = requests.get(
+            f"{HUBSPOT_BASE}/email/public/v1/events",
+            headers=_headers(),
+            params=params,
+            timeout=30,
+        )
+        if response.status_code == 403:
+            return {
+                "error": (
+                    "Access denied to HubSpot Email Events API. The "
+                    "Service Key likely needs the 'content' scope (or its "
+                    "equivalent) for marketing email events."
+                )
+            }
+        response.raise_for_status()
+        data = response.json()
+
+        for event in data.get("events", []) or []:
+            vid = event.get("vid")
+            if vid is not None:
+                vids.add(vid)
+
+        if not data.get("hasMore") or len(vids) >= max_unique:
+            break
+        offset = data.get("offset")
+        pages += 1
+
+    return {
+        "email_id": email_id,
+        "event_type": event_type,
+        "unique_contact_count": len(vids),
+        "contact_ids": sorted(list(vids))[:max_unique],
+        "truncated": len(vids) >= max_unique or pages >= MAX_PAGES,
+    }
+
+
 def clone_marketing_email(source_id: str, new_name: str) -> Dict[str, Any]:
     """Clone an existing marketing email. Returns the new email object."""
     response = requests.post(

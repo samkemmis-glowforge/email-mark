@@ -25,6 +25,7 @@ from email_mark.hubspot_crm import (
 from email_mark.hubspot_marketing import (
     clone_marketing_email,
     get_email_body_text,
+    get_email_engagement_contacts,
     get_email_statistics,
     list_marketing_emails,
     update_email_body,
@@ -271,6 +272,14 @@ def _tool_get_email_body(args: Dict[str, Any]) -> Dict[str, Any]:
     return get_email_body_text(str(args["email_id"]))
 
 
+def _tool_get_email_engagement_contacts(args: Dict[str, Any]) -> Dict[str, Any]:
+    return get_email_engagement_contacts(
+        email_id=str(args["email_id"]),
+        event_type=str(args.get("event_type", "DELIVERED")),
+        max_unique=int(args.get("max_unique", 5000)),
+    )
+
+
 def _tool_lookup_slack_user(args: Dict[str, Any]) -> Dict[str, Any]:
     matches = slack_lookup_user(args.get("query", ""))
     return {"matches": matches[:10], "total_matches": len(matches)}
@@ -457,6 +466,46 @@ TOOLS: List[Dict[str, Any]] = [
                 },
             },
             "required": ["user_id", "text"],
+        },
+    },
+    {
+        "name": "get_email_engagement_contacts",
+        "description": (
+            "Get the unique HubSpot contact IDs (vids) who had a specific "
+            "engagement event with a marketing email — DELIVERED, OPEN, "
+            "CLICK, BOUNCE, UNSUBSCRIBE, etc. Returns the count plus the "
+            "list of contact IDs (no emails or names). Use this for "
+            "attribution analysis: cross-reference these IDs with "
+            "search_hubspot_contacts (using hs_object_id IN [...] filter "
+            "plus any subscription/lifecycle filter) to count how many "
+            "recipients are now Premium subscribers, etc.\n\n"
+            "Caveats: caps at 5000 contact IDs by default. For large "
+            "campaigns this may truncate — say so honestly. Pulling all "
+            "events for big campaigns can take 30-60 seconds. "
+            "search_hubspot_contacts limits IN-filter values per call, so "
+            "you may need to chunk the contact IDs into batches of ~100 "
+            "across multiple search calls."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "email_id": {
+                    "type": "string",
+                    "description": "Marketing email ID (from search_marketing_emails).",
+                },
+                "event_type": {
+                    "type": "string",
+                    "description": (
+                        "DELIVERED (default — recipients), SENT, OPEN, CLICK, "
+                        "BOUNCE, UNSUBSCRIBE, DROPPED, SPAMREPORT."
+                    ),
+                },
+                "max_unique": {
+                    "type": "integer",
+                    "description": "Cap on unique contact IDs returned (default 5000).",
+                },
+            },
+            "required": ["email_id"],
         },
     },
     {
@@ -722,6 +771,7 @@ TOOLS: List[Dict[str, Any]] = [
 TOOL_HANDLERS: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     "search_marketing_emails": _tool_search_marketing_emails,
     "get_email_body": _tool_get_email_body,
+    "get_email_engagement_contacts": _tool_get_email_engagement_contacts,
     "get_marketing_email_stats": _tool_get_marketing_email_stats,
     "create_email_draft": _tool_create_email_draft,
     "get_subscription_distribution": _tool_get_subscription_distribution,
