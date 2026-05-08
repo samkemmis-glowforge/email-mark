@@ -855,6 +855,51 @@ def reset_conversation(conversation_id: str) -> None:
     _conversations.pop(conversation_id, None)
 
 
+def _sanitize_history(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Trim leading orphaned tool_results and trailing unanswered tool_use blocks.
+
+    Anthropic's API rejects a request if:
+      - The first message contains a tool_result without a preceding tool_use, OR
+      - An assistant message ends with a tool_use that has no following tool_result.
+
+    Either can happen when the agent loop hits the turn cap mid-tool-call and
+    we save partial state. This makes loaded history safe to send.
+    """
+    msgs = list(messages)
+
+    # Drop leading user messages whose content includes any tool_result.
+    while msgs:
+        first = msgs[0]
+        content = first.get("content")
+        if isinstance(content, list) and any(
+            isinstance(b, dict) and b.get("type") == "tool_result" for b in content
+        ):
+            msgs = msgs[1:]
+            continue
+        break
+
+    # Drop trailing assistant messages whose content includes any tool_use
+    # (without a follow-up tool_result, which we'd already have appended).
+    while msgs:
+        last = msgs[-1]
+        if last.get("role") != "assistant":
+            break
+        content = last.get("content")
+        has_tool_use = False
+        if isinstance(content, list):
+            for b in content:
+                btype = b.get("type") if isinstance(b, dict) else getattr(b, "type", None)
+                if btype == "tool_use":
+                    has_tool_use = True
+                    break
+        if has_tool_use:
+            msgs = msgs[:-1]
+            continue
+        break
+
+    return msgs
+
+
 def chat(
     user_message: str,
     *,
@@ -870,7 +915,9 @@ def chat(
     client = _get_client()
 
     if conversation_id is not None:
-        messages: List[Dict[str, Any]] = list(_conversations.get(conversation_id, []))
+        messages: List[Dict[str, Any]] = _sanitize_history(
+            _conversations.get(conversation_id, [])
+        )
     else:
         messages = []
 
