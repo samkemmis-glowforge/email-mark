@@ -144,6 +144,58 @@ def get_ab_test_variations(email_id: str) -> List[Dict[str, Any]]:
     return response.json().get("results", [])
 
 
+def get_workflow_details(workflow_id: str) -> Dict[str, Any]:
+    """Get metadata for a HubSpot workflow.
+
+    Useful to confirm the workflow exists, see its name, and check its
+    enrollment trigger before calling get_workflow_enrollments.
+    """
+    response = requests.get(
+        f"{HUBSPOT_BASE}/automation/v3/workflows/{workflow_id}",
+        headers=_headers(),
+        timeout=30,
+    )
+    if response.status_code == 403:
+        return {
+            "error": (
+                "Access denied. The Service Key likely needs the "
+                "'automation' scope to read workflows."
+            )
+        }
+    if response.status_code == 404:
+        return {"error": f"Workflow {workflow_id} not found."}
+    response.raise_for_status()
+    return response.json()
+
+
+def get_workflow_enrollments(workflow_id: str, limit: int = 250) -> Dict[str, Any]:
+    """List currently enrolled contacts in a HubSpot workflow.
+
+    Returns contact IDs (vids) currently enrolled, plus pagination info.
+    Note: this returns ACTIVELY enrolled contacts. For a workflow that
+    fires once per contact and ends, completed enrollments may not be
+    returned — historical enrollment data may need a different approach
+    (e.g., reading per-contact workflow properties).
+    """
+    response = requests.get(
+        f"{HUBSPOT_BASE}/automation/v3/workflows/{workflow_id}/enrollments",
+        headers=_headers(),
+        params={"limit": min(int(limit), 250)},
+        timeout=30,
+    )
+    if response.status_code == 403:
+        return {
+            "error": (
+                "Access denied. The Service Key likely needs the "
+                "'automation' scope."
+            )
+        }
+    if response.status_code == 404:
+        return {"error": f"Workflow {workflow_id} not found."}
+    response.raise_for_status()
+    return response.json()
+
+
 def get_contact_email_events(
     contact_email: str,
     email_ids: Optional[List[str]] = None,

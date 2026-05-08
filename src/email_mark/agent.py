@@ -28,6 +28,8 @@ from email_mark.hubspot_marketing import (
     get_email_body_text,
     get_email_engagement_contacts,
     get_email_statistics,
+    get_workflow_details,
+    get_workflow_enrollments,
     list_marketing_emails,
     update_email_body,
     update_marketing_email,
@@ -297,6 +299,17 @@ def _tool_get_email_engagement_contacts(args: Dict[str, Any]) -> Dict[str, Any]:
     )
 
 
+def _tool_get_workflow_details(args: Dict[str, Any]) -> Dict[str, Any]:
+    return get_workflow_details(str(args["workflow_id"]))
+
+
+def _tool_get_workflow_enrollments(args: Dict[str, Any]) -> Dict[str, Any]:
+    return get_workflow_enrollments(
+        str(args["workflow_id"]),
+        limit=int(args.get("limit", 250)),
+    )
+
+
 def _tool_get_contact_email_events(args: Dict[str, Any]) -> Dict[str, Any]:
     return get_contact_email_events(
         contact_email=str(args["contact_email"]),
@@ -492,6 +505,56 @@ TOOLS: List[Dict[str, Any]] = [
                 },
             },
             "required": ["user_id", "text"],
+        },
+    },
+    {
+        "name": "get_workflow_details",
+        "description": (
+            "Get metadata for a HubSpot workflow by ID — name, type, "
+            "trigger criteria, and other details. Use this to verify a "
+            "workflow exists and confirm what triggers it before pulling "
+            "its enrollments."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "workflow_id": {
+                    "type": "string",
+                    "description": (
+                        "Numeric workflow ID. Visible in the HubSpot URL "
+                        "when viewing the workflow."
+                    ),
+                },
+            },
+            "required": ["workflow_id"],
+        },
+    },
+    {
+        "name": "get_workflow_enrollments",
+        "description": (
+            "List currently enrolled contacts in a HubSpot workflow. "
+            "Returns contact IDs (vids) of people currently in the workflow. "
+            "Useful for finding who got an automated email campaign that "
+            "fires through a workflow. Caveat: only returns ACTIVE enrollments. "
+            "If contacts have already completed the workflow, they may not be "
+            "in this list — historical enrollment data may require a different "
+            "approach. Try this first; if results look incomplete, report so "
+            "we can pivot. PRIVACY: returns contact IDs only, not PII; aggregate "
+            "or summarize before responding to the user."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "workflow_id": {
+                    "type": "string",
+                    "description": "Numeric workflow ID.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max enrollments per page (default 250, max 250).",
+                },
+            },
+            "required": ["workflow_id"],
         },
     },
     {
@@ -837,6 +900,8 @@ TOOL_HANDLERS: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     "get_email_body": _tool_get_email_body,
     "get_email_engagement_contacts": _tool_get_email_engagement_contacts,
     "get_contact_email_events": _tool_get_contact_email_events,
+    "get_workflow_details": _tool_get_workflow_details,
+    "get_workflow_enrollments": _tool_get_workflow_enrollments,
     "get_marketing_email_stats": _tool_get_marketing_email_stats,
     "create_email_draft": _tool_create_email_draft,
     "get_subscription_distribution": _tool_get_subscription_distribution,
