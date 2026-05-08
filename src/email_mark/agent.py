@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -1109,13 +1110,29 @@ TOOL_HANDLERS: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
 
 
 def _execute_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    """Run a tool, log how long it took, and return the result.
+
+    Output goes to stdout so Render captures it. Grep `[timing]` to see
+    just the perf lines. Format: tool=<name> status=<ok|error> elapsed=<s>
+    """
     handler = TOOL_HANDLERS.get(name)
     if handler is None:
         return {"error": f"Unknown tool: {name}"}
+    start = time.perf_counter()
+    status = "ok"
     try:
-        return handler(args)
+        result = handler(args)
+        if isinstance(result, dict) and "error" in result:
+            status = "tool_error"
     except Exception as exc:
-        return {"error": f"Tool {name} failed: {exc}"}
+        result = {"error": f"Tool {name} failed: {exc}"}
+        status = "exception"
+    elapsed = time.perf_counter() - start
+    print(
+        f"[timing] tool={name} status={status} elapsed={elapsed:.2f}s",
+        flush=True,
+    )
+    return result
 
 
 def reset_conversation(conversation_id: str) -> None:
@@ -1191,14 +1208,33 @@ def chat(
 
     messages.append({"role": "user", "content": user_message})
 
+    chat_start = time.perf_counter()
+    turn_count = 0
+    tool_call_count = 0
+
     final_text = ""
-    for _ in range(MAX_AGENT_TURNS):
+    for turn_idx in range(MAX_AGENT_TURNS):
+        turn_count = turn_idx + 1
+
+        inference_start = time.perf_counter()
         response = client.messages.create(
             model=MODEL,
             max_tokens=4096,
             system=system_prompt,
             tools=TOOLS,
             messages=messages,
+        )
+        inference_elapsed = time.perf_counter() - inference_start
+
+        usage = getattr(response, "usage", None)
+        in_tokens = getattr(usage, "input_tokens", "?") if usage else "?"
+        out_tokens = getattr(usage, "output_tokens", "?") if usage else "?"
+        print(
+            f"[timing] inference turn={turn_count} "
+            f"elapsed={inference_elapsed:.2f}s "
+            f"in_tokens={in_tokens} out_tokens={out_tokens} "
+            f"stop_reason={response.stop_reason}",
+            flush=True,
         )
 
         messages.append({"role": "assistant", "content": response.content})
@@ -1214,6 +1250,7 @@ def chat(
             tool_results = []
             for block in response.content:
                 if getattr(block, "type", None) == "tool_use":
+                    tool_call_count += 1
                     result = _execute_tool(block.name, block.input)
                     tool_results.append(
                         {
@@ -1228,6 +1265,14 @@ def chat(
         break
     else:
         final_text = "(Agent loop exited without a final text response — likely hit the turn cap.)"
+
+    total_elapsed = time.perf_counter() - chat_start
+    print(
+        f"[timing] chat total={total_elapsed:.2f}s "
+        f"turns={turn_count} tool_calls={tool_call_count} "
+        f"conversation_id={conversation_id or 'none'}",
+        flush=True,
+    )
 
     if conversation_id is not None:
         # Trim oldest first if we exceed the cap.
