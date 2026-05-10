@@ -143,16 +143,40 @@ def get_email_widget_structure(email_id: str) -> Dict[str, Any]:
             html = body.get("html") if isinstance(body.get("html"), str) else ""
             text_only = re.sub(r"<[^>]+>", " ", html or "")
             text_only = re.sub(r"\s+", " ", text_only).strip()
-            rows.append(
-                {
-                    "widget_id": wid,
-                    "widget_type": widget.get("type") or widget.get("name") or "",
-                    "label": widget.get("label") or "",
-                    "html_text_length": len(text_only),
-                    "text_preview": text_only[:200],
-                    "has_html_field": bool(html),
-                }
-            )
+
+            row: Dict[str, Any] = {
+                "widget_id": wid,
+                "widget_type": widget.get("type") or widget.get("name") or "",
+                "label": widget.get("label") or "",
+                "html_text_length": len(text_only),
+                "text_preview": text_only[:200],
+                "has_html_field": bool(html),
+            }
+
+            # For non-text widgets (images, buttons, dividers, etc.) dump
+            # the body field shape so we can see what we're dealing with —
+            # field names like image_url / src / url tell us how to patch.
+            if not html and body:
+                body_summary: Dict[str, Any] = {}
+                for k, v in body.items():
+                    if isinstance(v, str):
+                        body_summary[k] = (
+                            v if len(v) <= 200
+                            else v[:200] + f"...[{len(v)} chars total]"
+                        )
+                    elif isinstance(v, (int, float, bool)) or v is None:
+                        body_summary[k] = v
+                    elif isinstance(v, dict):
+                        body_summary[k] = (
+                            f"<dict {len(v)} keys: {list(v.keys())[:8]}>"
+                        )
+                    elif isinstance(v, list):
+                        body_summary[k] = f"<list of {len(v)}>"
+                    else:
+                        body_summary[k] = f"<{type(v).__name__}>"
+                row["body_fields"] = body_summary
+
+            rows.append(row)
 
     return {
         "email_id": email.get("id"),
@@ -462,21 +486,69 @@ def _light_markdown_to_html(text: str) -> str:
     return text
 
 
-def _build_body_html(new_body_text: str, p_style: str, span_style: str) -> str:
-    """Convert plain-text-with-paragraphs into the same HTML pattern as the
-    template's existing body widget."""
+def _build_body_html(new_body_text: str, original_html: str = "") -> str:
+    """Convert plain-text-with-paragraphs into HTML that mirrors the original
+    widget's tag and attribute structure.
+
+    Strategy: detect the outermost text-wrapping element in `original_html`
+    (preferring h1-h6 over p so headings stay headings), capture its FULL
+    opening tag including every attribute (style, class, id, etc.), and
+    wrap each new paragraph in that exact tag. Same treatment for an inner
+    <span> if one is present. This preserves font-family, color, size,
+    weight, alignment, padding — all inline styles the template designer
+    set — without us having to know which CSS properties matter.
+
+    Single-element behavior: if the outer tag is a heading (h1-h6), we
+    emit ONE element with paragraphs joined by <br><br>, since multiple
+    sibling headings doesn't make semantic sense. For <p> we emit one
+    element per paragraph as before.
+    """
     paragraphs = [p.strip() for p in new_body_text.strip().split("\n\n") if p.strip()]
+    if not paragraphs:
+        return ""
+
+    # Prefer h1-h6 over p so heading widgets keep their heading semantics
+    # and the styles HubSpot's editor applies to headings.
+    outer_match = re.search(
+        r"<(h[1-6])\b[^>]*>", original_html or "", re.IGNORECASE
+    )
+    if not outer_match:
+        outer_match = re.search(
+            r"<(p)\b[^>]*>", original_html or "", re.IGNORECASE
+        )
+
+    if outer_match:
+        open_tag = outer_match.group(0)         # full opening tag, attrs and all
+        tag_name = outer_match.group(1).lower()
+    else:
+        open_tag = "<p>"
+        tag_name = "p"
+    close_tag = f"</{tag_name}>"
+
+    # Inner span (if present) carries inline styling for color/font-family
+    # in many HubSpot defaults — preserve its full opening tag too.
+    span_match = re.search(
+        r"<span\b[^>]*>", original_html or "", re.IGNORECASE
+    )
+    open_span = span_match.group(0) if span_match else ""
+    close_span = "</span>" if open_span else ""
+
+    is_heading = tag_name.startswith("h")
     parts: List[str] = []
-    for para in paragraphs:
-        para = _light_markdown_to_html(para).replace("\n", "<br>")
-        if p_style and span_style:
-            parts.append(
-                f'<p style="{p_style}"><span style="{span_style}">{para}</span></p>'
-            )
-        elif p_style:
-            parts.append(f'<p style="{p_style}">{para}</p>')
-        else:
-            parts.append(f"<p>{para}</p>")
+
+    if is_heading:
+        # One heading element with all paragraphs inside, separated by
+        # double <br>. Multi-paragraph headings don't make sense as
+        # multiple sibling <h2>s.
+        joined = "<br><br>".join(
+            _light_markdown_to_html(p).replace("\n", "<br>") for p in paragraphs
+        )
+        parts.append(f"{open_tag}{open_span}{joined}{close_span}{close_tag}")
+    else:
+        for para in paragraphs:
+            para = _light_markdown_to_html(para).replace("\n", "<br>")
+            parts.append(f"{open_tag}{open_span}{para}{close_span}{close_tag}")
+
     return "".join(parts)
 
 
@@ -556,14 +628,10 @@ def update_email_by_widget_map(
             continue
 
         old_html = body.get("html") if isinstance(body.get("html"), str) else ""
-        # Preserve the original <p>/<span> styling so the rendered email
-        # keeps the template's font, color, and spacing.
-        p_style_match = re.search(r'<p\s+style="([^"]*)"', old_html or "")
-        span_style_match = re.search(r'<span\s+style="([^"]*)"', old_html or "")
-        p_style = p_style_match.group(1) if p_style_match else ""
-        span_style = span_style_match.group(1) if span_style_match else ""
-
-        new_html = _build_body_html(new_text, p_style, span_style)
+        # Preserve the original wrapper element (h2 stays h2, p stays p)
+        # along with all its inline styling, so the rendered email keeps
+        # the template's font, color, weight, spacing, and heading levels.
+        new_html = _build_body_html(new_text, old_html or "")
 
         new_widget = dict(widget)
         new_body = dict(body)
@@ -572,14 +640,16 @@ def update_email_by_widget_map(
         new_widgets[widget_id] = new_widget
 
         old_text_only = re.sub(r"<[^>]+>", "", old_html or "").strip()
+        # Detect what tag we mirrored, for the report.
+        outer_match = re.search(r"<(h[1-6]|p)\b", old_html or "", re.IGNORECASE)
+        preserved_tag = outer_match.group(1).lower() if outer_match else "p (default)"
         updates.append({
             "role": role,
             "widget_id": widget_id,
             "status": "updated",
             "old_text_length": len(old_text_only),
             "new_text_length": len(new_text),
-            "preserved_p_style": bool(p_style),
-            "preserved_span_style": bool(span_style),
+            "preserved_outer_tag": preserved_tag,
         })
 
     new_content = dict(content)

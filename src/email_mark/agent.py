@@ -1477,18 +1477,53 @@ def chat(
             "cache_control": {"type": "ephemeral"},
         }
 
+    # Per-request timeout for Anthropic. Without this the SDK can sit on a
+    # degraded connection for many minutes silently retrying. Two minutes
+    # is plenty for any normal turn (largest turn is ~60s for a long draft
+    # generation); anything beyond that is a real problem and we want it
+    # to surface as an exception, not a hang.
+    INFERENCE_TIMEOUT_SECONDS = 120
+
     final_text = ""
     for turn_idx in range(MAX_AGENT_TURNS):
         turn_count = turn_idx + 1
 
-        inference_start = time.perf_counter()
-        response = client.messages.create(
-            model=MODEL,
-            max_tokens=4096,
-            system=system_blocks,
-            tools=tools_for_call,
-            messages=messages,
+        # Log BEFORE the call so we can see in-flight inferences in Render
+        # logs even when the API hangs.
+        in_flight_msg_count = len(messages)
+        print(
+            f"[timing] inference turn={turn_count} "
+            f"starting (messages_in_history={in_flight_msg_count})",
+            flush=True,
         )
+
+        inference_start = time.perf_counter()
+        try:
+            response = client.messages.create(
+                model=MODEL,
+                max_tokens=4096,
+                system=system_blocks,
+                tools=tools_for_call,
+                messages=messages,
+                timeout=INFERENCE_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            inference_elapsed = time.perf_counter() - inference_start
+            print(
+                f"[timing] inference turn={turn_count} "
+                f"FAILED after {inference_elapsed:.2f}s "
+                f"error={type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            # Don't re-raise into Slack as a stack trace; surface a clean
+            # message so the user knows to retry.
+            final_text = (
+                f"(Inference failed on turn {turn_count}: {type(exc).__name__}. "
+                "This is usually a transient Anthropic API issue — try the "
+                "request again.)"
+            )
+            break
+
         inference_elapsed = time.perf_counter() - inference_start
 
         usage = getattr(response, "usage", None)
