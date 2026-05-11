@@ -83,24 +83,22 @@ def handle_mention(event, say):
         say(text=DENIAL_MESSAGE, thread_ts=event.get("thread_ts") or event.get("ts"))
         return
 
-    # Conversation scoping rules:
-    #   - If user is replying inside an existing thread → scope to that thread
-    #     (so two separate threaded discussions don't cross-contaminate).
-    #   - If user is making a fresh top-level mention → scope to the user
-    #     within the channel (so their follow-up mentions remember context
-    #     even when they don't reply in-thread).
-    is_thread_reply = (
-        event.get("thread_ts") is not None
-        and event["thread_ts"] != event.get("ts")
-    )
-    if is_thread_reply:
-        reply_thread_ts = event["thread_ts"]
-        conversation_id = f"thread:{event['thread_ts']}"
-    else:
-        # Anchor the bot's reply as a thread off this fresh mention,
-        # so the channel stays tidy.
-        reply_thread_ts = event.get("ts")
-        conversation_id = f"channel-user:{event['channel']}:{event['user']}"
+    # Conversation scoping: always keyed by the thread root timestamp.
+    #
+    # For a fresh top-level mention, the user's message ts BECOMES the
+    # thread root when Mark anchors his reply with thread_ts=event['ts'].
+    # For a reply already inside a thread, event['thread_ts'] is the root.
+    # In both cases, every message in that thread (now and later) will
+    # resolve to the same conversation_id, so Mark sees the full history
+    # of the conversation he's already part of.
+    #
+    # The previous design used channel-user:{channel}:{user} for fresh
+    # mentions, which created a different key from thread:{ts} once Mark
+    # replied — so context was lost the moment the user replied inside
+    # the thread Mark just created.
+    thread_root_ts = event.get("thread_ts") or event.get("ts")
+    reply_thread_ts = thread_root_ts
+    conversation_id = f"thread:{thread_root_ts}"
 
     if _is_reset(text):
         reset_conversation(conversation_id)
