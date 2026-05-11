@@ -309,10 +309,11 @@ Steps:
                               project title. If a forum post returned no
                               images, omit that project's image entirely
                               and the previous week's image carries over.
-         laser_focus_body   — INCLUDES both the title (first paragraph,
-                              which auto-renders as h2 — do NOT bold it)
-                              and the 3-5 sentence body (subsequent
-                              paragraphs, separated by blank lines)
+         laser_focus_title  — the Laser Focus heading, e.g. "Laser Focus:
+                              The Glue-and-Set Secret". Renders as h2
+                              automatically — do NOT wrap in **bold**.
+         laser_focus_body   — 3-5 sentence body, NOT including the title.
+                              Multiple paragraphs separated by blank lines.
          signoff_body       — usually omit (template default is "Happy
                               Making! The Glowforge Team"); only set if
                               the user explicitly wants a different signoff
@@ -599,6 +600,23 @@ def _tool_create_icymi_draft(args: Dict[str, Any]) -> Dict[str, Any]:
             title_text = content_by_role.get(title_role)
             if isinstance(title_text, str) and title_text.strip():
                 img["alt"] = title_text.strip()
+
+    # The Laser Focus title and body share one widget in the template, but
+    # they need DIFFERENT tags (h2 for title, p for body). We accept them
+    # as separate fields from Mark — guaranteed-correct separator — and
+    # combine here with a blank line so _build_body_html splits into two
+    # paragraphs and maps them to the original h2 + p tag sequence.
+    laser_title = content_by_role.pop("laser_focus_title", None)
+    laser_body = content_by_role.get("laser_focus_body")
+    if isinstance(laser_title, str) and laser_title.strip():
+        title_clean = laser_title.strip()
+        if isinstance(laser_body, str) and laser_body.strip():
+            content_by_role["laser_focus_body"] = (
+                f"{title_clean}\n\n{laser_body.strip()}"
+            )
+        else:
+            # Body missing — still render the title alone, in h2.
+            content_by_role["laser_focus_body"] = title_clean
 
     # Step 1: Clone the canonical ICYMI master.
     cloned = clone_marketing_email(ICYMI_MASTER_TEMPLATE_ID, name)
@@ -1324,19 +1342,24 @@ TOOLS: List[Dict[str, Any]] = [
                             },
                             "required": ["url", "link"],
                         },
+                        "laser_focus_title": {
+                            "type": "string",
+                            "description": (
+                                "The Laser Focus heading, e.g. 'Laser Focus: "
+                                "The Glue-and-Set Secret'. Will render as h2 "
+                                "automatically — do NOT bold it manually. The "
+                                "title shares a widget with the body but is "
+                                "passed as a separate field so the heading "
+                                "and body get the right tags."
+                            ),
+                        },
                         "laser_focus_body": {
                             "type": "string",
                             "description": (
-                                "Includes BOTH the Laser Focus title (e.g., "
-                                "'Laser Focus: The X Secret') and the 3-5 "
-                                "sentence body, since they share one widget "
-                                "in the template. Format: the FIRST paragraph "
-                                "is the title — it will render as a heading "
-                                "(h2) automatically, so do NOT add **bold** "
-                                "around it. Then a blank line, then the body "
-                                "paragraph(s) which will render as body text. "
-                                "If you write multiple body paragraphs, "
-                                "separate each with a blank line."
+                                "The 3-5 sentence body of the Laser Focus "
+                                "section, NOT including the title. Separate "
+                                "multiple paragraphs with blank lines. "
+                                "Markdown links and bold work as usual."
                             ),
                         },
                         "signoff_body": {
@@ -1354,7 +1377,7 @@ TOOLS: List[Dict[str, Any]] = [
                         "project_1_title", "project_1_body",
                         "project_2_title", "project_2_body",
                         "project_3_title", "project_3_body",
-                        "laser_focus_body",
+                        "laser_focus_title", "laser_focus_body",
                     ],
                 },
             },
