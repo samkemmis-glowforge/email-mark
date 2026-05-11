@@ -30,6 +30,7 @@ from email_mark.hubspot_marketing import (
     get_email_body_text,
     get_email_engagement_contacts,
     get_email_statistics,
+    get_email_widget_html,
     get_email_widget_structure,
     get_workflow_details,
     get_workflow_enrollments,
@@ -491,6 +492,10 @@ def _tool_get_email_body(args: Dict[str, Any]) -> Dict[str, Any]:
 
 def _tool_get_email_widget_structure(args: Dict[str, Any]) -> Dict[str, Any]:
     return get_email_widget_structure(str(args["email_id"]))
+
+
+def _tool_get_email_widget_html(args: Dict[str, Any]) -> Dict[str, Any]:
+    return get_email_widget_html(str(args["email_id"]), str(args["widget_id"]))
 
 
 def _tool_get_email_engagement_contacts(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -986,6 +991,33 @@ TOOLS: List[Dict[str, Any]] = [
         },
     },
     {
+        "name": "get_email_widget_html",
+        "description": (
+            "Return the RAW HTML of a single widget in a marketing email — "
+            "for debugging when a rendered widget doesn't look right and we "
+            "need to inspect its actual tag structure (which the text-only "
+            "preview from get_email_widget_structure hides). Provide the "
+            "email_id and the specific widget_id you want to inspect."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "email_id": {
+                    "type": "string",
+                    "description": "The marketing email's HubSpot ID.",
+                },
+                "widget_id": {
+                    "type": "string",
+                    "description": (
+                        "The widget ID (e.g. 'module_17609870518031'). "
+                        "Get these from get_email_widget_structure."
+                    ),
+                },
+            },
+            "required": ["email_id", "widget_id"],
+        },
+    },
+    {
         "name": "get_email_widget_structure",
         "description": (
             "Diagnostic tool for inspecting the widget layout of a HubSpot "
@@ -1439,6 +1471,7 @@ TOOL_HANDLERS: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     "fetch_forum_post": _tool_fetch_forum_post,
     "get_email_body": _tool_get_email_body,
     "get_email_widget_structure": _tool_get_email_widget_structure,
+    "get_email_widget_html": _tool_get_email_widget_html,
     "get_email_engagement_contacts": _tool_get_email_engagement_contacts,
     "get_contact_email_events": _tool_get_contact_email_events,
     "list_workflows": _tool_list_workflows,

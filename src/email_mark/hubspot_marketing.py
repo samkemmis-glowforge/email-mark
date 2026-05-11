@@ -187,6 +187,44 @@ def get_email_widget_structure(email_id: str) -> Dict[str, Any]:
     }
 
 
+def get_email_widget_html(email_id: str, widget_id: str) -> Dict[str, Any]:
+    """Return the RAW HTML of a single widget — for debugging cases where
+    the rendered email doesn't look right and we need to see the actual
+    tag structure (which the text-stripped preview from
+    get_email_widget_structure hides).
+
+    Returns the raw html string, the list of all body fields, and the
+    widget type, so we can inspect both text widgets and image widgets.
+    """
+    response = requests.get(
+        f"{HUBSPOT_BASE}/marketing/v3/emails/{email_id}",
+        headers=_headers(),
+        params={"includeStats": "true"},
+        timeout=30,
+    )
+    response.raise_for_status()
+    email = response.json()
+
+    content = email.get("content") if isinstance(email.get("content"), dict) else {}
+    widgets = (content or {}).get("widgets") if isinstance(content, dict) else {}
+    if not isinstance(widgets, dict):
+        return {"error": "Email has no widgets dict."}
+
+    widget = widgets.get(widget_id)
+    if not isinstance(widget, dict):
+        return {"error": f"Widget {widget_id} not found in email {email_id}."}
+
+    body = widget.get("body") if isinstance(widget.get("body"), dict) else {}
+    return {
+        "email_id": email_id,
+        "widget_id": widget_id,
+        "widget_type": widget.get("type") or "",
+        "body_keys": sorted(list(body.keys())),
+        "raw_html": body.get("html") or "",
+        "raw_html_length": len(body.get("html") or ""),
+    }
+
+
 def get_email_statistics(email_id: str) -> Dict[str, Any]:
     """Stats for a single marketing email.
 
