@@ -488,90 +488,88 @@ def _light_markdown_to_html(text: str) -> str:
 
 def _build_body_html(new_body_text: str, original_html: str = "") -> str:
     """Convert plain-text-with-paragraphs into HTML that mirrors the original
-    widget's tag and attribute structure.
+    widget's per-paragraph tag and attribute structure.
 
-    Strategy: detect the outermost text-wrapping element in `original_html`
-    (preferring h1-h6 over p so headings stay headings), capture its FULL
-    opening tag including every attribute (style, class, id, etc.), and
-    wrap each new paragraph in that exact tag. Same treatment for an inner
-    <span> if one is present. This preserves font-family, color, size,
-    weight, alignment, padding — all inline styles the template designer
-    set — without us having to know which CSS properties matter.
+    Strategy: walk the original_html and capture the SEQUENCE of paragraph-
+    level opening tags (h1-h6 and p) in order, with each tag's full
+    attribute string preserved verbatim. Then map new paragraphs to that
+    sequence by index — paragraph 1 uses the original's first tag,
+    paragraph 2 uses the second, etc. This handles widgets that mix a
+    heading with body paragraphs (e.g., the Laser Focus widget which has
+    h2 + p + p): the new title paragraph stays an h2, the new body
+    paragraphs stay p.
 
-    Single-element behavior: if the outer tag is a heading (h1-h6), we
-    emit ONE element with paragraphs joined by <br><br>, since multiple
-    sibling headings doesn't make semantic sense. For <p> we emit one
-    element per paragraph as before.
+    For excess new paragraphs beyond what the original had, fall back to
+    the last <p> tag observed in the original (preserving its styling),
+    or to a bare <p> if the original had no <p> tags. We never default
+    overflow paragraphs to a heading — extra <h2>s in a row are wrong.
+
+    The inner <span> wrapping (if present anywhere in the original) is
+    captured once and reused for all new paragraphs, since HubSpot's
+    rich text widgets use it consistently for color/font styling.
     """
     paragraphs = [p.strip() for p in new_body_text.strip().split("\n\n") if p.strip()]
     if not paragraphs:
         return ""
 
-    # Prefer h1-h6 over p so heading widgets keep their heading semantics
-    # and the styles HubSpot's editor applies to headings.
-    outer_match = re.search(
-        r"<(h[1-6])\b[^>]*>", original_html or "", re.IGNORECASE
-    )
-    if not outer_match:
-        outer_match = re.search(
-            r"<(p)\b[^>]*>", original_html or "", re.IGNORECASE
-        )
+    # Walk the original HTML for paragraph-level opening tags, in order.
+    original_tags: List[tuple] = []  # list of (tag_name, full_opening_tag)
+    for m in re.finditer(
+        r"<(h[1-6]|p)\b[^>]*>", original_html or "", re.IGNORECASE
+    ):
+        original_tags.append((m.group(1).lower(), m.group(0)))
 
-    if outer_match:
-        open_tag = outer_match.group(0)         # full opening tag, attrs and all
-        tag_name = outer_match.group(1).lower()
-    else:
-        open_tag = "<p>"
-        tag_name = "p"
-    close_tag = f"</{tag_name}>"
+    # Overflow tag for paragraphs beyond what the original had: prefer the
+    # last <p> we saw (with its full styling), else bare <p>.
+    overflow_open = "<p>"
+    for tag_name, open_tag in reversed(original_tags):
+        if tag_name == "p":
+            overflow_open = open_tag
+            break
 
-    # Inner span (if present) carries inline styling for color/font-family
-    # in many HubSpot defaults — preserve its full opening tag too.
+    # Inner span carries inline color/font-family in many HubSpot defaults.
     span_match = re.search(
         r"<span\b[^>]*>", original_html or "", re.IGNORECASE
     )
     open_span = span_match.group(0) if span_match else ""
     close_span = "</span>" if open_span else ""
 
-    is_heading = tag_name.startswith("h")
     parts: List[str] = []
+    for idx, para in enumerate(paragraphs):
+        if idx < len(original_tags):
+            tag_name, open_tag = original_tags[idx]
+        else:
+            tag_name, open_tag = ("p", overflow_open)
+        close_tag = f"</{tag_name}>"
 
-    if is_heading:
-        # One heading element with all paragraphs inside, separated by
-        # double <br>. Multi-paragraph headings don't make sense as
-        # multiple sibling <h2>s.
-        joined = "<br><br>".join(
-            _light_markdown_to_html(p).replace("\n", "<br>") for p in paragraphs
-        )
-        parts.append(f"{open_tag}{open_span}{joined}{close_span}{close_tag}")
-    else:
-        for para in paragraphs:
-            para = _light_markdown_to_html(para).replace("\n", "<br>")
-            parts.append(f"{open_tag}{open_span}{para}{close_span}{close_tag}")
+        para_html = _light_markdown_to_html(para).replace("\n", "<br>")
+        parts.append(f"{open_tag}{open_span}{para_html}{close_span}{close_tag}")
 
     return "".join(parts)
 
 
 def update_email_by_widget_map(
     email_id: str,
-    content_by_role: Dict[str, str],
+    content_by_role: Dict[str, Any],
     widget_map: Dict[str, str],
 ) -> Dict[str, Any]:
     """Update multiple widgets in a marketing email, mapped by semantic role.
 
     Used for templates with stable widget IDs (i.e., always cloned from a
     canonical master). The caller provides:
-      - content_by_role: e.g., {"intro_body": "...", "project_1_title": "..."}
-      - widget_map:      e.g., {"intro_body": "module_17734393985902", ...}
+      - content_by_role: a mix of text and image updates keyed by role:
+          - str value  -> text widget. The widget's body.html is rebuilt
+                          from this string (markdown supported), preserving
+                          the original per-paragraph tag/style structure.
+          - dict value -> image widget. Recognized keys:
+                          {"url": <new src>, "alt": <new alt>, "link": <click-through URL>}.
+                          Only provided keys are updated; others are left
+                          untouched (e.g., width, height, css class).
+      - widget_map: role -> widget_id mapping for both text AND image roles.
 
-    For each role with content provided, finds the widget by ID, preserves
-    its existing <p>/<span> styling, and replaces the body html with new
-    paragraphs built from the role's text (markdown supported). All widgets
-    are PATCHed in a single request.
-
-    Returns a structured report so the caller can verify exactly what
-    landed where, and bail clearly if the template's widget IDs have
-    drifted (template was edited, etc.).
+    All widgets are PATCHed in a single request. Returns a structured
+    report so the caller can verify exactly what landed where, and bail
+    clearly if any expected widget IDs are missing (master was edited).
     """
     response = requests.get(
         f"{HUBSPOT_BASE}/marketing/v3/emails/{email_id}",
@@ -615,7 +613,7 @@ def update_email_by_widget_map(
     new_widgets = dict(widgets)
     updates: List[Dict[str, Any]] = []
 
-    for role, new_text in content_by_role.items():
+    for role, new_content in content_by_role.items():
         widget_id = widget_map[role]
         widget = widgets[widget_id]
         if not isinstance(widget, dict):
@@ -627,30 +625,72 @@ def update_email_by_widget_map(
             updates.append({"role": role, "widget_id": widget_id, "status": "no_body_dict"})
             continue
 
-        old_html = body.get("html") if isinstance(body.get("html"), str) else ""
-        # Preserve the original wrapper element (h2 stays h2, p stays p)
-        # along with all its inline styling, so the rendered email keeps
-        # the template's font, color, weight, spacing, and heading levels.
-        new_html = _build_body_html(new_text, old_html or "")
-
         new_widget = dict(widget)
         new_body = dict(body)
-        new_body["html"] = new_html
+
+        if isinstance(new_content, str):
+            # ---- Text widget update ----
+            old_html = body.get("html") if isinstance(body.get("html"), str) else ""
+            # Preserve the original wrapper element (h2 stays h2, p stays p)
+            # along with all its inline styling, so the rendered email keeps
+            # the template's font, color, weight, spacing, and heading levels.
+            new_html = _build_body_html(new_content, old_html or "")
+            new_body["html"] = new_html
+
+            old_text_only = re.sub(r"<[^>]+>", "", old_html or "").strip()
+            outer_match = re.search(r"<(h[1-6]|p)\b", old_html or "", re.IGNORECASE)
+            preserved_tag = outer_match.group(1).lower() if outer_match else "p (default)"
+            updates.append({
+                "role": role,
+                "widget_id": widget_id,
+                "kind": "text",
+                "status": "updated",
+                "old_text_length": len(old_text_only),
+                "new_text_length": len(new_content),
+                "preserved_outer_tag": preserved_tag,
+            })
+
+        elif isinstance(new_content, dict):
+            # ---- Image widget update ----
+            # Update only the explicitly provided fields. Width and height
+            # are NOT touched — those are sized for the template layout.
+            current_img = body.get("img") if isinstance(body.get("img"), dict) else {}
+            new_img = dict(current_img)
+            updated_fields: List[str] = []
+
+            if "url" in new_content and new_content["url"]:
+                new_img["src"] = new_content["url"]
+                updated_fields.append("img.src")
+            if "alt" in new_content and new_content["alt"]:
+                new_img["alt"] = new_content["alt"]
+                updated_fields.append("img.alt")
+            new_body["img"] = new_img
+
+            if "link" in new_content and new_content["link"]:
+                new_body["link"] = new_content["link"]
+                updated_fields.append("link")
+
+            updates.append({
+                "role": role,
+                "widget_id": widget_id,
+                "kind": "image",
+                "status": "updated" if updated_fields else "no_changes",
+                "updated_fields": updated_fields,
+                "old_src": (current_img.get("src") if isinstance(current_img, dict) else None),
+                "new_src": new_img.get("src"),
+                "new_link": new_body.get("link"),
+            })
+
+        else:
+            updates.append({
+                "role": role,
+                "widget_id": widget_id,
+                "status": f"skipped_unrecognized_value_type:{type(new_content).__name__}",
+            })
+            continue
+
         new_widget["body"] = new_body
         new_widgets[widget_id] = new_widget
-
-        old_text_only = re.sub(r"<[^>]+>", "", old_html or "").strip()
-        # Detect what tag we mirrored, for the report.
-        outer_match = re.search(r"<(h[1-6]|p)\b", old_html or "", re.IGNORECASE)
-        preserved_tag = outer_match.group(1).lower() if outer_match else "p (default)"
-        updates.append({
-            "role": role,
-            "widget_id": widget_id,
-            "status": "updated",
-            "old_text_length": len(old_text_only),
-            "new_text_length": len(new_text),
-            "preserved_outer_tag": preserved_tag,
-        })
 
     new_content = dict(content)
     new_content["widgets"] = new_widgets

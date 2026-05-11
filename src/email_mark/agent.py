@@ -67,19 +67,24 @@ ICYMI_MASTER_TEMPLATE_ID = "212542521240"
 ICYMI_WIDGET_MAP: Dict[str, str] = {
     # Intro paragraph that sets up the week's theme.
     "intro_body":       "module_17734393985902",
-    # Project 1 — visually first project module (title + body widgets).
+    # Project 1 — visually first project module (title + body + image).
     "project_1_title":  "module_17606404695542",
     "project_1_body":   "module_17606404695544",
+    "project_1_image":  "module_17606404695531",
     # Project 2 — visually second project module.
     "project_2_title":  "module-6-1-0",
     "project_2_body":   "module-6-1-2",
+    "project_2_image":  "module-6-0-0",
     # Project 3 — visually third project module.
     "project_3_title":  "module_17606408446199",
     "project_3_body":   "module_176064084461911",
+    "project_3_image":  "module_17606408446198",
     # Laser Focus of the Week — title and body live in one widget.
     "laser_focus_body": "module_17609870518031",
     # "Happy Making! The Glowforge Team" sign-off.
     "signoff_body":     "module_17636900856152",
+    # Note: module-8-0-0 is the bottom "Shop materials" banner image; we
+    # don't update it — it stays the same week to week.
 }
 
 # Conversation memory. Keyed by an external conversation_id (e.g., Slack
@@ -293,10 +298,21 @@ Steps:
          project_2_body     — same shape
          project_3_title    — same shape
          project_3_body     — same shape
-         laser_focus_body   — INCLUDES both the title (e.g., "**Laser
-                              Focus: The X Secret**") and the 3-5 sentence
-                              body, separated by a blank line, since they
-                              share one widget
+         project_1_image,
+         project_2_image,
+         project_3_image    — image objects with {"url", "alt", "link"}
+                              for each project. The url is the FIRST entry
+                              from fetch_forum_post's image_urls list. The
+                              link is the forum post URL (same one you
+                              embedded in the body). The alt is optional —
+                              if you omit it, the tool defaults to the
+                              project title. If a forum post returned no
+                              images, omit that project's image entirely
+                              and the previous week's image carries over.
+         laser_focus_body   — INCLUDES both the title (first paragraph,
+                              which auto-renders as h2 — do NOT bold it)
+                              and the 3-5 sentence body (subsequent
+                              paragraphs, separated by blank lines)
          signoff_body       — usually omit (template default is "Happy
                               Making! The Glowforge Team"); only set if
                               the user explicitly wants a different signoff
@@ -307,10 +323,11 @@ Steps:
 
 8. After the draft is created, give the user the following in one reply:
    a) The HubSpot edit_url so they can review the draft.
-   b) A list of the image URLs from each project, labeled by project (e.g.
-      "Project 1 — <title> by @<maker> images: <url>, <url>") so the user
-      can manually upload them into HubSpot. The template's image modules
-      are NOT updated by the tool.
+   b) Briefly note which projects had images replaced (read it from the
+      body_update report — image roles will show "kind": "image", "status":
+      "updated"). If any project's forum post had no images and you skipped
+      it, call that out so the user knows the prior week's image is still
+      in that slot.
    c) A single-line log entry the user can paste into their tracking doc:
         ICYMI <YYYY-MM-DD> | <Project 1 title> by @<maker1> | <Project 2 title> by @<maker2> | <Project 3 title> by @<maker3> | Subject: "<subject>"
 
@@ -571,6 +588,17 @@ def _tool_create_icymi_draft(args: Dict[str, Any]) -> Dict[str, Any]:
     content_by_role = args["content_by_role"]
     if not isinstance(content_by_role, dict):
         return {"error": "content_by_role must be an object."}
+
+    # Default alt text from project title when Mark didn't provide one,
+    # so we don't lose accessibility text on auto-populated images.
+    for n in (1, 2, 3):
+        img_role = f"project_{n}_image"
+        title_role = f"project_{n}_title"
+        img = content_by_role.get(img_role)
+        if isinstance(img, dict) and not img.get("alt"):
+            title_text = content_by_role.get(title_role)
+            if isinstance(title_text, str) and title_text.strip():
+                img["alt"] = title_text.strip()
 
     # Step 1: Clone the canonical ICYMI master.
     cloned = clone_marketing_email(ICYMI_MASTER_TEMPLATE_ID, name)
@@ -1202,9 +1230,10 @@ TOOLS: List[Dict[str, Any]] = [
                 "content_by_role": {
                     "type": "object",
                     "description": (
-                        "Structured body content. Each value is the plain "
-                        "text/markdown for that section — no need to add HTML "
-                        "tags; the tool builds them."
+                        "Structured body content. Text values are plain "
+                        "text/markdown (the tool builds the HTML). Image "
+                        "values are objects with url/alt/link — see the "
+                        "project_N_image fields below."
                     ),
                     "properties": {
                         "intro_body": {
@@ -1235,19 +1264,79 @@ TOOLS: List[Dict[str, Any]] = [
                                 "somewhere in the body."
                             ),
                         },
+                        "project_1_image": {
+                            "type": "object",
+                            "description": (
+                                "The project image to display alongside the "
+                                "text. Pulled from the first usable image "
+                                "URL in fetch_forum_post's image_urls list. "
+                                "If the forum post had no images, omit this "
+                                "field entirely and the previous week's "
+                                "image will carry over."
+                            ),
+                            "properties": {
+                                "url": {
+                                    "type": "string",
+                                    "description": (
+                                        "Direct URL to the new project image "
+                                        "(use the FIRST entry of image_urls "
+                                        "from fetch_forum_post)."
+                                    ),
+                                },
+                                "alt": {
+                                    "type": "string",
+                                    "description": (
+                                        "Short alt text describing the image. "
+                                        "If omitted, derives from the project "
+                                        "title."
+                                    ),
+                                },
+                                "link": {
+                                    "type": "string",
+                                    "description": (
+                                        "URL the image links to when clicked. "
+                                        "Use the forum post URL — same one "
+                                        "you embedded in project_1_body."
+                                    ),
+                                },
+                            },
+                            "required": ["url", "link"],
+                        },
                         "project_2_title": {"type": "string"},
                         "project_2_body": {"type": "string"},
+                        "project_2_image": {
+                            "type": "object",
+                            "properties": {
+                                "url": {"type": "string"},
+                                "alt": {"type": "string"},
+                                "link": {"type": "string"},
+                            },
+                            "required": ["url", "link"],
+                        },
                         "project_3_title": {"type": "string"},
                         "project_3_body": {"type": "string"},
+                        "project_3_image": {
+                            "type": "object",
+                            "properties": {
+                                "url": {"type": "string"},
+                                "alt": {"type": "string"},
+                                "link": {"type": "string"},
+                            },
+                            "required": ["url", "link"],
+                        },
                         "laser_focus_body": {
                             "type": "string",
                             "description": (
                                 "Includes BOTH the Laser Focus title (e.g., "
                                 "'Laser Focus: The X Secret') and the 3-5 "
                                 "sentence body, since they share one widget "
-                                "in the template. Put the title on its own "
-                                "line in **bold**, then a blank line, then "
-                                "the body."
+                                "in the template. Format: the FIRST paragraph "
+                                "is the title — it will render as a heading "
+                                "(h2) automatically, so do NOT add **bold** "
+                                "around it. Then a blank line, then the body "
+                                "paragraph(s) which will render as body text. "
+                                "If you write multiple body paragraphs, "
+                                "separate each with a blank line."
                             ),
                         },
                         "signoff_body": {
