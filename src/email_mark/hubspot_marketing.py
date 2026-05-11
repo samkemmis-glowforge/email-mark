@@ -526,62 +526,74 @@ def _light_markdown_to_html(text: str) -> str:
 
 def _build_body_html(new_body_text: str, original_html: str = "") -> str:
     """Convert plain-text-with-paragraphs into HTML that mirrors the original
-    widget's per-paragraph tag and attribute structure.
+    widget's per-paragraph tag and attribute structure — but only counts
+    paragraphs that actually had content.
 
-    Strategy: walk the original_html and capture the SEQUENCE of paragraph-
-    level opening tags (h1-h6 and p) in order, with each tag's full
-    attribute string preserved verbatim. Then map new paragraphs to that
-    sequence by index — paragraph 1 uses the original's first tag,
-    paragraph 2 uses the second, etc. This handles widgets that mix a
-    heading with body paragraphs (e.g., the Laser Focus widget which has
-    h2 + p + p): the new title paragraph stays an h2, the new body
-    paragraphs stay p.
+    HubSpot's drag-and-drop editor inserts empty <h2>&nbsp;</h2> and
+    <p>&nbsp;</p> blocks as visual spacers between real paragraphs. Those
+    empty blocks must be filtered out when building the tag sequence,
+    otherwise new paragraphs get mapped onto spacer slots and (e.g.) the
+    body content ends up wrapped in a second h2 because the master had
+    "h2(title), h2(spacer), p(body), p(spacer)" and we naively grabbed
+    the first two tags.
+
+    Per content paragraph we capture:
+      - the outer paragraph tag's full opening (preserves font-size,
+        text-align, line-height, font-weight, color, etc.)
+      - the inner <span>'s full opening (preserves font-family + color
+        defined at the span level, which HubSpot uses heavily)
 
     For excess new paragraphs beyond what the original had, fall back to
-    the last <p> tag observed in the original (preserving its styling),
-    or to a bare <p> if the original had no <p> tags. We never default
-    overflow paragraphs to a heading — extra <h2>s in a row are wrong.
-
-    The inner <span> wrapping (if present anywhere in the original) is
-    captured once and reused for all new paragraphs, since HubSpot's
-    rich text widgets use it consistently for color/font styling.
+    the last content <p> tag observed (with its full styling), or to a
+    bare <p> if the original had no <p> content slots.
     """
     paragraphs = [p.strip() for p in new_body_text.strip().split("\n\n") if p.strip()]
     if not paragraphs:
         return ""
 
-    # Walk the original HTML for paragraph-level opening tags, in order.
-    original_tags: List[tuple] = []  # list of (tag_name, full_opening_tag)
+    # Per content block: (tag_name, full_open_tag, open_span, close_span)
+    content_blocks: List[tuple] = []
     for m in re.finditer(
-        r"<(h[1-6]|p)\b[^>]*>", original_html or "", re.IGNORECASE
+        r"<(h[1-6]|p)\b([^>]*)>(.*?)</\1>",
+        original_html or "",
+        re.IGNORECASE | re.DOTALL,
     ):
-        original_tags.append((m.group(1).lower(), m.group(0)))
+        tag_name = m.group(1).lower()
+        full_open = f"<{tag_name}{m.group(2)}>"
+        inner_html = m.group(3)
 
-    # Overflow tag for paragraphs beyond what the original had: prefer the
-    # last <p> we saw (with its full styling), else bare <p>.
-    overflow_open = "<p>"
-    for tag_name, open_tag in reversed(original_tags):
-        if tag_name == "p":
-            overflow_open = open_tag
+        # Strip nested tags + nbsp/whitespace to detect spacer blocks.
+        inner_text = re.sub(r"<[^>]+>", "", inner_html)
+        inner_text = (
+            inner_text.replace("&nbsp;", " ").replace("\xa0", " ").strip()
+        )
+        if not inner_text:
+            continue  # spacer — don't include in the content sequence
+
+        # Capture the inner <span>'s full opening if present, for
+        # font-family/color preservation.
+        span_match = re.search(r"<span\b[^>]*>", inner_html, re.IGNORECASE)
+        open_span = span_match.group(0) if span_match else ""
+        close_span = "</span>" if open_span else ""
+
+        content_blocks.append((tag_name, full_open, open_span, close_span))
+
+    # Overflow style for paragraphs beyond what the original had: prefer
+    # the last content <p> (with its full styling), else bare <p>.
+    overflow = ("p", "<p>", "", "")
+    for entry in reversed(content_blocks):
+        if entry[0] == "p":
+            overflow = entry
             break
-
-    # Inner span carries inline color/font-family in many HubSpot defaults.
-    span_match = re.search(
-        r"<span\b[^>]*>", original_html or "", re.IGNORECASE
-    )
-    open_span = span_match.group(0) if span_match else ""
-    close_span = "</span>" if open_span else ""
 
     parts: List[str] = []
     for idx, para in enumerate(paragraphs):
-        if idx < len(original_tags):
-            tag_name, open_tag = original_tags[idx]
+        if idx < len(content_blocks):
+            tag_name, full_open, open_span, close_span = content_blocks[idx]
         else:
-            tag_name, open_tag = ("p", overflow_open)
-        close_tag = f"</{tag_name}>"
-
+            tag_name, full_open, open_span, close_span = overflow
         para_html = _light_markdown_to_html(para).replace("\n", "<br>")
-        parts.append(f"{open_tag}{open_span}{para_html}{close_span}{close_tag}")
+        parts.append(f"{full_open}{open_span}{para_html}{close_span}</{tag_name}>")
 
     return "".join(parts)
 
