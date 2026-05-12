@@ -25,7 +25,12 @@ from dotenv import find_dotenv, load_dotenv  # noqa: E402
 from slack_bolt import App  # noqa: E402
 from slack_bolt.adapter.socket_mode import SocketModeHandler  # noqa: E402
 
-from email_mark.agent import chat, reset_conversation  # noqa: E402
+from email_mark.agent import (  # noqa: E402
+    chat,
+    has_conversation,
+    reset_conversation,
+    seed_conversation,
+)
 
 load_dotenv(find_dotenv())
 logging.basicConfig(level=logging.INFO)
@@ -38,6 +43,103 @@ app = App(
 
 _MENTION_RE = re.compile(r"<@[^>]+>\s*")
 _RESET_KEYWORDS = {"/reset", "reset conversation", "start over", "new conversation"}
+
+# Bot's own Slack user ID. Fetched lazily on first rehydration so we can
+# tell our own messages apart from user messages in thread history.
+_BOT_USER_ID = None
+
+
+def _get_bot_user_id():
+    global _BOT_USER_ID
+    if _BOT_USER_ID is not None:
+        return _BOT_USER_ID
+    try:
+        auth = app.client.auth_test()
+        _BOT_USER_ID = auth.get("user_id")
+    except Exception as exc:
+        logging.warning("Couldn't fetch bot user_id: %s", exc)
+    return _BOT_USER_ID
+
+
+def _slack_msg_to_turn(msg, bot_id):
+    """Convert one Slack message into a {role, content} turn, or None to skip.
+
+    Bot messages become assistant turns; everything else becomes user turns
+    with any @-mentions stripped (to mirror what handle_mention does on
+    live messages).
+    """
+    text = (msg.get("text") or "").strip()
+    if not text:
+        return None
+    is_bot = msg.get("bot_id") is not None or (
+        bot_id and msg.get("user") == bot_id
+    )
+    if is_bot:
+        return {"role": "assistant", "content": text}
+    text = _MENTION_RE.sub("", text).strip()
+    if not text:
+        return None
+    return {"role": "user", "content": text}
+
+
+def _rehydrate_thread_history(channel, thread_ts):
+    """Fetch a Slack thread's messages and rebuild user/assistant turns.
+
+    Called when in-memory conversation state is empty for a thread Mark
+    was already part of — typically after a worker restart wiped the
+    dict. Returns a list of {role, content} turns in chronological order.
+    """
+    bot_id = _get_bot_user_id()
+    try:
+        result = app.client.conversations_replies(
+            channel=channel, ts=thread_ts, limit=200
+        )
+    except Exception as exc:
+        logging.warning("Failed to fetch thread %s: %s", thread_ts, exc)
+        return []
+    turns = []
+    for msg in result.get("messages", []) or []:
+        turn = _slack_msg_to_turn(msg, bot_id)
+        if turn is not None:
+            turns.append(turn)
+    return turns
+
+
+def _rehydrate_dm_history(channel):
+    """Fetch a DM channel's recent messages and rebuild user/assistant turns."""
+    bot_id = _get_bot_user_id()
+    try:
+        result = app.client.conversations_history(channel=channel, limit=50)
+    except Exception as exc:
+        logging.warning("Failed to fetch DM history for %s: %s", channel, exc)
+        return []
+    # conversations.history returns newest-first; reverse to chronological.
+    turns = []
+    for msg in reversed(result.get("messages", []) or []):
+        turn = _slack_msg_to_turn(msg, bot_id)
+        if turn is not None:
+            turns.append(turn)
+    return turns
+
+
+def _maybe_rehydrate(conversation_id, history_fn):
+    """If we have no in-memory history, fetch it from Slack and seed.
+
+    The LAST turn is dropped because it's the user message that just
+    triggered this handler — chat() will append it from the live event.
+    """
+    if has_conversation(conversation_id):
+        return
+    history = history_fn()
+    if history and history[-1].get("role") == "user":
+        history = history[:-1]
+    if history:
+        seed_conversation(conversation_id, history)
+        logging.info(
+            "Rehydrated %d Slack turns into conversation %s",
+            len(history),
+            conversation_id,
+        )
 
 
 def _is_reset(text: str) -> bool:
@@ -105,6 +207,12 @@ def handle_mention(event, say):
         say(text="Okay, conversation cleared. Fresh start.", thread_ts=reply_thread_ts)
         return
 
+    # Rehydrate from Slack if we lost in-memory state (e.g., after a deploy).
+    _maybe_rehydrate(
+        conversation_id,
+        lambda: _rehydrate_thread_history(event["channel"], thread_root_ts),
+    )
+
     reply = chat(text, conversation_id=conversation_id)
     say(text=reply, thread_ts=reply_thread_ts)
 
@@ -133,6 +241,12 @@ def handle_dm(event, say):
         reset_conversation(conversation_id)
         say("Okay, conversation cleared. Fresh start.")
         return
+
+    # Rehydrate from Slack if we lost in-memory state (e.g., after a deploy).
+    _maybe_rehydrate(
+        conversation_id,
+        lambda: _rehydrate_dm_history(event["channel"]),
+    )
 
     say(chat(text, conversation_id=conversation_id))
 

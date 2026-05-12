@@ -1601,6 +1601,26 @@ def reset_conversation(conversation_id: str) -> None:
     _conversations.pop(conversation_id, None)
 
 
+def has_conversation(conversation_id: str) -> bool:
+    """Return True if any stored history exists for this conversation."""
+    return bool(_conversations.get(conversation_id))
+
+
+def seed_conversation(
+    conversation_id: str, messages: List[Dict[str, Any]]
+) -> None:
+    """Replace any stored history for this conversation with these messages.
+
+    Used by the Slack runner to rehydrate context from a thread after a
+    worker restart wiped the in-memory dict. The runner reconstructs the
+    user/assistant turns from Slack's record of the thread and seeds them
+    here so chat() picks them up on the next call.
+    """
+    if not messages:
+        return
+    _conversations[conversation_id] = list(messages)
+
+
 def _sanitize_history(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Trim leading orphaned tool_results and trailing unanswered tool_use blocks.
 
