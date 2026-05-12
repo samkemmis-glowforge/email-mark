@@ -133,6 +133,42 @@ def _brand_voice_section() -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# Lessons-learned loading: domain knowledge captured from past conversations.
+# An editable file at prompts/lessons_learned.md gets injected into the system
+# prompt at startup. Add entries as we discover gotchas about data sources,
+# tool behavior, business rules, etc. — see the file's header for the format.
+# ---------------------------------------------------------------------------
+
+
+def _load_lessons() -> str:
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    lessons_file = repo_root / "prompts" / "lessons_learned.md"
+    if not lessons_file.exists():
+        return ""
+    text = lessons_file.read_text().strip()
+    if not text:
+        return ""
+    return text
+
+
+_LESSONS = _load_lessons()
+
+
+def _lessons_section() -> str:
+    if not _LESSONS:
+        return ""
+    return (
+        "\n\nLESSONS LEARNED — domain knowledge captured from past "
+        "conversations with the team. These are real gotchas about the data, "
+        "tools, business rules, or workflows that have tripped you up before. "
+        "Treat them as authoritative and apply them BEFORE reasoning from "
+        "first principles. When a lesson applies, surface it briefly so the "
+        "user knows you're using it.\n\n"
+        + _LESSONS
+    )
+
+
 SYSTEM_PROMPT = (
     """You are an AI coworker for the Glowforge marketing team, available in Slack.
 
@@ -144,6 +180,27 @@ use of *bold*; bullet points are fine).
 You have tools to look up real data in HubSpot and to create draft emails.
 Use them rather than guessing. When a tool returns data, summarize in plain
 language — never paste raw JSON.
+
+CAPTURING LESSONS — when you should propose adding to lessons_learned.md:
+When the user corrects you about something that's likely to recur — a data
+source quirk, an undocumented tool behavior, a business rule, a definition
+that differs from your assumptions — propose a one-paragraph lesson at the
+END of your response. Format it as a markdown block the user can paste
+directly into prompts/lessons_learned.md, like:
+
+  Want me to remember this? Add to lessons_learned.md:
+  ```
+  ## <topical heading, e.g. "BigQuery / Data warehouse">
+
+  - <The lesson, in 2-4 sentences, plain language. Include the SPECIFIC
+    rule, the CONSEQUENCE if forgotten, and the CORRECT alternative.>
+    (Learned YYYY-MM-DD)
+  ```
+
+Only propose a lesson when the correction is DURABLE — something that'll
+still be true next month, not a one-off mistake or a momentary preference.
+Don't propose lessons for every minor correction; reserve it for "this
+would have saved me 20 minutes if I'd known" moments.
 
 EXECUTION STYLE — handling multi-step requests:
 - Complete multi-step tasks end-to-end. Don't pause halfway to offer
@@ -418,6 +475,7 @@ If you're ever unsure whether something is sensitive, default to NOT
 sharing it and ask the user to confirm whether the request is appropriate.
 """
     + _brand_voice_section()
+    + _lessons_section()
 )
 
 
