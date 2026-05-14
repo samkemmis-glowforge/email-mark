@@ -141,9 +141,13 @@ def _brand_voice_section() -> str:
 # ---------------------------------------------------------------------------
 
 
-def _load_lessons() -> str:
+def _lessons_file_path() -> Path:
     repo_root = Path(__file__).resolve().parent.parent.parent
-    lessons_file = repo_root / "prompts" / "lessons_learned.md"
+    return repo_root / "prompts" / "lessons_learned.md"
+
+
+def _load_lessons() -> str:
+    lessons_file = _lessons_file_path()
     if not lessons_file.exists():
         return ""
     text = lessons_file.read_text().strip()
@@ -152,11 +156,11 @@ def _load_lessons() -> str:
     return text
 
 
-_LESSONS = _load_lessons()
-
-
 def _lessons_section() -> str:
-    if not _LESSONS:
+    # Re-read on every call so new lessons saved at runtime (via the
+    # remember_lesson tool) take effect immediately on the next inference.
+    text = _load_lessons()
+    if not text:
         return ""
     return (
         "\n\nLESSONS LEARNED — domain knowledge captured from past "
@@ -165,8 +169,76 @@ def _lessons_section() -> str:
         "Treat them as authoritative and apply them BEFORE reasoning from "
         "first principles. When a lesson applies, surface it briefly so the "
         "user knows you're using it.\n\n"
-        + _LESSONS
+        + text
     )
+
+
+def remember_lesson(heading: str, lesson: str) -> Dict[str, Any]:
+    """Append a lesson to prompts/lessons_learned.md under the given heading.
+
+    If a section with the matching heading already exists, append the
+    lesson as a new bullet under it. Otherwise create a new section at
+    the bottom of the file.
+
+    On Render, the file lives in the deployed-code path which gets reset
+    on each new deploy — so lessons saved at runtime persist until the
+    next push. The response includes a `permanence_note` reminding the
+    user to commit to git for durable storage.
+    """
+    import re as _re
+    from datetime import date as _date
+
+    heading_clean = (heading or "").strip()
+    lesson_clean = (lesson or "").strip()
+    if not heading_clean or not lesson_clean:
+        return {"error": "Both heading and lesson are required."}
+
+    lessons_file = _lessons_file_path()
+    if not lessons_file.exists():
+        return {"error": f"Lessons file not found at {lessons_file}"}
+
+    today = _date.today().isoformat()
+    new_bullet = f"\n- {lesson_clean}\n  (Learned {today})\n"
+
+    content = lessons_file.read_text()
+    heading_marker = f"## {heading_clean}"
+    heading_pattern = _re.escape(heading_marker)
+    # Match the heading and everything up to the next ## section (or EOF).
+    section_match = _re.search(
+        rf"({heading_pattern}\n.*?)(?=\n## |\Z)",
+        content,
+        _re.DOTALL,
+    )
+    if section_match:
+        existing = section_match.group(1).rstrip()
+        replacement = existing + new_bullet
+        new_content = (
+            content[: section_match.start()]
+            + replacement
+            + content[section_match.end():]
+        )
+        section_action = "appended_to_existing"
+    else:
+        new_content = (
+            content.rstrip()
+            + f"\n\n{heading_marker}\n{new_bullet}"
+        )
+        section_action = "created_new_section"
+
+    lessons_file.write_text(new_content)
+
+    return {
+        "saved": True,
+        "heading": heading_clean,
+        "lesson": lesson_clean,
+        "date": today,
+        "section_action": section_action,
+        "permanence_note": (
+            "Lesson saved to the local file. On Render this resets to the "
+            "git version on every deploy — share the lesson in chat so the "
+            "user can commit it for permanent storage."
+        ),
+    }
 
 
 SYSTEM_PROMPT = (
@@ -245,26 +317,23 @@ You have tools to look up real data in HubSpot and to create draft emails.
 Use them rather than guessing. When a tool returns data, summarize in plain
 language — never paste raw JSON.
 
-CAPTURING LESSONS — when you should propose adding to lessons_learned.md:
-When the user corrects you about something that's likely to recur — a data
-source quirk, an undocumented tool behavior, a business rule, a definition
-that differs from your assumptions — propose a one-paragraph lesson at the
-END of your response. Format it as a markdown block the user can paste
-directly into prompts/lessons_learned.md, like:
+CAPTURING LESSONS — save them yourself, don't ask:
+When the user corrects you about something durable — a data source quirk,
+an undocumented tool behavior, a business rule that differs from your
+assumptions — call the remember_lesson tool to save it directly. Don't
+just propose the lesson in chat and wait for the user to paste it; that
+hasn't been working and you keep making the same mistakes.
 
-  Want me to remember this? Add to lessons_learned.md:
-  ```
-  ## <topical heading, e.g. "BigQuery / Data warehouse">
+After saving, briefly mention in chat that you saved it (one sentence),
+include the lesson text, and remind the user to commit the file to git
+so it survives the next deploy. Example: "Saved a lesson to lessons_
+learned.md: 'BQ hubspot.email_events only goes back to Dec 2024.' Worth
+committing to git so it persists across deploys."
 
-  - <The lesson, in 2-4 sentences, plain language. Include the SPECIFIC
-    rule, the CONSEQUENCE if forgotten, and the CORRECT alternative.>
-    (Learned YYYY-MM-DD)
-  ```
-
-Only propose a lesson when the correction is DURABLE — something that'll
-still be true next month, not a one-off mistake or a momentary preference.
-Don't propose lessons for every minor correction; reserve it for "this
-would have saved me 20 minutes if I'd known" moments.
+Only save lessons for DURABLE truths that'll still be true next month —
+not one-off mistakes, momentary preferences, or "this specific user is
+named Yuliya" trivia. Reserve it for "this would have saved me 20
+minutes if I'd known" moments.
 
 EXECUTION STYLE — handling multi-step requests:
 - Complete multi-step tasks end-to-end. Don't pause halfway to offer
@@ -656,6 +725,13 @@ def _tool_fetch_forum_post(args: Dict[str, Any]) -> Dict[str, Any]:
     return fetch_forum_post(str(args["url"]))
 
 
+def _tool_remember_lesson(args: Dict[str, Any]) -> Dict[str, Any]:
+    return remember_lesson(
+        heading=str(args.get("heading", "")),
+        lesson=str(args.get("lesson", "")),
+    )
+
+
 def _tool_lookup_slack_user(args: Dict[str, Any]) -> Dict[str, Any]:
     matches = slack_lookup_user(args.get("query", ""))
     return {"matches": matches[:10], "total_matches": len(matches)}
@@ -867,6 +943,54 @@ TOOLS: List[Dict[str, Any]] = [
                 },
             },
             "required": ["name_contains"],
+        },
+    },
+    {
+        "name": "remember_lesson",
+        "description": (
+            "Save a durable lesson to your lessons_learned.md file so you "
+            "won't make the same mistake next time. Use this when the user "
+            "corrects you about something that's likely to recur: a data "
+            "source quirk (e.g. a BigQuery table is stale or incomplete), "
+            "an undocumented tool behavior, a business rule, a definition "
+            "that differs from your default assumption, or a workflow "
+            "gotcha. The lesson takes effect on your next inference call.\n\n"
+            "Only save lessons for DURABLE truths — gotchas about systems "
+            "that will still be true next month. Do NOT save lessons for "
+            "one-off preferences, momentary mistakes, or tone/style "
+            "feedback (those go in the system prompt directly).\n\n"
+            "When you save a lesson, also briefly tell the user in chat: "
+            "(1) that you saved it, (2) what it says, and (3) that they "
+            "should commit it to git for permanent storage — on Render the "
+            "file resets on every deploy."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "heading": {
+                    "type": "string",
+                    "description": (
+                        "The topical section heading. If an existing "
+                        "heading fits (e.g., 'BigQuery / Data warehouse', "
+                        "'HubSpot — contacts and marketing status', "
+                        "'HubSpot — billing levers'), use it. Otherwise "
+                        "create a new one. Use Title Case with em-dashes "
+                        "between subject and qualifier."
+                    ),
+                },
+                "lesson": {
+                    "type": "string",
+                    "description": (
+                        "The lesson, 2-4 sentences in plain language. "
+                        "Include the SPECIFIC rule, the CONSEQUENCE if "
+                        "forgotten, and the CORRECT alternative. No "
+                        "Markdown headers or bullet syntax — the file "
+                        "wraps it in a bullet automatically and tags "
+                        "today's date."
+                    ),
+                },
+            },
+            "required": ["heading", "lesson"],
         },
     },
     {
@@ -1591,6 +1715,7 @@ TOOLS: List[Dict[str, Any]] = [
 TOOL_HANDLERS: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     "search_marketing_emails": _tool_search_marketing_emails,
     "fetch_forum_post": _tool_fetch_forum_post,
+    "remember_lesson": _tool_remember_lesson,
     "get_email_body": _tool_get_email_body,
     "get_email_widget_structure": _tool_get_email_widget_structure,
     "get_email_widget_html": _tool_get_email_widget_html,
