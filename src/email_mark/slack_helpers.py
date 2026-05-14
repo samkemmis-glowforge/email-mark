@@ -73,6 +73,26 @@ def lookup_user(query: str) -> List[Dict[str, Any]]:
     return matches
 
 
+def get_user_display(user_id: str) -> Optional[str]:
+    """Return a user's display name from the cached workspace user list.
+
+    Tries display_name → real_name → username, in that order. Returns
+    None if the user isn't found (e.g., outside the workspace, deactivated).
+    """
+    if not user_id:
+        return None
+    for user in _get_users():
+        if user.get("id") == user_id:
+            profile = user.get("profile", {}) or {}
+            return (
+                profile.get("display_name")
+                or profile.get("real_name")
+                or user.get("name")
+                or None
+            )
+    return None
+
+
 def send_dm(user_id: str, text: str) -> Dict[str, Any]:
     """Send a direct message to a Slack user. Opens a DM channel if needed."""
     client = _get_client()

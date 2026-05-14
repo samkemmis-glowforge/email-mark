@@ -31,6 +31,9 @@ from email_mark.agent import (  # noqa: E402
     reset_conversation,
     seed_conversation,
 )
+from email_mark.slack_helpers import (  # noqa: E402
+    get_user_display as slack_get_user_display,
+)
 
 load_dotenv(find_dotenv())
 logging.basicConfig(level=logging.INFO)
@@ -63,6 +66,11 @@ def _markdown_to_slack(text):
     text = _MD_BOLD_RE.sub(r"*\1*", text)        # **bold** -> *bold*
     text = _MD_LINK_RE.sub(r"<\2|\1>", text)     # [text](url) -> <url|text>
     text = _MD_HEADER_RE.sub(r"*\2*", text)      # # Header   -> *Header*
+    # Slack requires whitespace/punctuation around *bold* for it to render.
+    # If Mark writes *Header*Text with no space, the post-converted result
+    # won't render as bold. Insert a space when bold runs straight into a
+    # word character, and a newline when it runs into a sentence-starter.
+    text = re.sub(r"(\*[^*\s][^*\n]*?[^*\s]\*)(?=\w)", r"\1 ", text)
     return text
 
 # Bot's own Slack user ID. Fetched lazily on first rehydration so we can
@@ -85,9 +93,10 @@ def _get_bot_user_id():
 def _slack_msg_to_turn(msg, bot_id):
     """Convert one Slack message into a {role, content} turn, or None to skip.
 
-    Bot messages become assistant turns; everything else becomes user turns
-    with any @-mentions stripped (to mirror what handle_mention does on
-    live messages).
+    Bot messages become assistant turns. Other users' messages become user
+    turns prefixed with the speaker's display name so Mark can distinguish
+    between multiple participants in a conversation ("Yuliya asked X, Sam
+    asked me to dig into it" wouldn't work without attribution).
     """
     text = (msg.get("text") or "").strip()
     if not text:
@@ -100,6 +109,10 @@ def _slack_msg_to_turn(msg, bot_id):
     text = _MENTION_RE.sub("", text).strip()
     if not text:
         return None
+    speaker_id = msg.get("user")
+    speaker = slack_get_user_display(speaker_id) if speaker_id else None
+    if speaker:
+        text = f"[{speaker}]: {text}"
     return {"role": "user", "content": text}
 
 
@@ -120,6 +133,48 @@ def _rehydrate_thread_history(channel, thread_ts):
         return []
     turns = []
     for msg in result.get("messages", []) or []:
+        turn = _slack_msg_to_turn(msg, bot_id)
+        if turn is not None:
+            turns.append(turn)
+    return turns
+
+
+def _rehydrate_channel_context(channel, before_ts, limit=10, max_minutes_back=30):
+    """Pull recent channel messages preceding a top-level @-mention.
+
+    Used when Mark is mentioned at the channel level (not inside an
+    existing thread) — the user is likely asking him to weigh in on what
+    was just being discussed in the channel. We grab the last few
+    messages within a recency window so Mark has the surrounding context
+    instead of cold-starting.
+
+    Limited to messages within `max_minutes_back` minutes to avoid
+    pulling in stale conversation from earlier in the day.
+    """
+    bot_id = _get_bot_user_id()
+    try:
+        result = app.client.conversations_history(
+            channel=channel,
+            latest=before_ts,
+            inclusive=False,
+            limit=limit,
+        )
+    except Exception as exc:
+        logging.warning("Failed to fetch channel history for %s: %s", channel, exc)
+        return []
+    try:
+        cutoff = float(before_ts) - (max_minutes_back * 60)
+    except (TypeError, ValueError):
+        cutoff = 0.0
+    turns = []
+    # conversations.history returns newest-first; reverse to chronological.
+    for msg in reversed(result.get("messages", []) or []):
+        msg_ts = msg.get("ts")
+        try:
+            if float(msg_ts) < cutoff:
+                continue
+        except (TypeError, ValueError):
+            continue
         turn = _slack_msg_to_turn(msg, bot_id)
         if turn is not None:
             turns.append(turn)
@@ -228,11 +283,23 @@ def handle_mention(event, say):
         say(text="Okay, conversation cleared. Fresh start.", thread_ts=reply_thread_ts)
         return
 
-    # Rehydrate from Slack if we lost in-memory state (e.g., after a deploy).
-    _maybe_rehydrate(
-        conversation_id,
-        lambda: _rehydrate_thread_history(event["channel"], thread_root_ts),
+    # Rehydrate from Slack if memory is empty. Two cases:
+    #   - Reply inside an existing thread → fetch the thread.
+    #   - Top-level @-mention → fetch recent channel context so Mark can
+    #     see what the user is asking him to weigh in on.
+    is_thread_reply = (
+        event.get("thread_ts") is not None
+        and event["thread_ts"] != event.get("ts")
     )
+    if is_thread_reply:
+        rehydrate_fn = lambda: _rehydrate_thread_history(  # noqa: E731
+            event["channel"], thread_root_ts
+        )
+    else:
+        rehydrate_fn = lambda: _rehydrate_channel_context(  # noqa: E731
+            event["channel"], event["ts"]
+        )
+    _maybe_rehydrate(conversation_id, rehydrate_fn)
 
     reply = chat(text, conversation_id=conversation_id)
     say(text=_markdown_to_slack(reply), thread_ts=reply_thread_ts)
