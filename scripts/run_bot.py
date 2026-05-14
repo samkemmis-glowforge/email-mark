@@ -44,6 +44,27 @@ app = App(
 _MENTION_RE = re.compile(r"<@[^>]+>\s*")
 _RESET_KEYWORDS = {"/reset", "reset conversation", "start over", "new conversation"}
 
+# Markdown -> Slack mrkdwn conversion. Mark's training makes him default to
+# Markdown formatting even after prompt instructions to use Slack syntax,
+# so we do a defensive pass on his output before sending.
+#
+# We deliberately do NOT convert single-asterisk *italic* because in Slack
+# the same syntax means BOLD — guessing wrong would corrupt valid output.
+# Bold (**), links, and headers are safe to convert.
+_MD_BOLD_RE = re.compile(r"\*\*([^*\n]+?)\*\*")
+_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^)\s]+)\)")
+_MD_HEADER_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$", re.MULTILINE)
+
+
+def _markdown_to_slack(text):
+    """Best-effort conversion of common Markdown to Slack mrkdwn syntax."""
+    if not text:
+        return text
+    text = _MD_BOLD_RE.sub(r"*\1*", text)        # **bold** -> *bold*
+    text = _MD_LINK_RE.sub(r"<\2|\1>", text)     # [text](url) -> <url|text>
+    text = _MD_HEADER_RE.sub(r"*\2*", text)      # # Header   -> *Header*
+    return text
+
 # Bot's own Slack user ID. Fetched lazily on first rehydration so we can
 # tell our own messages apart from user messages in thread history.
 _BOT_USER_ID = None
@@ -214,7 +235,7 @@ def handle_mention(event, say):
     )
 
     reply = chat(text, conversation_id=conversation_id)
-    say(text=reply, thread_ts=reply_thread_ts)
+    say(text=_markdown_to_slack(reply), thread_ts=reply_thread_ts)
 
 
 @app.event("message")
@@ -248,7 +269,7 @@ def handle_dm(event, say):
         lambda: _rehydrate_dm_history(event["channel"]),
     )
 
-    say(chat(text, conversation_id=conversation_id))
+    say(_markdown_to_slack(chat(text, conversation_id=conversation_id)))
 
 
 def main() -> None:
