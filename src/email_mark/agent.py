@@ -29,6 +29,7 @@ from email_mark.hubspot_marketing import (
     get_contact_email_events,
     get_email_body_text,
     get_email_engagement_contacts,
+    get_email_engagers_via_list,
     get_email_statistics,
     get_email_widget_html,
     get_email_widget_structure,
@@ -697,6 +698,14 @@ def _tool_get_email_engagement_contacts(args: Dict[str, Any]) -> Dict[str, Any]:
     )
 
 
+def _tool_get_email_engagers_via_list(args: Dict[str, Any]) -> Dict[str, Any]:
+    return get_email_engagers_via_list(
+        email_id=str(args["email_id"]),
+        event_type=str(args.get("event_type", "OPENED")),
+        delete_after_read=bool(args.get("delete_after_read", True)),
+    )
+
+
 def _tool_list_workflows(args: Dict[str, Any]) -> Dict[str, Any]:
     return list_workflows(limit=int(args.get("limit", 100)))
 
@@ -1174,6 +1183,58 @@ TOOLS: List[Dict[str, Any]] = [
                 },
             },
             "required": ["contact_email"],
+        },
+    },
+    {
+        "name": "get_email_engagers_via_list",
+        "description": (
+            "Get contacts who engaged with a marketing email by creating "
+            "a temporary HubSpot Active List, reading its members (with "
+            "email addresses), then deleting the list. Use this as the "
+            "DEFAULT path for individual-level engagement data — the v1 "
+            "events API (get_email_engagement_contacts) has become "
+            "unreliable for newer Service Keys and often returns empty "
+            "results even when aggregate stats show engagement.\n\n"
+            "Returns recipient_emails (the actual email addresses, "
+            "lowercased and deduped) ready to join against external "
+            "systems like Shopify orders. Also returns contact_ids and a "
+            "diagnostics block with list population progress.\n\n"
+            "event_type uses HubSpot's filter operators (DIFFERENT from "
+            "the v1 events API): OPENED, CLICKED, SENT, BOUNCED, "
+            "OPTED_OUT, MARKED_AS_SPAM, RECEIVED. Note the past-tense "
+            "operators — 'OPENED' not 'OPEN'.\n\n"
+            "Takes ~20-90 seconds end to end (list creation + ~15s wait + "
+            "polling + member read + delete). Tell the user this will "
+            "take a moment before calling. For very large engagement "
+            "(50K+ contacts) the wait can stretch — surface the "
+            "diagnostics.final_list_size if it seems to have plateaued "
+            "before reading members."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "email_id": {
+                    "type": "string",
+                    "description": "Marketing email ID (from search_marketing_emails).",
+                },
+                "event_type": {
+                    "type": "string",
+                    "description": (
+                        "Engagement type to filter by (PAST TENSE): "
+                        "OPENED, CLICKED, SENT, BOUNCED, OPTED_OUT, "
+                        "MARKED_AS_SPAM, RECEIVED. Default OPENED."
+                    ),
+                },
+                "delete_after_read": {
+                    "type": "boolean",
+                    "description": (
+                        "Delete the temporary list after reading members. "
+                        "Default true (keeps HubSpot UI clean). Set false "
+                        "if the user wants to inspect or reuse the list."
+                    ),
+                },
+            },
+            "required": ["email_id"],
         },
     },
     {
@@ -1730,6 +1791,7 @@ TOOL_HANDLERS: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     "get_email_widget_structure": _tool_get_email_widget_structure,
     "get_email_widget_html": _tool_get_email_widget_html,
     "get_email_engagement_contacts": _tool_get_email_engagement_contacts,
+    "get_email_engagers_via_list": _tool_get_email_engagers_via_list,
     "get_contact_email_events": _tool_get_contact_email_events,
     "list_workflows": _tool_list_workflows,
     "get_workflow_details": _tool_get_workflow_details,
@@ -1966,11 +2028,16 @@ def chat(
 
         messages.append({"role": "assistant", "content": response.content})
 
+        # Extract any text from this response so we never return empty when
+        # the model produced output but hit an unusual stop_reason (most
+        # commonly max_tokens — the 4096 output cap).
+        any_text = "".join(
+            getattr(b, "text", "") for b in response.content
+            if getattr(b, "type", None) == "text"
+        )
+
         if response.stop_reason == "end_turn":
-            final_text = "".join(
-                getattr(b, "text", "") for b in response.content
-                if getattr(b, "type", None) == "text"
-            )
+            final_text = any_text
             break
 
         if response.stop_reason == "tool_use":
@@ -1989,6 +2056,22 @@ def chat(
             messages.append({"role": "user", "content": tool_results})
             continue
 
+        # Unusual stop_reason — most often max_tokens. Keep whatever text
+        # the model produced and tell the user the reply got truncated, so
+        # they know to ask a more focused question rather than seeing a
+        # silent "(no response)".
+        if any_text:
+            final_text = (
+                any_text
+                + f"\n\n_(Reply was truncated by stop_reason={response.stop_reason} "
+                "— ask a more focused follow-up if you need more.)_"
+            )
+        else:
+            final_text = (
+                f"(Mark stopped with stop_reason={response.stop_reason} "
+                "and no text content. Most often this means the tool result "
+                "was too large to fit in context — try narrowing the query.)"
+            )
         break
     else:
         final_text = "(Agent loop exited without a final text response — likely hit the turn cap.)"

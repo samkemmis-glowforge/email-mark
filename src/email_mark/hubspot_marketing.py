@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -510,6 +511,193 @@ def get_email_engagement_contacts(
             "total_events_seen": total_events_seen,
             "last_response_has_more": last_has_more,
             "sample_event_keys": sample_event_keys,
+        },
+    }
+
+
+def get_email_engagers_via_list(
+    email_id: str,
+    event_type: str = "OPENED",
+    initial_wait_seconds: int = 15,
+    max_wait_seconds: int = 120,
+    poll_interval_seconds: int = 10,
+    delete_after_read: bool = True,
+) -> Dict[str, Any]:
+    """Get contacts who engaged with a marketing email by creating a
+    temporary HubSpot Active List and reading its members.
+
+    Use this when get_email_engagement_contacts (v1 events API) returns
+    empty results — HubSpot has been deprecating that API and it's
+    unreliable for newer Service Keys, while the Lists API is what they're
+    actively investing in.
+
+    Flow:
+      1. Create a dynamic (active) list filtered by "EmailCampaignActivity"
+         + event_type (OPENED, CLICKED, SENT, etc.) + emailId.
+      2. Wait initial_wait_seconds, then poll size every poll_interval_seconds
+         until it stabilizes (two reads with same size) or max_wait_seconds.
+      3. Read members with the `email` property, paginating to completion.
+      4. Optionally delete the list to avoid clutter.
+
+    event_type uses HubSpot's filter operators (different from the v1 events
+    API): OPENED, CLICKED, SENT, BOUNCED, OPTED_OUT, MARKED_AS_SPAM, etc.
+
+    Returns recipient_emails (lowercased, deduped), contact_ids, list_id,
+    plus a diagnostics block with timings and population progress.
+    """
+    if not email_id:
+        return {"error": "email_id is required."}
+
+    list_name = f"[mark-tmp] engagers of email {email_id} {event_type.upper()} {int(time.time())}"
+    create_payload = {
+        "name": list_name,
+        "dynamic": True,
+        "filters": [[
+            {
+                "filterFamily": "EmailCampaignActivity",
+                "withinTimeMode": "PAST",
+                "type": "EMAIL_CAMPAIGN_ACTIVITY",
+                "operator": event_type.upper(),
+                "campaignId": str(email_id),
+            }
+        ]],
+    }
+
+    # 1. Create the list.
+    create_response = requests.post(
+        f"{HUBSPOT_BASE}/contacts/v1/lists",
+        headers=_headers(),
+        json=create_payload,
+        timeout=30,
+    )
+    if create_response.status_code not in (200, 201):
+        return {
+            "error": (
+                f"Failed to create list (HTTP {create_response.status_code}). "
+                "Service Key likely needs the 'lists' or 'contacts' scope."
+            ),
+            "response_body": create_response.text[:500],
+        }
+
+    list_data = create_response.json()
+    list_id = list_data.get("listId")
+    if list_id is None:
+        return {
+            "error": "List was created but no listId in response.",
+            "response": list_data,
+        }
+
+    # 2. Wait initial period, then poll until size stabilizes.
+    time.sleep(initial_wait_seconds)
+    started = time.time()
+    sizes_seen: List[int] = []
+    while time.time() - started < max_wait_seconds:
+        size_response = requests.get(
+            f"{HUBSPOT_BASE}/contacts/v1/lists/{list_id}",
+            headers=_headers(),
+            timeout=30,
+        )
+        if size_response.status_code != 200:
+            break
+        meta = size_response.json().get("metaData") or {}
+        current_size = meta.get("size")
+        if current_size is not None:
+            sizes_seen.append(current_size)
+            # Stop when size stops growing (two consecutive identical reads
+            # AND we have a non-zero number).
+            if (
+                len(sizes_seen) >= 2
+                and sizes_seen[-1] == sizes_seen[-2]
+                and sizes_seen[-1] > 0
+            ):
+                break
+        time.sleep(poll_interval_seconds)
+
+    final_size = sizes_seen[-1] if sizes_seen else None
+    wait_elapsed = int(time.time() - started) + initial_wait_seconds
+
+    # 3. Read members.
+    emails: set = set()
+    contact_ids: set = set()
+    vid_offset: Optional[int] = None
+    pages = 0
+    MAX_PAGES = 100
+    while pages < MAX_PAGES:
+        params: Dict[str, Any] = {"count": 100, "property": "email"}
+        if vid_offset is not None:
+            params["vidOffset"] = vid_offset
+        members_response = requests.get(
+            f"{HUBSPOT_BASE}/contacts/v1/lists/{list_id}/contacts/all",
+            headers=_headers(),
+            params=params,
+            timeout=30,
+        )
+        if members_response.status_code != 200:
+            break
+        data = members_response.json()
+        for contact in data.get("contacts", []) or []:
+            vid = contact.get("vid")
+            if vid is not None:
+                contact_ids.add(vid)
+            email_prop = (contact.get("properties") or {}).get("email") or {}
+            email_value = email_prop.get("value") if isinstance(email_prop, dict) else None
+            if email_value:
+                emails.add(str(email_value).strip().lower())
+        if not data.get("has-more"):
+            break
+        vid_offset = data.get("vid-offset")
+        if vid_offset is None:
+            break
+        pages += 1
+
+    # 4. Best-effort delete to keep the HubSpot UI clean. Failures are
+    #    non-fatal — we still return the data we already pulled.
+    list_was_deleted = False
+    if delete_after_read:
+        try:
+            del_response = requests.delete(
+                f"{HUBSPOT_BASE}/contacts/v1/lists/{list_id}",
+                headers=_headers(),
+                timeout=30,
+            )
+            list_was_deleted = del_response.status_code in (200, 204)
+        except Exception:
+            list_was_deleted = False
+
+    # Cap the returned arrays so a huge engagement set doesn't blow the
+    # model's context window. The counts are always accurate; the arrays
+    # are truncated with a `truncated` flag the caller can react to. For
+    # joining against external systems with N > MAX_EMAILS_IN_RESPONSE,
+    # the caller should run a BigQuery join with the email_id as the
+    # filter instead of pulling all emails inline.
+    MAX_EMAILS_IN_RESPONSE = 1000
+    all_emails = sorted(list(emails))
+    all_contact_ids = sorted(list(contact_ids))
+    truncated = (
+        len(all_emails) > MAX_EMAILS_IN_RESPONSE
+        or len(all_contact_ids) > MAX_EMAILS_IN_RESPONSE
+    )
+    return {
+        "email_id": email_id,
+        "event_type": event_type.upper(),
+        "list_id": list_id,
+        "list_name": list_name,
+        "unique_email_count": len(all_emails),
+        "unique_contact_count": len(all_contact_ids),
+        "recipient_emails": all_emails[:MAX_EMAILS_IN_RESPONSE],
+        "contact_ids": all_contact_ids[:MAX_EMAILS_IN_RESPONSE],
+        "truncated": truncated,
+        "truncation_note": (
+            f"Only the first {MAX_EMAILS_IN_RESPONSE} of {len(all_emails)} "
+            "emails are returned to keep context manageable. For analyses "
+            "needing the full set, do the join in BigQuery instead of inline."
+        ) if truncated else None,
+        "list_deleted": list_was_deleted,
+        "diagnostics": {
+            "final_list_size": final_size,
+            "size_progression": sizes_seen,
+            "wait_elapsed_seconds": wait_elapsed,
+            "pages_fetched": pages + 1,
         },
     }
 
