@@ -424,19 +424,30 @@ def get_email_engagement_contacts(
     event_type: str = "DELIVERED",
     max_unique: int = 5000,
 ) -> Dict[str, Any]:
-    """Pull unique HubSpot contact IDs who had a specific event with a
-    marketing email — used for attribution analysis.
+    """Pull unique HubSpot contacts (IDs + email addresses) who had a
+    specific event with a marketing email — used for attribution analysis
+    and for joining against external data sources like Shopify orders.
 
     `event_type` options: DELIVERED, SENT, OPEN, CLICK, BOUNCE,
-    UNSUBSCRIBE, DROPPED, SPAMREPORT.
+    UNSUBSCRIBE, DROPPED, SPAMREPORT (must be UPPERCASE — case sensitive).
 
-    Returns the count and a list of contact IDs (vids only — no emails or
-    names). Caps pagination at max_unique IDs to prevent runaway calls
-    on huge campaigns. The returned IDs can be passed to
-    search_hubspot_contacts with a `hs_object_id IN [...]` filter to
-    aggregate by subscription status, lifecycle stage, etc.
+    Returns the counts, contact IDs (vids), and recipient_emails. The
+    recipient_emails list comes directly from the events payload and can
+    be joined against external systems (Shopify, Stripe, etc.). For
+    aggregation against HubSpot CRM properties, pass contact_ids to
+    search_hubspot_contacts with a `hs_object_id IN [...]` filter.
+
+    `diagnostics` includes pages_fetched, total_events_seen, hasMore on
+    the last response, and the keys present on a sample event — useful
+    when results are unexpectedly zero (the events array may be empty,
+    the API may not recognize the emailId, or the event_type might be
+    misspelled).
     """
     vids: set = set()
+    emails: set = set()
+    total_events_seen = 0
+    last_has_more = None
+    sample_event_keys: List[str] = []
     offset: Optional[str] = None
     pages = 0
     MAX_PAGES = 30
@@ -467,12 +478,21 @@ def get_email_engagement_contacts(
         response.raise_for_status()
         data = response.json()
 
-        for event in data.get("events", []) or []:
+        events = data.get("events", []) or []
+        total_events_seen += len(events)
+        if not sample_event_keys and events:
+            sample_event_keys = sorted(list(events[0].keys()))
+
+        for event in events:
             vid = event.get("vid")
             if vid is not None:
                 vids.add(vid)
+            recipient = event.get("recipient")
+            if recipient:
+                emails.add(recipient.strip().lower())
 
-        if not data.get("hasMore") or len(vids) >= max_unique:
+        last_has_more = data.get("hasMore")
+        if not last_has_more or len(emails) >= max_unique:
             break
         offset = data.get("offset")
         pages += 1
@@ -481,8 +501,16 @@ def get_email_engagement_contacts(
         "email_id": email_id,
         "event_type": event_type,
         "unique_contact_count": len(vids),
+        "unique_email_count": len(emails),
         "contact_ids": sorted(list(vids))[:max_unique],
-        "truncated": len(vids) >= max_unique or pages >= MAX_PAGES,
+        "recipient_emails": sorted(list(emails))[:max_unique],
+        "truncated": len(emails) >= max_unique or pages >= MAX_PAGES,
+        "diagnostics": {
+            "pages_fetched": pages + 1,
+            "total_events_seen": total_events_seen,
+            "last_response_has_more": last_has_more,
+            "sample_event_keys": sample_event_keys,
+        },
     }
 
 
