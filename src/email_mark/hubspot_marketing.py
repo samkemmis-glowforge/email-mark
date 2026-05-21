@@ -522,6 +522,7 @@ def get_email_engagers_via_list(
     max_wait_seconds: int = 120,
     poll_interval_seconds: int = 10,
     delete_after_read: bool = True,
+    intersect_with: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Get contacts who engaged with a marketing email by creating a
     temporary HubSpot Active List and reading its members.
@@ -664,15 +665,43 @@ def get_email_engagers_via_list(
         except Exception:
             list_was_deleted = False
 
-    # Cap the returned arrays so a huge engagement set doesn't blow the
-    # model's context window. The counts are always accurate; the arrays
-    # are truncated with a `truncated` flag the caller can react to. For
-    # joining against external systems with N > MAX_EMAILS_IN_RESPONSE,
-    # the caller should run a BigQuery join with the email_id as the
-    # filter instead of pulling all emails inline.
-    MAX_EMAILS_IN_RESPONSE = 1000
     all_emails = sorted(list(emails))
     all_contact_ids = sorted(list(contact_ids))
+
+    # If the caller wants to know which of THEIR emails are in the
+    # engagement set, do the set intersection here — deterministically,
+    # server-side — instead of trusting the model to do it in context.
+    # This is the right path for join/attribution queries: caller has a
+    # small set (e.g. 40 Shopify customers), wants to know which engaged
+    # with the campaign.
+    if intersect_with is not None:
+        target = {e.strip().lower() for e in intersect_with if e}
+        engager_set = set(all_emails)
+        matched = sorted(target & engager_set)
+        unmatched = sorted(target - engager_set)
+        return {
+            "email_id": email_id,
+            "event_type": event_type.upper(),
+            "mode": "intersection",
+            "input_emails_count": len(target),
+            "engagers_total_count": len(all_emails),
+            "matched_count": len(matched),
+            "matched_emails": matched,
+            "unmatched_emails": unmatched,
+            "match_rate_pct": round(len(matched) / len(target) * 100, 2) if target else 0.0,
+            "list_id": list_id,
+            "list_deleted": list_was_deleted,
+            "diagnostics": {
+                "final_list_size": final_size,
+                "size_progression": sizes_seen,
+                "wait_elapsed_seconds": wait_elapsed,
+                "pages_fetched": pages + 1,
+            },
+        }
+
+    # No intersection requested — return the full engager set, capped to
+    # keep the model's context manageable. Counts are always accurate.
+    MAX_EMAILS_IN_RESPONSE = 1000
     truncated = (
         len(all_emails) > MAX_EMAILS_IN_RESPONSE
         or len(all_contact_ids) > MAX_EMAILS_IN_RESPONSE
@@ -680,6 +709,7 @@ def get_email_engagers_via_list(
     return {
         "email_id": email_id,
         "event_type": event_type.upper(),
+        "mode": "full_list",
         "list_id": list_id,
         "list_name": list_name,
         "unique_email_count": len(all_emails),
@@ -689,8 +719,10 @@ def get_email_engagers_via_list(
         "truncated": truncated,
         "truncation_note": (
             f"Only the first {MAX_EMAILS_IN_RESPONSE} of {len(all_emails)} "
-            "emails are returned to keep context manageable. For analyses "
-            "needing the full set, do the join in BigQuery instead of inline."
+            "emails are returned to keep context manageable. To check "
+            "specific emails against this engagement set, call this tool "
+            "again with the `intersect_with` parameter — the intersection "
+            "is done server-side and returns deterministic results."
         ) if truncated else None,
         "list_deleted": list_was_deleted,
         "diagnostics": {

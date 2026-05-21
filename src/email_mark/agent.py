@@ -703,6 +703,7 @@ def _tool_get_email_engagers_via_list(args: Dict[str, Any]) -> Dict[str, Any]:
         email_id=str(args["email_id"]),
         event_type=str(args.get("event_type", "OPENED")),
         delete_after_read=bool(args.get("delete_after_read", True)),
+        intersect_with=args.get("intersect_with"),
     )
 
 
@@ -1231,6 +1232,22 @@ TOOLS: List[Dict[str, Any]] = [
                         "Delete the temporary list after reading members. "
                         "Default true (keeps HubSpot UI clean). Set false "
                         "if the user wants to inspect or reuse the list."
+                    ),
+                },
+                "intersect_with": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "OPTIONAL but STRONGLY PREFERRED for attribution "
+                        "queries. Pass a list of emails you want to check "
+                        "(e.g., the 40 Shopify customer emails). The tool "
+                        "will compute the intersection server-side and "
+                        "return ONLY the matched + unmatched subsets, plus "
+                        "the match_rate_pct. Use this whenever the user "
+                        "asks 'which of these people did X' — DO NOT try "
+                        "to do the set intersection yourself in text, "
+                        "LLMs hallucinate when matching 40+ items against "
+                        "1000+ items and you will get partial/wrong answers."
                     ),
                 },
             },
