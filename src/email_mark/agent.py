@@ -143,6 +143,31 @@ def _brand_voice_section() -> str:
 
 
 def _lessons_file_path() -> Path:
+    """Return the path Mark reads/writes lessons to.
+
+    If LESSONS_FILE_PATH is set (Render persistent disk path, e.g.
+    /var/data/lessons_learned.md), use it — lessons there survive every
+    deploy. On first run when the persistent file doesn't exist yet, we
+    seed it from the repo's prompts/lessons_learned.md so existing
+    lessons aren't lost.
+
+    Without the env var, fall back to the repo path. That works for
+    local dev; on Render without a disk, lessons are ephemeral.
+    """
+    override = os.environ.get("LESSONS_FILE_PATH")
+    if override:
+        persistent = Path(override)
+        if not persistent.exists():
+            persistent.parent.mkdir(parents=True, exist_ok=True)
+            repo_seed = (
+                Path(__file__).resolve().parent.parent.parent
+                / "prompts"
+                / "lessons_learned.md"
+            )
+            if repo_seed.exists():
+                persistent.write_text(repo_seed.read_text())
+        return persistent
+
     repo_root = Path(__file__).resolve().parent.parent.parent
     return repo_root / "prompts" / "lessons_learned.md"
 
@@ -174,17 +199,113 @@ def _lessons_section() -> str:
     )
 
 
+def _commit_lessons_to_github(new_content: str, message: str) -> Dict[str, Any]:
+    """Push the updated lessons file to GitHub via the Contents API.
+
+    Required env vars:
+      GITHUB_TOKEN   - fine-grained PAT with Contents:Write on the repo
+      GITHUB_REPO    - "owner/name" form, e.g. "Glowforge/email-mark"
+    Optional:
+      GITHUB_BRANCH  - branch to commit to (default: "main")
+
+    Includes `[skip render]` in the commit message so Render's auto-deploy
+    doesn't trigger on every lesson save (which would cause a continuous
+    restart loop). Mark's own `_lessons_section()` re-reads the file on
+    every inference, so new lessons take effect without needing a deploy.
+
+    Returns {committed: bool, ...details}. Failures are non-fatal — the
+    caller still has the lesson saved to local disk.
+    """
+    import base64 as _b64
+
+    token = os.environ.get("GITHUB_TOKEN")
+    repo = os.environ.get("GITHUB_REPO")
+    branch = os.environ.get("GITHUB_BRANCH", "main")
+    if not token or not repo:
+        return {
+            "committed": False,
+            "reason": "GITHUB_TOKEN or GITHUB_REPO env var not set",
+        }
+
+    import requests as _requests
+    api = "https://api.github.com"
+    path = "prompts/lessons_learned.md"
+    headers = {
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+    # 1. Get current SHA so we can update (vs create).
+    current_sha: Optional[str] = None
+    try:
+        get_response = _requests.get(
+            f"{api}/repos/{repo}/contents/{path}",
+            headers=headers,
+            params={"ref": branch},
+            timeout=15,
+        )
+        if get_response.status_code == 200:
+            current_sha = get_response.json().get("sha")
+        elif get_response.status_code != 404:
+            return {
+                "committed": False,
+                "reason": (
+                    f"GitHub GET returned HTTP {get_response.status_code}: "
+                    f"{get_response.text[:200]}"
+                ),
+            }
+    except Exception as exc:
+        return {"committed": False, "reason": f"GitHub GET error: {exc}"}
+
+    # 2. PUT updated content.
+    payload: Dict[str, Any] = {
+        "message": f"{message} [skip render]",
+        "content": _b64.b64encode(new_content.encode("utf-8")).decode("ascii"),
+        "branch": branch,
+    }
+    if current_sha:
+        payload["sha"] = current_sha
+
+    try:
+        put_response = _requests.put(
+            f"{api}/repos/{repo}/contents/{path}",
+            headers=headers,
+            json=payload,
+            timeout=15,
+        )
+    except Exception as exc:
+        return {"committed": False, "reason": f"GitHub PUT error: {exc}"}
+
+    if put_response.status_code in (200, 201):
+        body = put_response.json()
+        commit = body.get("commit", {})
+        return {
+            "committed": True,
+            "commit_sha": commit.get("sha"),
+            "commit_url": commit.get("html_url"),
+            "branch": branch,
+        }
+    return {
+        "committed": False,
+        "reason": (
+            f"GitHub PUT returned HTTP {put_response.status_code}: "
+            f"{put_response.text[:300]}"
+        ),
+    }
+
+
 def remember_lesson(heading: str, lesson: str) -> Dict[str, Any]:
-    """Append a lesson to prompts/lessons_learned.md under the given heading.
+    """Append a lesson to prompts/lessons_learned.md and commit to git.
 
-    If a section with the matching heading already exists, append the
-    lesson as a new bullet under it. Otherwise create a new section at
-    the bottom of the file.
-
-    On Render, the file lives in the deployed-code path which gets reset
-    on each new deploy — so lessons saved at runtime persist until the
-    next push. The response includes a `permanence_note` reminding the
-    user to commit to git for durable storage.
+    Flow:
+      1. Update the local file on the Render worker (so the running
+         process sees the new lesson immediately via _lessons_section()
+         which re-reads on each inference).
+      2. Push the updated file to GitHub via the Contents API. Commit
+         includes [skip render] so we don't trigger a deploy loop.
+      3. Return a structured result describing both the local write and
+         the GitHub commit.
     """
     import re as _re
     from datetime import date as _date
@@ -204,7 +325,6 @@ def remember_lesson(heading: str, lesson: str) -> Dict[str, Any]:
     content = lessons_file.read_text()
     heading_marker = f"## {heading_clean}"
     heading_pattern = _re.escape(heading_marker)
-    # Match the heading and everything up to the next ## section (or EOF).
     section_match = _re.search(
         rf"({heading_pattern}\n.*?)(?=\n## |\Z)",
         content,
@@ -226,20 +346,28 @@ def remember_lesson(heading: str, lesson: str) -> Dict[str, Any]:
         )
         section_action = "created_new_section"
 
+    # 1. Local write (always — the running process needs to see this).
     lessons_file.write_text(new_content)
 
-    return {
+    result: Dict[str, Any] = {
         "saved": True,
         "heading": heading_clean,
         "lesson": lesson_clean,
         "date": today,
         "section_action": section_action,
-        "permanence_note": (
-            "Lesson saved to the local file. On Render this resets to the "
-            "git version on every deploy — share the lesson in chat so the "
-            "user can commit it for permanent storage."
-        ),
+        "storage_path": str(lessons_file),
     }
+
+    # 2. Optional GitHub push for version history — only attempt if env
+    #    vars are configured. If not, the persistent disk IS the durable
+    #    store and we don't want to spam "github commit failed" messages.
+    if os.environ.get("GITHUB_TOKEN") and os.environ.get("GITHUB_REPO"):
+        result["github"] = _commit_lessons_to_github(
+            new_content,
+            message=f"Add lesson under '{heading_clean}'",
+        )
+
+    return result
 
 
 SYSTEM_PROMPT = (
@@ -318,18 +446,18 @@ You have tools to look up real data in HubSpot and to create draft emails.
 Use them rather than guessing. When a tool returns data, summarize in plain
 language — never paste raw JSON.
 
-CAPTURING LESSONS — save them yourself, don't ask:
+CAPTURING LESSONS — save them yourself:
 When the user corrects you about something durable — a data source quirk,
 an undocumented tool behavior, a business rule that differs from your
-assumptions — call the remember_lesson tool to save it directly. Don't
-just propose the lesson in chat and wait for the user to paste it; that
-hasn't been working and you keep making the same mistakes.
+assumptions — call remember_lesson directly. The tool both saves the
+lesson locally AND commits it to GitHub so it survives deploys.
 
-After saving, briefly mention in chat that you saved it (one sentence),
-include the lesson text, and remind the user to commit the file to git
-so it survives the next deploy. Example: "Saved a lesson to lessons_
-learned.md: 'BQ hubspot.email_events only goes back to Dec 2024.' Worth
-committing to git so it persists across deploys."
+After saving, briefly confirm in chat in ONE sentence: include the lesson
+heading and a short link/sha from the github field of the response if
+the commit succeeded. Example: "Saved under 'BigQuery / Data warehouse'
+(commit a3f2b1c)." If the github commit failed (github.committed=false),
+say so plainly and include the reason — the user may need to commit
+manually.
 
 Only save lessons for DURABLE truths that'll still be true next month —
 not one-off mistakes, momentary preferences, or "this specific user is
