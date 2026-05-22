@@ -370,6 +370,250 @@ def remember_lesson(heading: str, lesson: str) -> Dict[str, Any]:
     return result
 
 
+# ---------------------------------------------------------------------------
+# Lesson parsing — list, update, delete
+# ---------------------------------------------------------------------------
+#
+# Lessons file format (markdown):
+#
+#   ## Heading One
+#
+#   - First lesson body, possibly multi-line.
+#     Continuation lines are indented two spaces.
+#     (Learned 2026-05-11)
+#
+#   - Second lesson body.
+#     (Learned 2026-05-12)
+#
+#   ## Heading Two
+#   - Lesson under second heading.
+#     (Learned 2026-05-13)
+#
+# We parse into {heading: [lesson_text, ...]} so Mark can address a specific
+# lesson by (heading, index). Indices are 0-based and reflect order in the file.
+
+
+def _parse_lessons_file() -> Dict[str, List[str]]:
+    """Parse the lessons file into {heading: [lesson_text, ...]}.
+
+    Each lesson_text excludes the leading "- " bullet marker but preserves
+    the rest of the body verbatim (including the trailing "(Learned ...)"
+    line). Headings are returned without their "## " prefix.
+    """
+    import re as _re
+
+    lessons_file = _lessons_file_path()
+    if not lessons_file.exists():
+        return {}
+
+    content = lessons_file.read_text()
+    sections: Dict[str, List[str]] = {}
+
+    # Split into sections by "## " headings.
+    section_matches = list(_re.finditer(r"^## (.+?)$", content, _re.MULTILINE))
+    for i, match in enumerate(section_matches):
+        heading = match.group(1).strip()
+        body_start = match.end()
+        body_end = (
+            section_matches[i + 1].start()
+            if i + 1 < len(section_matches)
+            else len(content)
+        )
+        body = content[body_start:body_end]
+
+        # Within the section body, split on lines that start with "- " at
+        # column 0 — those are bullet starts. Continuation lines start
+        # with whitespace.
+        lessons: List[str] = []
+        current: List[str] = []
+        in_bullet = False
+        for line in body.split("\n"):
+            if line.startswith("- "):
+                if in_bullet and current:
+                    lessons.append("\n".join(current).rstrip())
+                current = [line[2:]]  # strip "- "
+                in_bullet = True
+            elif in_bullet:
+                # Continuation of current bullet OR blank line within it.
+                # Blank lines end the bullet only when followed by a non-
+                # indented non-bullet line; for simplicity treat any blank
+                # line as a soft separator and let trim handle it.
+                if line.strip() == "" and current and current[-1].strip() == "":
+                    # Two blanks in a row — end the bullet.
+                    if current:
+                        lessons.append("\n".join(current).rstrip())
+                    current = []
+                    in_bullet = False
+                else:
+                    current.append(line.lstrip() if line.startswith("  ") else line)
+        if in_bullet and current:
+            lessons.append("\n".join(current).rstrip())
+
+        # Drop empty entries (e.g., trailing whitespace artifacts).
+        lessons = [l for l in lessons if l.strip()]
+        if lessons:
+            sections[heading] = lessons
+
+    return sections
+
+
+def _serialize_lessons_file(sections: Dict[str, List[str]]) -> str:
+    """Inverse of _parse_lessons_file — produce the markdown file body.
+
+    Preserves the file's preamble (everything before the first `## ` heading)
+    when re-writing. Each lesson is wrapped as a bullet with two-space
+    indentation on continuation lines.
+    """
+    import re as _re
+
+    lessons_file = _lessons_file_path()
+    if lessons_file.exists():
+        original = lessons_file.read_text()
+        first_heading = _re.search(r"^## ", original, _re.MULTILINE)
+        preamble = original[: first_heading.start()] if first_heading else ""
+    else:
+        preamble = ""
+
+    parts: List[str] = [preamble.rstrip(), ""]
+    for heading, lessons in sections.items():
+        parts.append(f"## {heading}")
+        parts.append("")
+        for lesson in lessons:
+            # Indent every continuation line with two spaces.
+            lines = lesson.split("\n")
+            bullet_lines = [f"- {lines[0]}"] + [
+                f"  {ln}" if ln.strip() else ""
+                for ln in lines[1:]
+            ]
+            parts.append("\n".join(bullet_lines))
+            parts.append("")  # blank line between bullets
+    return "\n".join(parts).rstrip() + "\n"
+
+
+def list_lessons() -> Dict[str, Any]:
+    """Return all lessons grouped by heading with indices for addressing.
+
+    Mark calls this BEFORE deciding whether to save a new lesson, so he
+    can see if an existing entry already covers the topic. The (heading,
+    index) pair returned here is what update_lesson / delete_lesson take.
+    """
+    sections = _parse_lessons_file()
+    out: Dict[str, Any] = {
+        "headings": [],
+        "storage_path": str(_lessons_file_path()),
+    }
+    for heading, lessons in sections.items():
+        out["headings"].append({
+            "heading": heading,
+            "lessons": [
+                {"index": i, "text": text} for i, text in enumerate(lessons)
+            ],
+        })
+    return out
+
+
+def update_lesson(heading: str, index: int, new_lesson: str) -> Dict[str, Any]:
+    """Replace an existing lesson at (heading, index) with new text.
+
+    Use when an existing lesson is partially right but needs correction,
+    or when you want to consolidate multiple bullets into one updated
+    statement. For consolidation, update the FIRST bullet then delete
+    the others.
+    """
+    from datetime import date as _date
+
+    heading_clean = (heading or "").strip()
+    new_clean = (new_lesson or "").strip()
+    if not heading_clean or not new_clean:
+        return {"error": "Both heading and new_lesson are required."}
+
+    sections = _parse_lessons_file()
+    if heading_clean not in sections:
+        return {
+            "error": f"No section found with heading '{heading_clean}'.",
+            "available_headings": list(sections.keys()),
+        }
+    if index < 0 or index >= len(sections[heading_clean]):
+        return {
+            "error": (
+                f"Index {index} out of range for '{heading_clean}' "
+                f"(has {len(sections[heading_clean])} lessons)."
+            ),
+        }
+
+    # Append today's date marker if the new text doesn't already carry one.
+    today = _date.today().isoformat()
+    if "(Learned " not in new_clean:
+        new_clean = f"{new_clean}\n(Updated {today})"
+
+    old_text = sections[heading_clean][index]
+    sections[heading_clean][index] = new_clean
+    new_content = _serialize_lessons_file(sections)
+
+    lessons_file = _lessons_file_path()
+    lessons_file.write_text(new_content)
+
+    result: Dict[str, Any] = {
+        "updated": True,
+        "heading": heading_clean,
+        "index": index,
+        "old_text": old_text,
+        "new_text": new_clean,
+        "storage_path": str(lessons_file),
+    }
+    if os.environ.get("GITHUB_TOKEN") and os.environ.get("GITHUB_REPO"):
+        result["github"] = _commit_lessons_to_github(
+            new_content,
+            message=f"Update lesson under '{heading_clean}' (index {index})",
+        )
+    return result
+
+
+def delete_lesson(heading: str, index: int) -> Dict[str, Any]:
+    """Remove the lesson at (heading, index). If the section becomes
+    empty, the heading is also removed.
+    """
+    heading_clean = (heading or "").strip()
+    if not heading_clean:
+        return {"error": "heading is required."}
+
+    sections = _parse_lessons_file()
+    if heading_clean not in sections:
+        return {
+            "error": f"No section found with heading '{heading_clean}'.",
+            "available_headings": list(sections.keys()),
+        }
+    if index < 0 or index >= len(sections[heading_clean]):
+        return {
+            "error": (
+                f"Index {index} out of range for '{heading_clean}' "
+                f"(has {len(sections[heading_clean])} lessons)."
+            ),
+        }
+
+    removed = sections[heading_clean].pop(index)
+    if not sections[heading_clean]:
+        del sections[heading_clean]
+
+    new_content = _serialize_lessons_file(sections)
+    lessons_file = _lessons_file_path()
+    lessons_file.write_text(new_content)
+
+    result: Dict[str, Any] = {
+        "deleted": True,
+        "heading": heading_clean,
+        "index": index,
+        "removed_text": removed,
+        "storage_path": str(lessons_file),
+    }
+    if os.environ.get("GITHUB_TOKEN") and os.environ.get("GITHUB_REPO"):
+        result["github"] = _commit_lessons_to_github(
+            new_content,
+            message=f"Delete lesson under '{heading_clean}' (index {index})",
+        )
+    return result
+
+
 SYSTEM_PROMPT = (
     """You are Mark, an AI coworker for the Glowforge marketing team in Slack.
 
@@ -446,18 +690,30 @@ You have tools to look up real data in HubSpot and to create draft emails.
 Use them rather than guessing. When a tool returns data, summarize in plain
 language — never paste raw JSON.
 
-CAPTURING LESSONS — save them yourself:
+CAPTURING LESSONS — save them yourself, but check first:
 When the user corrects you about something durable — a data source quirk,
 an undocumented tool behavior, a business rule that differs from your
-assumptions — call remember_lesson directly. The tool both saves the
-lesson locally AND commits it to GitHub so it survives deploys.
+assumptions — capture it. But BEFORE you call remember_lesson, call
+list_lessons to see what's already saved. Three cases:
 
-After saving, briefly confirm in chat in ONE sentence: include the lesson
-heading and a short link/sha from the github field of the response if
-the commit succeeded. Example: "Saved under 'BigQuery / Data warehouse'
-(commit a3f2b1c)." If the github commit failed (github.committed=false),
-say so plainly and include the reason — the user may need to commit
-manually.
+1. Nothing existing covers this topic → call remember_lesson to append.
+2. An existing lesson is on the same topic but WRONG or INCOMPLETE → call
+   update_lesson to replace it. Do NOT append a contradicting bullet next
+   to the old one — that leaves you with two lessons that disagree, and
+   next time you'll be confused about which to trust.
+3. Multiple existing bullets are stale or were attempts at the same problem
+   → consolidate. Update the first to the corrected version, then
+   delete_lesson the others.
+
+If you wrote a lesson earlier in this conversation and the user is now
+correcting THAT lesson, you almost certainly want update_lesson, not
+remember_lesson.
+
+After saving/updating/deleting, briefly confirm in chat in ONE sentence:
+include the heading and (for updates/deletes) what changed. Example:
+"Updated 'BigQuery / Data warehouse' lesson #0 with the new caveat."
+If a github commit failed (github.committed=false), say so plainly and
+include the reason — the user may need to commit manually.
 
 Only save lessons for DURABLE truths that'll still be true next month —
 not one-off mistakes, momentary preferences, or "this specific user is
@@ -870,6 +1126,25 @@ def _tool_remember_lesson(args: Dict[str, Any]) -> Dict[str, Any]:
     )
 
 
+def _tool_list_lessons(args: Dict[str, Any]) -> Dict[str, Any]:
+    return list_lessons()
+
+
+def _tool_update_lesson(args: Dict[str, Any]) -> Dict[str, Any]:
+    return update_lesson(
+        heading=str(args.get("heading", "")),
+        index=int(args.get("index", -1)),
+        new_lesson=str(args.get("new_lesson", "")),
+    )
+
+
+def _tool_delete_lesson(args: Dict[str, Any]) -> Dict[str, Any]:
+    return delete_lesson(
+        heading=str(args.get("heading", "")),
+        index=int(args.get("index", -1)),
+    )
+
+
 def _tool_lookup_slack_user(args: Dict[str, Any]) -> Dict[str, Any]:
     matches = slack_lookup_user(args.get("query", ""))
     return {"matches": matches[:10], "total_matches": len(matches)}
@@ -1086,21 +1361,16 @@ TOOLS: List[Dict[str, Any]] = [
     {
         "name": "remember_lesson",
         "description": (
-            "Save a durable lesson to your lessons_learned.md file so you "
-            "won't make the same mistake next time. Use this when the user "
-            "corrects you about something that's likely to recur: a data "
-            "source quirk (e.g. a BigQuery table is stale or incomplete), "
-            "an undocumented tool behavior, a business rule, a definition "
-            "that differs from your default assumption, or a workflow "
-            "gotcha. The lesson takes effect on your next inference call.\n\n"
+            "APPEND a new lesson to your lessons_learned.md file. Use ONLY "
+            "when no existing lesson covers this topic — call list_lessons "
+            "first to check. If an existing lesson is wrong or incomplete, "
+            "call update_lesson instead so you don't end up with two "
+            "contradicting bullets.\n\n"
             "Only save lessons for DURABLE truths — gotchas about systems "
             "that will still be true next month. Do NOT save lessons for "
             "one-off preferences, momentary mistakes, or tone/style "
             "feedback (those go in the system prompt directly).\n\n"
-            "When you save a lesson, also briefly tell the user in chat: "
-            "(1) that you saved it, (2) what it says, and (3) that they "
-            "should commit it to git for permanent storage — on Render the "
-            "file resets on every deploy."
+            "After saving, briefly confirm in chat what you saved."
         ),
         "input_schema": {
             "type": "object",
@@ -1129,6 +1399,85 @@ TOOLS: List[Dict[str, Any]] = [
                 },
             },
             "required": ["heading", "lesson"],
+        },
+    },
+    {
+        "name": "list_lessons",
+        "description": (
+            "List every lesson currently in your lessons_learned.md file, "
+            "grouped by heading and indexed within each heading. ALWAYS "
+            "call this before remember_lesson / update_lesson / "
+            "delete_lesson so you address the right entry. Returns a "
+            "structure like {headings: [{heading, lessons: [{index, "
+            "text}]}]}."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    {
+        "name": "update_lesson",
+        "description": (
+            "Replace an existing lesson in place. Use this when an existing "
+            "bullet is wrong, incomplete, or being superseded — DON'T leave "
+            "the old bullet and append a new contradicting one. Call "
+            "list_lessons first to find the exact (heading, index) pair to "
+            "target.\n\n"
+            "For consolidating multiple stale bullets into one: update the "
+            "first to the corrected version, then call delete_lesson on the "
+            "others (delete from highest index to lowest so earlier indices "
+            "remain valid).\n\n"
+            "A '(Updated YYYY-MM-DD)' line is appended automatically if "
+            "you don't include your own date marker."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "heading": {
+                    "type": "string",
+                    "description": "Section heading containing the lesson, exactly as returned by list_lessons.",
+                },
+                "index": {
+                    "type": "integer",
+                    "description": "0-based index of the lesson within the section, from list_lessons.",
+                },
+                "new_lesson": {
+                    "type": "string",
+                    "description": (
+                        "The replacement lesson body — full text that will "
+                        "stand in for the existing bullet. Same style as "
+                        "remember_lesson: 2-4 sentences, no markdown bullet "
+                        "syntax."
+                    ),
+                },
+            },
+            "required": ["heading", "index", "new_lesson"],
+        },
+    },
+    {
+        "name": "delete_lesson",
+        "description": (
+            "Remove a lesson that's no longer accurate or is being "
+            "consolidated into another bullet. Call list_lessons first to "
+            "find the exact (heading, index). If the section becomes "
+            "empty, the heading is removed too. When deleting multiple "
+            "lessons in the same section, delete from highest index to "
+            "lowest so earlier indices don't shift."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "heading": {
+                    "type": "string",
+                    "description": "Section heading, exactly as returned by list_lessons.",
+                },
+                "index": {
+                    "type": "integer",
+                    "description": "0-based index of the lesson within the section.",
+                },
+            },
+            "required": ["heading", "index"],
         },
     },
     {
@@ -1932,6 +2281,9 @@ TOOL_HANDLERS: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     "search_marketing_emails": _tool_search_marketing_emails,
     "fetch_forum_post": _tool_fetch_forum_post,
     "remember_lesson": _tool_remember_lesson,
+    "list_lessons": _tool_list_lessons,
+    "update_lesson": _tool_update_lesson,
+    "delete_lesson": _tool_delete_lesson,
     "get_email_body": _tool_get_email_body,
     "get_email_widget_structure": _tool_get_email_widget_structure,
     "get_email_widget_html": _tool_get_email_widget_html,
