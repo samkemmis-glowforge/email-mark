@@ -1059,8 +1059,8 @@ segment, audience, or "the X list" by name:
    If the user has a specific override, take it; otherwise the default
    is correct.
 
-4. count_list_intersection takes 10-30 seconds. Say "one sec, asking
-   HubSpot" before the call so the user knows you didn't hang.
+4. count_list_intersection is fast (single v3 contacts-search call,
+   usually 1-3 seconds). No need to warn the user about waiting.
 
 5. If the user gives you a NUMBER mid-conversation and the referent
    isn't obvious, ask before assuming it's an ID — numbers are
@@ -1880,9 +1880,9 @@ TOOLS: List[Dict[str, Any]] = [
             "Pass max_sends_since_engagement=null to count marketing "
             "contacts of any engagement level. Pass marketing_only=false "
             "to count all contacts regardless of marketing status.\n\n"
-            "Takes 10-30 seconds because HubSpot needs time to populate "
-            "the dynamic list. Tell the user 'one sec, asking HubSpot' "
-            "before the call so they don't think you've hung."
+            "Implementation: single v3 contacts-search call with a combined "
+            "ilsListMemberships.listId + property filter. Usually returns "
+            "in a few seconds; no temp lists, no polling."
         ),
         "input_schema": {
             "type": "object",

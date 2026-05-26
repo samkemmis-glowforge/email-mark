@@ -744,176 +744,188 @@ def get_email_engagers_via_list(
 def find_hubspot_lists(
     name_contains: str = "",
     limit: int = 20,
-    max_pages: int = 20,
 ) -> Dict[str, Any]:
-    """Search HubSpot contact lists by name substring (case-insensitive).
+    """Search HubSpot contact lists by name via the v3 lists search API.
 
-    Uses /contacts/v1/lists, which doesn't support server-side name search,
-    so this paginates through lists (250 per page) and filters client-side.
-    Returns up to `limit` matches.
+    Uses POST /crm/v3/lists/search, which supports server-side name search
+    (the legacy v1 endpoint required scanning all lists and filtering
+    client-side). Needs the `crm.lists.read` scope.
 
     Args:
-      name_contains: Substring to look for in list names. Empty string
-        returns the most recent lists.
+      name_contains: Substring to look for in list names. Case-insensitive
+        match handled server-side.
       limit: Max number of matches to return. Default 20.
-      max_pages: Cap on pagination to avoid runaway scans on accounts
-        with thousands of lists. Default 20 -> up to 5000 lists scanned.
 
     Returns:
       {
         "found": int,
         "lists": [{
-          "list_id": int,
+          "list_id": str,
           "name": str,
-          "list_type": "STATIC" | "DYNAMIC",
-          "dynamic": bool,
-          "size": int,  # total contact count
-          "created_at": str,  # ISO 8601 or epoch ms (HubSpot is inconsistent)
+          "processing_type": "DYNAMIC" | "STATIC" | "MANUAL" | ...,
+          "object_type_id": str,  # "0-1" for contacts
+          "size": int | None,
+          "created_at": str,  # ISO 8601 UTC
           "updated_at": str,
         }, ...],
-        "scanned_pages": int,
-        "scanned_lists": int,
+        "total_matching": int,  # total matches HubSpot says exist
+        "search_term": str,
       }
     """
-    needle = (name_contains or "").strip().lower()
+    payload = {
+        "query": (name_contains or "").strip(),
+        "count": int(limit),
+        "offset": 0,
+        # Request the size field on each list so we don't need a second call.
+        "additionalProperties": ["hs_list_size", "hs_list_reference_count"],
+    }
+    response = requests.post(
+        f"{HUBSPOT_BASE}/crm/v3/lists/search",
+        headers=_headers(),
+        json=payload,
+        timeout=30,
+    )
+    if response.status_code != 200:
+        return {
+            "error": (
+                f"v3 lists search returned HTTP {response.status_code}. "
+                "Service Key likely missing 'crm.lists.read' scope, or the "
+                "v3 lists endpoint isn't enabled on this account."
+            ),
+            "response_body": response.text[:500],
+        }
+
+    body = response.json()
+    raw_lists = body.get("lists") or body.get("results") or []
+
     matches: List[Dict[str, Any]] = []
-    scanned = 0
-    offset = 0
-    pages = 0
-    PAGE_SIZE = 250
-
-    while pages < max_pages and len(matches) < limit:
-        response = requests.get(
-            f"{HUBSPOT_BASE}/contacts/v1/lists",
-            headers=_headers(),
-            params={"count": PAGE_SIZE, "offset": offset},
-            timeout=30,
-        )
-        if response.status_code != 200:
-            return {
-                "error": (
-                    f"Lists API returned HTTP {response.status_code}. "
-                    "Service Key likely missing 'contacts' or 'lists' scope."
-                ),
-                "response_body": response.text[:500],
-            }
-
-        payload = response.json()
-        page_lists = payload.get("lists", []) or []
-        scanned += len(page_lists)
-        pages += 1
-
-        for lst in page_lists:
-            name = (lst.get("name") or "").strip()
-            if not needle or needle in name.lower():
-                meta = lst.get("metaData") or {}
-                matches.append({
-                    "list_id": lst.get("listId"),
-                    "name": name,
-                    "list_type": lst.get("listType"),
-                    "dynamic": bool(lst.get("dynamic")),
-                    "size": meta.get("size"),
-                    "created_at": lst.get("createdAt"),
-                    "updated_at": lst.get("updatedAt"),
-                })
-                if len(matches) >= limit:
-                    break
-
-        if not payload.get("has-more"):
-            break
-        offset = payload.get("offset", offset + PAGE_SIZE)
+    for lst in raw_lists:
+        addl = lst.get("additionalProperties") or {}
+        size_val = addl.get("hs_list_size")
+        try:
+            size = int(size_val) if size_val is not None else None
+        except (TypeError, ValueError):
+            size = None
+        matches.append({
+            "list_id": str(lst.get("listId")) if lst.get("listId") is not None else None,
+            "name": lst.get("name"),
+            "processing_type": lst.get("processingType"),
+            "object_type_id": lst.get("objectTypeId"),
+            "size": size,
+            "created_at": lst.get("createdAt"),
+            "updated_at": lst.get("updatedAt"),
+        })
 
     return {
         "found": len(matches),
         "lists": matches,
-        "scanned_pages": pages,
-        "scanned_lists": scanned,
-        "search_term": needle,
+        "total_matching": body.get("total"),
+        "search_term": (name_contains or "").strip(),
         "note": (
-            "Truncated at limit — increase limit or narrow name_contains."
-            if len(matches) >= limit else None
+            "Search returned more matches than `limit` — narrow the search "
+            "term or increase limit."
+            if body.get("hasMore") else None
         ),
     }
 
 
-def get_list_details(list_id: str) -> Dict[str, Any]:
-    """Fetch a HubSpot contact list's metadata and filter criteria.
+def _summarize_v3_filter_branch(branch: Any) -> str:
+    """Render a v3 list filterBranch tree as a short human-readable string.
 
-    Use this to:
-      - Confirm a list_id exists and get its current size
-      - Describe what defines the list (the filter criteria) so you can
-        explain the list's audience without guessing
-      - Decide whether the list is static (manually curated) or dynamic
-        (rule-based, auto-updating)
+    HubSpot's v3 filter tree has two node kinds:
+      - Leaf: {filterType: PROPERTY | IN_LIST | ..., property, operator, value}
+      - Branch: {filterBranchType: AND | OR, filters: [leaf...], filterBranches: [branch...]}
+    """
+    if not isinstance(branch, dict):
+        return ""
+    ftype = branch.get("filterType")
+    if ftype == "IN_LIST":
+        return f"is in list {branch.get('listId')}"
+    if ftype == "PROPERTY":
+        prop = branch.get("property") or ""
+        op = branch.get("operator") or ""
+        val = branch.get("value")
+        if val is not None:
+            return f"{prop} {op} {val!r}"
+        values = branch.get("values")
+        if values:
+            return f"{prop} {op} {values!r}"
+        return f"{prop} {op}"
+    if ftype:
+        # Other leaf filter types — render minimally.
+        return f"{ftype}:{branch.get('operator', '')}"
+    # Branch node — recurse.
+    op = branch.get("filterBranchOperator", "AND")
+    parts: List[str] = []
+    for sub in (branch.get("filters") or []):
+        s = _summarize_v3_filter_branch(sub)
+        if s:
+            parts.append(s)
+    for sub in (branch.get("filterBranches") or []):
+        s = _summarize_v3_filter_branch(sub)
+        if s:
+            parts.append(f"({s})")
+    if not parts:
+        return ""
+    joiner = " AND " if op == "AND" else " OR "
+    return joiner.join(parts)
+
+
+def get_list_details(list_id: str) -> Dict[str, Any]:
+    """Fetch a HubSpot list's metadata and filter criteria via the v3 API.
+
+    Uses GET /crm/v3/lists/{listId} with includeFilters=true so we get the
+    filter tree in the same call. Needs the `crm.lists.read` scope.
 
     Returns:
-      list_id, name, list_type, dynamic, size, created_at, updated_at,
-      filter_summary (a human-readable description of the criteria, when
-      the list is dynamic), and raw_filters (the original filter object
-      for debugging).
+      list_id, name, processing_type, object_type_id, size, created_at,
+      updated_at, filter_summary (plain-English render of the criteria when
+      the list is dynamic), raw_filter (the full v3 filterBranch tree).
     """
     response = requests.get(
-        f"{HUBSPOT_BASE}/contacts/v1/lists/{list_id}",
+        f"{HUBSPOT_BASE}/crm/v3/lists/{list_id}",
         headers=_headers(),
+        params={"includeFilters": "true"},
         timeout=30,
     )
     if response.status_code == 404:
         return {"error": f"List {list_id} not found."}
     if response.status_code != 200:
         return {
-            "error": f"Lists API returned HTTP {response.status_code}.",
+            "error": (
+                f"v3 lists get returned HTTP {response.status_code}. "
+                "Service Key likely missing 'crm.lists.read' scope."
+            ),
             "response_body": response.text[:500],
         }
 
-    data = response.json()
-    meta = data.get("metaData") or {}
-    raw_filters = data.get("filters") or []
+    body = response.json()
+    # v3 wraps the list object as {"list": {...}}; older responses may
+    # return the object at the top level. Tolerate both.
+    lst = body.get("list") if isinstance(body.get("list"), dict) else body
 
-    # Build a best-effort plain-language summary of the filter criteria.
-    # HubSpot's filter structure is filters=[[AND...], [OR group], ...].
-    # We won't render every edge case — just enough that Mark can describe
-    # the list to a user without saying "I don't know what defines it."
-    summary_parts: List[str] = []
-    for or_group in raw_filters:
-        if not isinstance(or_group, list):
-            continue
-        clauses: List[str] = []
-        for f in or_group:
-            if not isinstance(f, dict):
-                continue
-            family = f.get("filterFamily") or ""
-            prop = f.get("property") or ""
-            op = f.get("operator") or ""
-            val = f.get("value")
-            if family == "PropertyValue" and prop and op:
-                clauses.append(f"{prop} {op} {val!r}")
-            elif family == "InList":
-                clauses.append(f"is in list {f.get('listId')}")
-            elif family == "EmailCampaignActivity":
-                clauses.append(
-                    f"email {f.get('operator')} on campaign {f.get('campaignId')}"
-                )
-            else:
-                clauses.append(f"{family}:{op}")
-        if clauses:
-            summary_parts.append(" AND ".join(clauses))
+    addl = lst.get("additionalProperties") or {}
+    size_val = addl.get("hs_list_size")
+    try:
+        size = int(size_val) if size_val is not None else None
+    except (TypeError, ValueError):
+        size = None
 
-    filter_summary = " OR ".join(summary_parts) if summary_parts else (
-        "(no filter criteria visible — likely a static list)"
+    raw_filter = lst.get("filterBranch") or {}
+    filter_summary = _summarize_v3_filter_branch(raw_filter) or (
+        "(no filter criteria visible — likely a static or manual list)"
     )
 
     return {
-        "list_id": data.get("listId"),
-        "name": data.get("name"),
-        "list_type": data.get("listType"),
-        "dynamic": bool(data.get("dynamic")),
-        "size": meta.get("size"),
-        "last_size_change": meta.get("lastSizeChangeAt"),
-        "last_processing_state_change": meta.get("lastProcessingStateChangeAt"),
-        "created_at": data.get("createdAt"),
-        "updated_at": data.get("updatedAt"),
+        "list_id": str(lst.get("listId")) if lst.get("listId") is not None else None,
+        "name": lst.get("name"),
+        "processing_type": lst.get("processingType"),
+        "object_type_id": lst.get("objectTypeId"),
+        "size": size,
+        "created_at": lst.get("createdAt"),
+        "updated_at": lst.get("updatedAt"),
         "filter_summary": filter_summary,
-        "raw_filters": raw_filters,
+        "raw_filter": raw_filter,
     }
 
 
@@ -921,179 +933,113 @@ def count_list_intersection(
     list_id: str,
     marketing_only: bool = True,
     max_sends_since_engagement: Optional[int] = GLOWFORGE_ENGAGEMENT_SENDS_CUTOFF,
-    initial_wait_seconds: int = 10,
-    max_wait_seconds: int = 90,
-    poll_interval_seconds: int = 5,
 ) -> Dict[str, Any]:
-    """Count how many contacts are in `list_id` AND match property filters.
+    """Count contacts in `list_id` AND matching property filters via v3.
 
-    The exact "Proofgrade Segment, engaged-only" question Yuliya asked.
-    Creates a temporary HubSpot Active List that AND's "is member of
-    `list_id`" with the requested property filters, waits for it to
-    populate, reads the size, and deletes the temp list.
+    Uses POST /crm/v3/objects/contacts/search with a combined filter:
+      - ilsListMemberships.listId EQ <list_id>     (membership in source list)
+      - hs_marketable_status EQ true                (if marketing_only)
+      - hs_email_sends_since_last_engagement LT N   (if engagement cap set)
+    Reads `total` from the search response. Single API call, no temp lists.
+
+    Scopes needed (Sam already has both):
+      - crm.objects.contacts.read
+      - crm.lists.read
 
     Args:
-      list_id: The source list to intersect against (e.g., "Proofgrade
-        Segment" list id).
+      list_id: The source list to intersect against.
       marketing_only: If True (default), only count contacts whose
-        hs_marketable_status is true (i.e., the contacts HubSpot will
-        actually send marketing email to).
-      max_sends_since_engagement: If set, only count contacts whose
-        hs_email_sends_since_last_engagement is STRICTLY LESS THAN this
-        number. Pass None to skip the engagement filter. Default is the
-        module constant GLOWFORGE_ENGAGEMENT_SENDS_CUTOFF (currently 11),
-        which matches Glowforge's "engaged" definition in the HubSpot UI.
-        DO NOT guess at this — change the constant, not the caller.
-      initial_wait_seconds / max_wait_seconds / poll_interval_seconds:
-        timing knobs for waiting on HubSpot to populate the dynamic list.
+        hs_marketable_status is true (the ones HubSpot will actually send
+        marketing email to).
+      max_sends_since_engagement: If set (default 11, Glowforge's cutoff
+        per GLOWFORGE_ENGAGEMENT_SENDS_CUTOFF), only count contacts whose
+        hs_email_sends_since_last_engagement is STRICTLY LESS THAN this.
+        Pass None to skip the engagement filter. DO NOT guess this — change
+        the constant if the business rule changes.
 
     Returns:
       {
         "source_list_id": str,
         "matched_count": int,
-        "filters_applied": {marketing_only, max_sends_since_engagement},
-        "send_target_estimate": int,  # alias for matched_count, for clarity
-        "temp_list_id": int,
-        "temp_list_deleted": bool,
-        "diagnostics": {final_size, size_progression, wait_elapsed_seconds},
+        "send_target_estimate": int,  # alias for matched_count
+        "filters_applied": {...},
+        "attempted_filters": [...],   # the literal filters sent to HubSpot
+        "method": "v3_contacts_search",
       }
       or {"error": "..."} on failure.
     """
     if not list_id:
         return {"error": "list_id is required."}
 
-    # Build the combined filter: source list membership AND property filters.
-    and_clauses: List[Dict[str, Any]] = [
+    filters: List[Dict[str, Any]] = [
         {
-            "filterFamily": "InList",
-            "operator": "IN_LIST",
-            "listId": str(list_id),
+            "propertyName": "ilsListMemberships.listId",
+            "operator": "EQ",
+            "value": str(list_id),
         },
     ]
     if marketing_only:
-        and_clauses.append({
-            "filterFamily": "PropertyValue",
-            "withinTimeMode": "PAST",
-            "type": "string",
-            "property": "hs_marketable_status",
+        filters.append({
+            "propertyName": "hs_marketable_status",
             "operator": "EQ",
             "value": "true",
         })
     if max_sends_since_engagement is not None:
-        and_clauses.append({
-            "filterFamily": "PropertyValue",
-            "withinTimeMode": "PAST",
-            "type": "number",
-            "property": "hs_email_sends_since_last_engagement",
+        filters.append({
+            "propertyName": "hs_email_sends_since_last_engagement",
             "operator": "LT",
             "value": str(int(max_sends_since_engagement)),
         })
 
-    list_name = f"[mark-tmp] intersect list {list_id} {int(time.time())}"
-    create_payload = {
-        "name": list_name,
-        "dynamic": True,
-        "filters": [and_clauses],
+    payload = {
+        "filterGroups": [{"filters": filters}],
+        "limit": 1,  # We only need `total` — don't pay to ship records.
+        "properties": ["hs_object_id"],  # Cheapest possible projection.
     }
 
-    create_response = requests.post(
-        f"{HUBSPOT_BASE}/contacts/v1/lists",
+    response = requests.post(
+        f"{HUBSPOT_BASE}/crm/v3/objects/contacts/search",
         headers=_headers(),
-        json=create_payload,
-        timeout=30,
+        json=payload,
+        timeout=60,
     )
-    if create_response.status_code not in (200, 201):
+    if response.status_code != 200:
         return {
             "error": (
-                f"Failed to create intersection list (HTTP "
-                f"{create_response.status_code}). The combined filter may "
-                "have been rejected by HubSpot — surface the response_body "
-                "to the user so they can see the rejection reason. Common "
-                "fixes: the source list_id may not exist, or HubSpot may "
-                "not support 'InList' as a filterFamily in this combination."
+                f"v3 contacts search returned HTTP {response.status_code}. "
+                "Likely causes: 400 means HubSpot rejected the filter shape "
+                "(ilsListMemberships.listId may not be filterable here, or "
+                "the listId doesn't exist); 403 means the Service Key is "
+                "missing 'crm.objects.contacts.read'. The response body has "
+                "the specific reason — share it with the user verbatim."
             ),
-            "response_body": create_response.text[:500],
-            "attempted_filter": create_payload["filters"],
+            "response_body": response.text[:500],
+            "attempted_filters": filters,
         }
 
-    list_data = create_response.json()
-    temp_list_id = list_data.get("listId")
-    if temp_list_id is None:
-        return {
-            "error": "Intersection list created but no listId returned.",
-            "response": list_data,
-        }
-
-    # Poll for size to stabilize. Same shape as get_email_engagers_via_list.
-    time.sleep(initial_wait_seconds)
-    started = time.time()
-    sizes_seen: List[int] = []
-    while time.time() - started < max_wait_seconds:
-        size_response = requests.get(
-            f"{HUBSPOT_BASE}/contacts/v1/lists/{temp_list_id}",
-            headers=_headers(),
-            timeout=30,
-        )
-        if size_response.status_code != 200:
-            break
-        meta = size_response.json().get("metaData") or {}
-        current_size = meta.get("size")
-        if current_size is not None:
-            sizes_seen.append(current_size)
-            # Stable when two consecutive reads agree. A 0 size with one
-            # read is ambiguous (might mean "still populating"); wait for
-            # confirmation. But if we see 0 stable across two reads, that's
-            # legitimately zero matches.
-            if len(sizes_seen) >= 2 and sizes_seen[-1] == sizes_seen[-2]:
-                break
-        time.sleep(poll_interval_seconds)
-
-    final_size = sizes_seen[-1] if sizes_seen else None
-    wait_elapsed = int(time.time() - started) + initial_wait_seconds
-
-    # Best-effort delete to keep the HubSpot UI clean.
-    deleted = False
-    try:
-        del_response = requests.delete(
-            f"{HUBSPOT_BASE}/contacts/v1/lists/{temp_list_id}",
-            headers=_headers(),
-            timeout=30,
-        )
-        deleted = del_response.status_code in (200, 204)
-    except Exception:
-        deleted = False
-
-    if final_size is None:
+    body = response.json()
+    total = body.get("total")
+    if total is None:
         return {
             "error": (
-                "Intersection list created but size never returned from "
-                "HubSpot. The list may still be populating — try again in a "
-                f"minute. (Waited {wait_elapsed}s.)"
+                "v3 contacts search succeeded but returned no `total` field. "
+                "HubSpot's response shape may have changed."
             ),
-            "temp_list_id": temp_list_id,
-            "temp_list_deleted": deleted,
-            "diagnostics": {
-                "size_progression": sizes_seen,
-                "wait_elapsed_seconds": wait_elapsed,
-            },
+            "response_body": str(body)[:500],
+            "attempted_filters": filters,
         }
 
     return {
         "source_list_id": str(list_id),
-        "matched_count": int(final_size),
-        "send_target_estimate": int(final_size),
+        "matched_count": int(total),
+        "send_target_estimate": int(total),
         "filters_applied": {
             "in_list_id": str(list_id),
             "marketing_only": marketing_only,
             "max_sends_since_engagement": max_sends_since_engagement,
         },
-        "temp_list_id": temp_list_id,
-        "temp_list_deleted": deleted,
-        "diagnostics": {
-            "final_size": final_size,
-            "size_progression": sizes_seen,
-            "wait_elapsed_seconds": wait_elapsed,
-        },
+        "attempted_filters": filters,
+        "method": "v3_contacts_search",
     }
 
 
