@@ -1046,6 +1046,17 @@ segment, audience, or "the X list" by name:
    match, show the top 2-3 by size and ask the user to disambiguate
    — name overlap is real (e.g. two different "Proofgrade" lists).
 
+   CRITICAL CAVEAT about the id you get back: the list_id returned by
+   find_hubspot_lists is the ILS list id, which works for
+   get_list_details but does NOT reliably work for
+   count_list_intersection. HubSpot's ILS and contact-membership
+   systems use different ids for the same list. If you intend to
+   count members (step 3 below) and the user did NOT paste a URL,
+   ASK FOR THE URL before counting — you need the legacy id from
+   /objectLists/{id}/ in the URL, not the search-returned id.
+   Counting with the search-returned id will silently return 0 and
+   you won't notice the bug.
+
 2. If the user asks something about the list's composition ("how is
    it defined", "what's in it", "static or dynamic"), call
    get_list_details(list_id) and report the filter_summary plainly.
@@ -1812,17 +1823,22 @@ TOOLS: List[Dict[str, Any]] = [
         "name": "find_hubspot_lists",
         "description": (
             "Search HubSpot contact lists by name substring "
-            "(case-insensitive). Use this whenever a user mentions a "
-            "list, segment, or audience by name — e.g. 'the Proofgrade "
-            "Segment', 'our trial drip list', 'Aura buyers'. Returns "
-            "matching lists with list_id, name, list_type "
-            "(STATIC/DYNAMIC), and current size.\n\n"
+            "(case-insensitive). Uses the v3 lists search endpoint. "
+            "Use this whenever a user mentions a list, segment, or "
+            "audience by name — e.g. 'the Proofgrade Segment', 'our "
+            "trial drip list', 'Aura buyers'. Returns matching lists "
+            "with list_id, name, processing_type, and current size.\n\n"
             "Don't ask the user 'what is the Proofgrade Segment?' — "
             "call this tool with name_contains='Proofgrade' and find it. "
             "If multiple lists match, surface the top 2-3 by size and "
             "let the user disambiguate.\n\n"
-            "Pagination: scans up to ~5000 lists per call, plenty for a "
-            "normal HubSpot account."
+            "CRITICAL CAVEAT: the list_id returned by this tool is the "
+            "ILS id. It works for get_list_details but does NOT work for "
+            "count_list_intersection — HubSpot's contact-membership "
+            "system indexes the legacy id, which only appears in URLs "
+            "like /objectLists/{legacy_id}/. If the user wants a count "
+            "and didn't paste a URL, ASK for the URL before counting. "
+            "Counting with this id will silently return 0."
         ),
         "input_schema": {
             "type": "object",
