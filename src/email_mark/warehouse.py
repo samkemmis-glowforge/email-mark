@@ -234,6 +234,206 @@ def describe_table(fully_qualified_table_id: str) -> Dict[str, Any]:
     }
 
 
+def compute_email_revenue(
+    email_id: str,
+    window_days: int = 7,
+) -> Dict[str, Any]:
+    """Canonical revenue calculation for a HubSpot marketing email.
+
+    This is the ONE supported way to compute email revenue. Same inputs ->
+    identical output, every time. The whole point is to remove the
+    free-form-SQL variance that produced three contradictory answers for
+    the same email in Slack.
+
+    Methodology (fixed — do not pretend you have other options):
+      - Send time: pulled from HubSpot's `publishDate` on the email via
+        get_email_statistics. NEVER guessed from order data or "assumed
+        from mid-May". If publishDate is missing, returns an error.
+      - Attribution: clickers within the window. A customer counts only if
+        their email (a) clicked the marketing email per HubSpot, AND (b)
+        placed a Shopify order between send_time and send_time + window_days.
+      - Revenue: SUM(total_price_usd) on glowforge-dev.gf_shopify.orders,
+        excluding cancelled and test orders. Refunds are NOT subtracted —
+        we measure gross attributed revenue.
+      - Self-consistency: same query runs twice with the BQ cache disabled.
+        If the two runs disagree, we return an error rather than picking
+        one — that's an alarm worth raising, not a silent reconciliation.
+
+    PRIVACY: returns aggregate counts only. Does NOT return individual
+    customer emails, order ids, or per-customer totals.
+
+    Args:
+      email_id: HubSpot marketing email ID. Pass as string.
+      window_days: Attribution window in days from send time. Default 7.
+
+    Returns:
+      Dict including total_revenue_usd, order_count, customer_count,
+      clicker_count, the exact SQL run, and params_summary.
+      Or {"error": "..."} on any failure mode.
+    """
+    # Local imports keep warehouse.py importable without HubSpot setup,
+    # and avoid a circular import via hubspot_marketing -> agent helpers.
+    from email_mark.hubspot_marketing import (
+        get_email_engagers_via_list,
+        get_email_statistics,
+    )
+
+    if not email_id:
+        return {"error": "email_id is required."}
+    if window_days < 1 or window_days > 90:
+        return {
+            "error": (
+                f"window_days must be between 1 and 90 (got {window_days}). "
+                "Wider windows just measure background order rate."
+            )
+        }
+
+    # 1. Resolve send time from HubSpot. No guessing allowed.
+    try:
+        email_obj = get_email_statistics(str(email_id))
+    except Exception as exc:
+        return {"error": f"Failed to fetch email {email_id} from HubSpot: {exc}"}
+
+    send_raw = email_obj.get("publishDate")
+    if not send_raw:
+        return {
+            "error": (
+                f"Email {email_id} has no publishDate. Either it hasn't been "
+                "sent yet, or HubSpot didn't return the field. Refusing to "
+                "estimate a send time. Confirm the email is in PUBLISHED state."
+            )
+        }
+    send_iso = str(send_raw)
+
+    # 2. Get the clicker list from HubSpot's Lists API (the supported path).
+    try:
+        clickers_result = get_email_engagers_via_list(
+            email_id=str(email_id),
+            event_type="CLICKED",
+        )
+    except Exception as exc:
+        return {"error": f"Failed to fetch clickers for email {email_id}: {exc}"}
+
+    if isinstance(clickers_result, dict) and "error" in clickers_result:
+        return {"error": f"Clicker lookup failed: {clickers_result['error']}"}
+
+    recipient_emails = clickers_result.get("recipient_emails") or []
+    clicker_count = len(recipient_emails)
+
+    if not recipient_emails:
+        return {
+            "email_id": str(email_id),
+            "send_time_iso": send_iso,
+            "window_days": window_days,
+            "attribution": "clickers",
+            "clicker_count": 0,
+            "clickers_with_orders": 0,
+            "order_count": 0,
+            "customer_count": 0,
+            "total_revenue_usd": 0.0,
+            "sql": None,
+            "params_summary": None,
+            "note": (
+                "Zero clickers returned by HubSpot's Active List API. Either "
+                "no one clicked this email, or the temp list didn't populate "
+                "within the polling window. Revenue is reported as $0; "
+                "surface this caveat in the Slack reply."
+            ),
+        }
+
+    # 3. Build & run the canonical query, twice, cache disabled.
+    sql = (
+        "SELECT\n"
+        "  COUNT(DISTINCT o.id) AS order_count,\n"
+        "  COUNT(DISTINCT LOWER(TRIM(COALESCE(o.email, o.contact_email)))) AS customer_count,\n"
+        "  ROUND(COALESCE(SUM(o.total_price_usd), 0), 2) AS total_revenue_usd\n"
+        "FROM `glowforge-dev.gf_shopify.orders` o\n"
+        "WHERE LOWER(TRIM(COALESCE(o.email, o.contact_email))) IN UNNEST(@clicker_emails)\n"
+        "  AND o.created_at >= TIMESTAMP(@send_time)\n"
+        "  AND o.created_at < TIMESTAMP_ADD(TIMESTAMP(@send_time), INTERVAL @window_days DAY)\n"
+        "  AND o.cancelled_at IS NULL\n"
+        "  AND (o.test IS NULL OR o.test = FALSE)"
+    )
+
+    normalized_emails = sorted({
+        e.strip().lower() for e in recipient_emails if e and e.strip()
+    })
+
+    params = [
+        bigquery.ArrayQueryParameter("clicker_emails", "STRING", normalized_emails),
+        bigquery.ScalarQueryParameter("send_time", "TIMESTAMP", send_iso),
+        bigquery.ScalarQueryParameter("window_days", "INT64", window_days),
+    ]
+
+    client = _client("dev")  # orders live in glowforge-dev, not the data project
+
+    def _run_once() -> Dict[str, Any]:
+        cfg = bigquery.QueryJobConfig(
+            query_parameters=params,
+            use_query_cache=False,
+            maximum_bytes_billed=MAX_BYTES_BILLED,
+        )
+        rows = list(
+            client.query(sql, job_config=cfg).result(timeout=QUERY_TIMEOUT_SECONDS)
+        )
+        return dict(rows[0]) if rows else {
+            "order_count": 0,
+            "customer_count": 0,
+            "total_revenue_usd": 0,
+        }
+
+    try:
+        run_a = _run_once()
+        run_b = _run_once()
+    except Exception as exc:
+        return {"error": f"BigQuery query failed: {exc}"}
+
+    def _shape(r: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "order_count": int(r.get("order_count") or 0),
+            "customer_count": int(r.get("customer_count") or 0),
+            "total_revenue_usd": float(r.get("total_revenue_usd") or 0),
+        }
+
+    a, b = _shape(run_a), _shape(run_b)
+    if a != b:
+        return {
+            "error": (
+                "Self-consistency check failed: the canonical revenue query "
+                f"returned different results on two consecutive runs. "
+                f"run1={a} run2={b}. DO NOT report a revenue number — surface "
+                "this error to the user and stop."
+            ),
+            "first_run": a,
+            "second_run": b,
+        }
+
+    return {
+        "email_id": str(email_id),
+        "send_time_iso": send_iso,
+        "window_days": window_days,
+        "attribution": "clickers",
+        "clicker_count": clicker_count,
+        "clickers_with_orders": a["customer_count"],
+        "order_count": a["order_count"],
+        "customer_count": a["customer_count"],
+        "total_revenue_usd": a["total_revenue_usd"],
+        "sql": sql,
+        "params_summary": {
+            "table": "glowforge-dev.gf_shopify.orders",
+            "send_time_utc": send_iso,
+            "window_days": window_days,
+            "clicker_count_into_query": len(normalized_emails),
+            "filters": (
+                "o.email (or contact_email) matches a clicker email, "
+                "o.created_at in [send_time, send_time + window_days), "
+                "o.cancelled_at IS NULL, o.test != TRUE; "
+                "refunds NOT subtracted (gross attributed revenue)"
+            ),
+        },
+    }
+
+
 def get_print_recency_buckets() -> List[Dict[str, Any]]:
     """Distribution of users by how recently they last printed.
 

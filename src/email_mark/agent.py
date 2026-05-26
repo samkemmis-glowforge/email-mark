@@ -46,6 +46,7 @@ from email_mark.slack_helpers import (
     send_dm as slack_send_dm,
 )
 from email_mark.warehouse import (
+    compute_email_revenue,
     count_inactive_users,
     describe_table,
     get_print_recency_buckets,
@@ -921,11 +922,19 @@ ICYMI VOICE — apply on top of the general brand voice:
   exclamation point overload, describing photos the reader hasn't seen.
 
 DATA WAREHOUSE — what's wired up:
+- Canonical metric tools (USE THESE FIRST when the question fits — they
+  give deterministic answers across runs):
+    compute_email_revenue — revenue driven by a HubSpot marketing email.
+                            REQUIRED for any email-revenue question. See
+                            the REVENUE QUESTIONS section below.
 - Prebuilt aggregate tools: get_subscription_distribution, count_inactive_users,
-  get_print_recency_buckets. Use these first when the question fits.
+  get_print_recency_buckets.
 - Ad-hoc SQL: run_warehouse_query lets you write your own BigQuery SELECT for
   questions the prebuilt tools can't answer (joins, custom aggregations,
   funnel analysis). Use describe_table first if you're unsure about columns.
+  Do NOT use run_warehouse_query for any metric that has a canonical tool
+  above — free-form SQL for those questions is what produced "three
+  different answers in one morning" in the past.
 
 KEY TABLES (fully-qualified):
 - glowforge-data-production.reporting.active_users — daily user activity,
@@ -955,6 +964,64 @@ What you DO NOT have yet (be honest about gaps):
 - Access to forum/community data
 - Direct contact-list creation (CRM read access via the official HubSpot connector
   is available in Cowork, but not yet wired in here)
+
+REVENUE QUESTIONS — read every time before answering. This section
+exists because free-form revenue SQL produced THREE different answers
+for the same email in a single morning. Don't reintroduce that bug.
+
+When the user asks how much revenue an email drove — or any variant
+("what was revenue from email X", "did this campaign make money",
+"how did this send perform", "ROI on email Y") — you MUST:
+
+1. Call compute_email_revenue(email_id=..., window_days=...). DO NOT
+   write your own SQL. DO NOT call run_warehouse_query. DO NOT assume
+   the send date from order timestamps or "mid-May" — the tool pulls
+   the real publishDate from HubSpot. The tool is the single source
+   of truth on purpose; everything else is variance.
+
+2. If compute_email_revenue returns an error (no publishDate,
+   self-consistency mismatch, BQ failure), surface the error verbatim
+   to the user and STOP. Do not fall back to free-form SQL. Do not
+   estimate. Do not "try a different approach." The error IS the
+   answer — that's exactly when we want you to stop and ask.
+
+3. In your Slack reply you MUST surface ALL of the following — not
+   optional, not "if it seems useful":
+     - The dollar number (total_revenue_usd)
+     - The order count and customer count
+     - The send time (send_time_iso) and the window (window_days)
+     - The attribution model (always "clickers within window" for now —
+       say so explicitly so the user knows you're not counting
+       openers or recipients)
+     - The exact SQL the tool ran, in a Slack code block (use
+       triple backticks)
+   This violates the usual 4-sentence default. That's fine — revenue
+   answers are the one place where "show your work" beats brevity.
+   If the user can't see the SQL in your reply, they can't audit the
+   answer when it looks wrong, and we end up with three contradictory
+   numbers in Slack again.
+
+4. Default window is 7 days. Use it unless the user explicitly asks
+   for something else. If the user asks a revenue question without
+   specifying a window, default to 7 and call that out in your reply
+   ("default 7-day window — let me know if you want 14 or 30").
+
+5. NEVER name individual customers in revenue replies. The tool
+   returns aggregates only on purpose. If you find yourself writing
+   "<email>@<domain> spent $316," stop — that's a privacy violation
+   AND it's likely fabricated (the tool doesn't return per-customer
+   emails). Aggregates only.
+
+LESSONS vs. CODE — when to capture which:
+- Lessons (remember_lesson) are for FACTS that don't change often:
+  data source quirks, undocumented field meanings, business rules.
+  "publishDate on /v3/emails/{id} is ISO 8601 UTC" is a lesson.
+- Code (existing tools) is for RECIPES — how to compute a metric. If
+  you find yourself wanting to write "for X metric, use table Y with
+  join Z" as a lesson, that's a sign it should be a TOOL instead.
+  Flag the gap to Sam in your reply and keep the lesson short; don't
+  encode the recipe in prose that the next session might interpret
+  differently.
 
 PRIVACY AND SENSITIVE DATA — strict rules. READ CAREFULLY:
 You have tools that can return individual customer records (search_hubspot_contacts,
@@ -1170,6 +1237,13 @@ def _tool_get_print_recency_buckets(args: Dict[str, Any]) -> Dict[str, Any]:
 
 def _tool_run_warehouse_query(args: Dict[str, Any]) -> Dict[str, Any]:
     return run_warehouse_query(str(args["sql"]))
+
+
+def _tool_compute_email_revenue(args: Dict[str, Any]) -> Dict[str, Any]:
+    return compute_email_revenue(
+        email_id=str(args["email_id"]),
+        window_days=int(args.get("window_days", 7)),
+    )
 
 
 def _tool_describe_table(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -1945,6 +2019,50 @@ TOOLS: List[Dict[str, Any]] = [
         },
     },
     {
+        "name": "compute_email_revenue",
+        "description": (
+            "CANONICAL tool for computing the revenue driven by a HubSpot "
+            "marketing email. THIS IS THE ONLY SUPPORTED WAY — do NOT use "
+            "run_warehouse_query for revenue questions, do NOT free-form your "
+            "own SQL, do NOT guess the email's send date from order data. "
+            "Same inputs return the same answer, every time.\n\n"
+            "Methodology (fixed, encoded in the tool):\n"
+            "  - Send time pulled from HubSpot publishDate (no guessing)\n"
+            "  - Attribution: clickers within window (HubSpot CLICKED list joined "
+            "to Shopify orders by email)\n"
+            "  - Revenue: SUM(total_price_usd) on glowforge-dev.gf_shopify.orders, "
+            "excluding cancelled and test orders\n"
+            "  - Self-consistency: query runs twice; mismatched results are a "
+            "hard error\n\n"
+            "Returns: total_revenue_usd, order_count, customer_count, "
+            "clicker_count, plus the exact SQL and params used. You MUST "
+            "echo the send time, window, attribution method, AND the SQL into "
+            "your Slack reply — see the REVENUE QUESTIONS section of the system "
+            "prompt for the required reply shape."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "email_id": {
+                    "type": "string",
+                    "description": "HubSpot marketing email ID (numeric, as string).",
+                },
+                "window_days": {
+                    "type": "integer",
+                    "description": (
+                        "Attribution window in days from send time. Default 7. "
+                        "Only override if the user explicitly asks for a "
+                        "different window (and confirm that's what they meant). "
+                        "Must be 1-90."
+                    ),
+                    "minimum": 1,
+                    "maximum": 90,
+                },
+            },
+            "required": ["email_id"],
+        },
+    },
+    {
         "name": "list_contact_properties",
         "description": (
             "List the contact properties HubSpot knows about, optionally "
@@ -2300,6 +2418,7 @@ TOOL_HANDLERS: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     "count_inactive_users": _tool_count_inactive_users,
     "get_print_recency_buckets": _tool_get_print_recency_buckets,
     "run_warehouse_query": _tool_run_warehouse_query,
+    "compute_email_revenue": _tool_compute_email_revenue,
     "describe_table": _tool_describe_table,
     "search_hubspot_contacts": _tool_search_hubspot_contacts,
     "list_contact_properties": _tool_list_contact_properties,
