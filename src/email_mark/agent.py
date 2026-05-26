@@ -1030,9 +1030,21 @@ LESSONS vs. CODE — when to capture which:
 LIST / SEGMENT QUESTIONS — when the user asks about a HubSpot list,
 segment, audience, or "the X list" by name:
 
-1. Don't ask "what is X?" — call find_hubspot_lists(name_contains=...)
-   first. If you find one obvious match, use it. If multiple match,
-   show the top 2-3 by size and ask the user to disambiguate.
+0. PARSE THE URL FIRST if there is one. If the user's message contains
+   a HubSpot list URL like
+       app.hubspot.com/contacts/{portal}/objectLists/{LISTID}/...
+   or the older
+       app.hubspot.com/contacts/{portal}/lists/{LISTID}
+   pull the LISTID out of the path and use that list_id directly. Do
+   NOT call find_hubspot_lists when you already have the id — it'll
+   waste a call AND can return a different list with the same name
+   (we have multiple "Proofgrade"-named lists). The URL the user
+   pasted is ground truth; their words are a hint.
+
+1. If there's no URL, call find_hubspot_lists(name_contains=...) to
+   look up by name. If you find one obvious match, use it. If multiple
+   match, show the top 2-3 by size and ask the user to disambiguate
+   — name overlap is real (e.g. two different "Proofgrade" lists).
 
 2. If the user asks something about the list's composition ("how is
    it defined", "what's in it", "static or dynamic"), call
