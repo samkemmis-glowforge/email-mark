@@ -18,6 +18,13 @@ load_dotenv(find_dotenv())
 
 HUBSPOT_BASE = "https://api.hubapi.com"
 
+# Glowforge-specific business constant: HubSpot's "engaged" cutoff for
+# marketing email targeting. A contact is "engaged" if they have fewer
+# than this many marketing sends since their last open/click. This
+# matches the value configured in the HubSpot UI under marketing email
+# engagement settings. If you change this in HubSpot, change it here too.
+GLOWFORGE_ENGAGEMENT_SENDS_CUTOFF = 11
+
 
 def _headers() -> Dict[str, str]:
     token = os.environ.get("HUBSPOT_API_KEY")
@@ -730,6 +737,362 @@ def get_email_engagers_via_list(
             "size_progression": sizes_seen,
             "wait_elapsed_seconds": wait_elapsed,
             "pages_fetched": pages + 1,
+        },
+    }
+
+
+def find_hubspot_lists(
+    name_contains: str = "",
+    limit: int = 20,
+    max_pages: int = 20,
+) -> Dict[str, Any]:
+    """Search HubSpot contact lists by name substring (case-insensitive).
+
+    Uses /contacts/v1/lists, which doesn't support server-side name search,
+    so this paginates through lists (250 per page) and filters client-side.
+    Returns up to `limit` matches.
+
+    Args:
+      name_contains: Substring to look for in list names. Empty string
+        returns the most recent lists.
+      limit: Max number of matches to return. Default 20.
+      max_pages: Cap on pagination to avoid runaway scans on accounts
+        with thousands of lists. Default 20 -> up to 5000 lists scanned.
+
+    Returns:
+      {
+        "found": int,
+        "lists": [{
+          "list_id": int,
+          "name": str,
+          "list_type": "STATIC" | "DYNAMIC",
+          "dynamic": bool,
+          "size": int,  # total contact count
+          "created_at": str,  # ISO 8601 or epoch ms (HubSpot is inconsistent)
+          "updated_at": str,
+        }, ...],
+        "scanned_pages": int,
+        "scanned_lists": int,
+      }
+    """
+    needle = (name_contains or "").strip().lower()
+    matches: List[Dict[str, Any]] = []
+    scanned = 0
+    offset = 0
+    pages = 0
+    PAGE_SIZE = 250
+
+    while pages < max_pages and len(matches) < limit:
+        response = requests.get(
+            f"{HUBSPOT_BASE}/contacts/v1/lists",
+            headers=_headers(),
+            params={"count": PAGE_SIZE, "offset": offset},
+            timeout=30,
+        )
+        if response.status_code != 200:
+            return {
+                "error": (
+                    f"Lists API returned HTTP {response.status_code}. "
+                    "Service Key likely missing 'contacts' or 'lists' scope."
+                ),
+                "response_body": response.text[:500],
+            }
+
+        payload = response.json()
+        page_lists = payload.get("lists", []) or []
+        scanned += len(page_lists)
+        pages += 1
+
+        for lst in page_lists:
+            name = (lst.get("name") or "").strip()
+            if not needle or needle in name.lower():
+                meta = lst.get("metaData") or {}
+                matches.append({
+                    "list_id": lst.get("listId"),
+                    "name": name,
+                    "list_type": lst.get("listType"),
+                    "dynamic": bool(lst.get("dynamic")),
+                    "size": meta.get("size"),
+                    "created_at": lst.get("createdAt"),
+                    "updated_at": lst.get("updatedAt"),
+                })
+                if len(matches) >= limit:
+                    break
+
+        if not payload.get("has-more"):
+            break
+        offset = payload.get("offset", offset + PAGE_SIZE)
+
+    return {
+        "found": len(matches),
+        "lists": matches,
+        "scanned_pages": pages,
+        "scanned_lists": scanned,
+        "search_term": needle,
+        "note": (
+            "Truncated at limit — increase limit or narrow name_contains."
+            if len(matches) >= limit else None
+        ),
+    }
+
+
+def get_list_details(list_id: str) -> Dict[str, Any]:
+    """Fetch a HubSpot contact list's metadata and filter criteria.
+
+    Use this to:
+      - Confirm a list_id exists and get its current size
+      - Describe what defines the list (the filter criteria) so you can
+        explain the list's audience without guessing
+      - Decide whether the list is static (manually curated) or dynamic
+        (rule-based, auto-updating)
+
+    Returns:
+      list_id, name, list_type, dynamic, size, created_at, updated_at,
+      filter_summary (a human-readable description of the criteria, when
+      the list is dynamic), and raw_filters (the original filter object
+      for debugging).
+    """
+    response = requests.get(
+        f"{HUBSPOT_BASE}/contacts/v1/lists/{list_id}",
+        headers=_headers(),
+        timeout=30,
+    )
+    if response.status_code == 404:
+        return {"error": f"List {list_id} not found."}
+    if response.status_code != 200:
+        return {
+            "error": f"Lists API returned HTTP {response.status_code}.",
+            "response_body": response.text[:500],
+        }
+
+    data = response.json()
+    meta = data.get("metaData") or {}
+    raw_filters = data.get("filters") or []
+
+    # Build a best-effort plain-language summary of the filter criteria.
+    # HubSpot's filter structure is filters=[[AND...], [OR group], ...].
+    # We won't render every edge case — just enough that Mark can describe
+    # the list to a user without saying "I don't know what defines it."
+    summary_parts: List[str] = []
+    for or_group in raw_filters:
+        if not isinstance(or_group, list):
+            continue
+        clauses: List[str] = []
+        for f in or_group:
+            if not isinstance(f, dict):
+                continue
+            family = f.get("filterFamily") or ""
+            prop = f.get("property") or ""
+            op = f.get("operator") or ""
+            val = f.get("value")
+            if family == "PropertyValue" and prop and op:
+                clauses.append(f"{prop} {op} {val!r}")
+            elif family == "InList":
+                clauses.append(f"is in list {f.get('listId')}")
+            elif family == "EmailCampaignActivity":
+                clauses.append(
+                    f"email {f.get('operator')} on campaign {f.get('campaignId')}"
+                )
+            else:
+                clauses.append(f"{family}:{op}")
+        if clauses:
+            summary_parts.append(" AND ".join(clauses))
+
+    filter_summary = " OR ".join(summary_parts) if summary_parts else (
+        "(no filter criteria visible — likely a static list)"
+    )
+
+    return {
+        "list_id": data.get("listId"),
+        "name": data.get("name"),
+        "list_type": data.get("listType"),
+        "dynamic": bool(data.get("dynamic")),
+        "size": meta.get("size"),
+        "last_size_change": meta.get("lastSizeChangeAt"),
+        "last_processing_state_change": meta.get("lastProcessingStateChangeAt"),
+        "created_at": data.get("createdAt"),
+        "updated_at": data.get("updatedAt"),
+        "filter_summary": filter_summary,
+        "raw_filters": raw_filters,
+    }
+
+
+def count_list_intersection(
+    list_id: str,
+    marketing_only: bool = True,
+    max_sends_since_engagement: Optional[int] = GLOWFORGE_ENGAGEMENT_SENDS_CUTOFF,
+    initial_wait_seconds: int = 10,
+    max_wait_seconds: int = 90,
+    poll_interval_seconds: int = 5,
+) -> Dict[str, Any]:
+    """Count how many contacts are in `list_id` AND match property filters.
+
+    The exact "Proofgrade Segment, engaged-only" question Yuliya asked.
+    Creates a temporary HubSpot Active List that AND's "is member of
+    `list_id`" with the requested property filters, waits for it to
+    populate, reads the size, and deletes the temp list.
+
+    Args:
+      list_id: The source list to intersect against (e.g., "Proofgrade
+        Segment" list id).
+      marketing_only: If True (default), only count contacts whose
+        hs_marketable_status is true (i.e., the contacts HubSpot will
+        actually send marketing email to).
+      max_sends_since_engagement: If set, only count contacts whose
+        hs_email_sends_since_last_engagement is STRICTLY LESS THAN this
+        number. Pass None to skip the engagement filter. Default is the
+        module constant GLOWFORGE_ENGAGEMENT_SENDS_CUTOFF (currently 11),
+        which matches Glowforge's "engaged" definition in the HubSpot UI.
+        DO NOT guess at this — change the constant, not the caller.
+      initial_wait_seconds / max_wait_seconds / poll_interval_seconds:
+        timing knobs for waiting on HubSpot to populate the dynamic list.
+
+    Returns:
+      {
+        "source_list_id": str,
+        "matched_count": int,
+        "filters_applied": {marketing_only, max_sends_since_engagement},
+        "send_target_estimate": int,  # alias for matched_count, for clarity
+        "temp_list_id": int,
+        "temp_list_deleted": bool,
+        "diagnostics": {final_size, size_progression, wait_elapsed_seconds},
+      }
+      or {"error": "..."} on failure.
+    """
+    if not list_id:
+        return {"error": "list_id is required."}
+
+    # Build the combined filter: source list membership AND property filters.
+    and_clauses: List[Dict[str, Any]] = [
+        {
+            "filterFamily": "InList",
+            "operator": "IN_LIST",
+            "listId": str(list_id),
+        },
+    ]
+    if marketing_only:
+        and_clauses.append({
+            "filterFamily": "PropertyValue",
+            "withinTimeMode": "PAST",
+            "type": "string",
+            "property": "hs_marketable_status",
+            "operator": "EQ",
+            "value": "true",
+        })
+    if max_sends_since_engagement is not None:
+        and_clauses.append({
+            "filterFamily": "PropertyValue",
+            "withinTimeMode": "PAST",
+            "type": "number",
+            "property": "hs_email_sends_since_last_engagement",
+            "operator": "LT",
+            "value": str(int(max_sends_since_engagement)),
+        })
+
+    list_name = f"[mark-tmp] intersect list {list_id} {int(time.time())}"
+    create_payload = {
+        "name": list_name,
+        "dynamic": True,
+        "filters": [and_clauses],
+    }
+
+    create_response = requests.post(
+        f"{HUBSPOT_BASE}/contacts/v1/lists",
+        headers=_headers(),
+        json=create_payload,
+        timeout=30,
+    )
+    if create_response.status_code not in (200, 201):
+        return {
+            "error": (
+                f"Failed to create intersection list (HTTP "
+                f"{create_response.status_code}). The combined filter may "
+                "have been rejected by HubSpot — surface the response_body "
+                "to the user so they can see the rejection reason. Common "
+                "fixes: the source list_id may not exist, or HubSpot may "
+                "not support 'InList' as a filterFamily in this combination."
+            ),
+            "response_body": create_response.text[:500],
+            "attempted_filter": create_payload["filters"],
+        }
+
+    list_data = create_response.json()
+    temp_list_id = list_data.get("listId")
+    if temp_list_id is None:
+        return {
+            "error": "Intersection list created but no listId returned.",
+            "response": list_data,
+        }
+
+    # Poll for size to stabilize. Same shape as get_email_engagers_via_list.
+    time.sleep(initial_wait_seconds)
+    started = time.time()
+    sizes_seen: List[int] = []
+    while time.time() - started < max_wait_seconds:
+        size_response = requests.get(
+            f"{HUBSPOT_BASE}/contacts/v1/lists/{temp_list_id}",
+            headers=_headers(),
+            timeout=30,
+        )
+        if size_response.status_code != 200:
+            break
+        meta = size_response.json().get("metaData") or {}
+        current_size = meta.get("size")
+        if current_size is not None:
+            sizes_seen.append(current_size)
+            # Stable when two consecutive reads agree. A 0 size with one
+            # read is ambiguous (might mean "still populating"); wait for
+            # confirmation. But if we see 0 stable across two reads, that's
+            # legitimately zero matches.
+            if len(sizes_seen) >= 2 and sizes_seen[-1] == sizes_seen[-2]:
+                break
+        time.sleep(poll_interval_seconds)
+
+    final_size = sizes_seen[-1] if sizes_seen else None
+    wait_elapsed = int(time.time() - started) + initial_wait_seconds
+
+    # Best-effort delete to keep the HubSpot UI clean.
+    deleted = False
+    try:
+        del_response = requests.delete(
+            f"{HUBSPOT_BASE}/contacts/v1/lists/{temp_list_id}",
+            headers=_headers(),
+            timeout=30,
+        )
+        deleted = del_response.status_code in (200, 204)
+    except Exception:
+        deleted = False
+
+    if final_size is None:
+        return {
+            "error": (
+                "Intersection list created but size never returned from "
+                "HubSpot. The list may still be populating — try again in a "
+                f"minute. (Waited {wait_elapsed}s.)"
+            ),
+            "temp_list_id": temp_list_id,
+            "temp_list_deleted": deleted,
+            "diagnostics": {
+                "size_progression": sizes_seen,
+                "wait_elapsed_seconds": wait_elapsed,
+            },
+        }
+
+    return {
+        "source_list_id": str(list_id),
+        "matched_count": int(final_size),
+        "send_target_estimate": int(final_size),
+        "filters_applied": {
+            "in_list_id": str(list_id),
+            "marketing_only": marketing_only,
+            "max_sends_since_engagement": max_sends_since_engagement,
+        },
+        "temp_list_id": temp_list_id,
+        "temp_list_deleted": deleted,
+        "diagnostics": {
+            "final_size": final_size,
+            "size_progression": sizes_seen,
+            "wait_elapsed_seconds": wait_elapsed,
         },
     }
 

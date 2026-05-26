@@ -25,7 +25,10 @@ from email_mark.hubspot_crm import (
     search_contacts,
 )
 from email_mark.hubspot_marketing import (
+    GLOWFORGE_ENGAGEMENT_SENDS_CUTOFF,
     clone_marketing_email,
+    count_list_intersection,
+    find_hubspot_lists,
     get_contact_email_events,
     get_email_body_text,
     get_email_engagement_contacts,
@@ -33,6 +36,7 @@ from email_mark.hubspot_marketing import (
     get_email_statistics,
     get_email_widget_html,
     get_email_widget_structure,
+    get_list_details,
     get_workflow_details,
     get_workflow_enrollments,
     list_marketing_emails,
@@ -1023,6 +1027,34 @@ LESSONS vs. CODE — when to capture which:
   encode the recipe in prose that the next session might interpret
   differently.
 
+LIST / SEGMENT QUESTIONS — when the user asks about a HubSpot list,
+segment, audience, or "the X list" by name:
+
+1. Don't ask "what is X?" — call find_hubspot_lists(name_contains=...)
+   first. If you find one obvious match, use it. If multiple match,
+   show the top 2-3 by size and ask the user to disambiguate.
+
+2. If the user asks something about the list's composition ("how is
+   it defined", "what's in it", "static or dynamic"), call
+   get_list_details(list_id) and report the filter_summary plainly.
+
+3. If the user asks "how many will my email go to", "how many engaged
+   contacts in list X", "how many marketing-eligible in list Y", call
+   count_list_intersection(list_id, marketing_only=True,
+   max_sends_since_engagement=11). The 11 is Glowforge's configured
+   engagement threshold; it's hard-coded as the default — DO NOT guess
+   ranges like "10-16 sends, varies by account" the way you used to.
+   If the user has a specific override, take it; otherwise the default
+   is correct.
+
+4. count_list_intersection takes 10-30 seconds. Say "one sec, asking
+   HubSpot" before the call so the user knows you didn't hang.
+
+5. If the user gives you a NUMBER mid-conversation and the referent
+   isn't obvious, ask before assuming it's an ID — numbers are
+   usually counts or thresholds, not email IDs. Don't blindly run
+   search_marketing_emails on every number you see.
+
 PRIVACY AND SENSITIVE DATA — strict rules. READ CAREFULLY:
 You have tools that can return individual customer records (search_hubspot_contacts,
 run_warehouse_query). It is your responsibility to ensure that PII never reaches
@@ -1146,6 +1178,33 @@ def _tool_get_email_engagement_contacts(args: Dict[str, Any]) -> Dict[str, Any]:
         email_id=str(args["email_id"]),
         event_type=str(args.get("event_type", "DELIVERED")),
         max_unique=int(args.get("max_unique", 5000)),
+    )
+
+
+def _tool_find_hubspot_lists(args: Dict[str, Any]) -> Dict[str, Any]:
+    return find_hubspot_lists(
+        name_contains=str(args.get("name_contains") or ""),
+        limit=int(args.get("limit", 20)),
+    )
+
+
+def _tool_get_list_details(args: Dict[str, Any]) -> Dict[str, Any]:
+    return get_list_details(str(args["list_id"]))
+
+
+def _tool_count_list_intersection(args: Dict[str, Any]) -> Dict[str, Any]:
+    # max_sends_since_engagement defaults to GLOWFORGE_ENGAGEMENT_SENDS_CUTOFF
+    # at the function-definition level; callers can pass None to skip the
+    # engagement filter entirely, or an explicit override.
+    if "max_sends_since_engagement" in args:
+        max_sends = args["max_sends_since_engagement"]
+        max_sends = None if max_sends is None else int(max_sends)
+    else:
+        max_sends = GLOWFORGE_ENGAGEMENT_SENDS_CUTOFF
+    return count_list_intersection(
+        list_id=str(args["list_id"]),
+        marketing_only=bool(args.get("marketing_only", True)),
+        max_sends_since_engagement=max_sends,
     )
 
 
@@ -1735,6 +1794,112 @@ TOOLS: List[Dict[str, Any]] = [
                 },
             },
             "required": ["contact_email"],
+        },
+    },
+    {
+        "name": "find_hubspot_lists",
+        "description": (
+            "Search HubSpot contact lists by name substring "
+            "(case-insensitive). Use this whenever a user mentions a "
+            "list, segment, or audience by name — e.g. 'the Proofgrade "
+            "Segment', 'our trial drip list', 'Aura buyers'. Returns "
+            "matching lists with list_id, name, list_type "
+            "(STATIC/DYNAMIC), and current size.\n\n"
+            "Don't ask the user 'what is the Proofgrade Segment?' — "
+            "call this tool with name_contains='Proofgrade' and find it. "
+            "If multiple lists match, surface the top 2-3 by size and "
+            "let the user disambiguate.\n\n"
+            "Pagination: scans up to ~5000 lists per call, plenty for a "
+            "normal HubSpot account."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name_contains": {
+                    "type": "string",
+                    "description": (
+                        "Substring to match in list names. Case-insensitive."
+                    ),
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max matches to return (default 20).",
+                },
+            },
+            "required": ["name_contains"],
+        },
+    },
+    {
+        "name": "get_list_details",
+        "description": (
+            "Fetch a HubSpot list's metadata and filter criteria by "
+            "list_id (get the id from find_hubspot_lists first). Returns "
+            "name, size, list_type, dynamic vs static, and a "
+            "human-readable filter_summary describing what defines the "
+            "list. Use this when the user asks 'what's in list X', "
+            "'how is segment Y defined', or before doing intersection "
+            "counts so you can confirm the list matches what the user "
+            "meant."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "list_id": {
+                    "type": "string",
+                    "description": "HubSpot list ID (numeric, as string).",
+                },
+            },
+            "required": ["list_id"],
+        },
+    },
+    {
+        "name": "count_list_intersection",
+        "description": (
+            "Count how many contacts are in a HubSpot list AND match "
+            "property filters. THE canonical tool for the question "
+            "'how many people in list X will actually receive my email "
+            "if I send to engaged contacts only'. Creates a temporary "
+            "intersection list on HubSpot, polls for its size, returns "
+            "the count, and cleans up the temp list.\n\n"
+            "Default behavior: marketing_only=True (filters to "
+            "hs_marketable_status=true) AND max_sends_since_engagement=11 "
+            "(Glowforge's configured engagement threshold — DO NOT guess "
+            "this number, the constant is hard-coded in code). "
+            "Pass max_sends_since_engagement=null to count marketing "
+            "contacts of any engagement level. Pass marketing_only=false "
+            "to count all contacts regardless of marketing status.\n\n"
+            "Takes 10-30 seconds because HubSpot needs time to populate "
+            "the dynamic list. Tell the user 'one sec, asking HubSpot' "
+            "before the call so they don't think you've hung."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "list_id": {
+                    "type": "string",
+                    "description": (
+                        "Source list ID (from find_hubspot_lists). "
+                        "Pass as string even though HubSpot ids are numeric."
+                    ),
+                },
+                "marketing_only": {
+                    "type": "boolean",
+                    "description": (
+                        "Filter to marketing contacts only. Default true. "
+                        "Set false to include non-marketing contacts."
+                    ),
+                },
+                "max_sends_since_engagement": {
+                    "type": ["integer", "null"],
+                    "description": (
+                        "Engagement filter: count only contacts with "
+                        "hs_email_sends_since_last_engagement STRICTLY "
+                        "LESS THAN this. Default 11 (Glowforge's cutoff). "
+                        "Pass null to skip the engagement filter entirely."
+                    ),
+                },
+            },
+            "required": ["list_id"],
         },
     },
     {
@@ -2419,6 +2584,9 @@ TOOL_HANDLERS: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     "get_print_recency_buckets": _tool_get_print_recency_buckets,
     "run_warehouse_query": _tool_run_warehouse_query,
     "compute_email_revenue": _tool_compute_email_revenue,
+    "find_hubspot_lists": _tool_find_hubspot_lists,
+    "get_list_details": _tool_get_list_details,
+    "count_list_intersection": _tool_count_list_intersection,
     "describe_table": _tool_describe_table,
     "search_hubspot_contacts": _tool_search_hubspot_contacts,
     "list_contact_properties": _tool_list_contact_properties,
