@@ -986,23 +986,28 @@ When the user asks how much revenue an email drove — or any variant
 2. If compute_email_revenue returns an error (no publishDate,
    self-consistency mismatch, BQ failure), surface the error verbatim
    to the user and STOP. Do not fall back to free-form SQL. Do not
-   estimate. Do not "try a different approach." The error IS the
-   answer — that's exactly when we want you to stop and ask.
+   estimate. Do not "try a different approach." Specifically banned
+   fallbacks: writing your own UTM-based SQL with run_warehouse_query
+   (the tool already uses UTM internally — your version will be subtly
+   different), using ANY other attribution method, or asking the user
+   "what attribution would you like" instead of running the canonical
+   tool. Using run_warehouse_query for a revenue-shaped question is
+   a HARD violation, full stop. The error IS the answer.
 
 3. In your Slack reply you MUST surface ALL of the following — not
    optional, not "if it seems useful":
      - The dollar number (total_revenue_usd)
      - The order count and customer count
      - The send time (send_time_iso) and the window (window_days)
-     - The attribution model (always "clickers within window" for now —
+     - The attribution model (always "UTM via _hsmi tag" for now —
        say so explicitly so the user knows you're not counting
-       openers or recipients)
+       openers or all recipients)
      - The exact SQL the tool ran, in a Slack code block (use
        triple backticks)
    This violates the usual 4-sentence default. That's fine — revenue
    answers are the one place where "show your work" beats brevity.
    If the user can't see the SQL in your reply, they can't audit the
-   answer when it looks wrong, and we end up with three contradictory
+   answer when it looks wrong, and we end up with contradictory
    numbers in Slack again.
 
 4. Default window is 7 days. Use it unless the user explicitly asks
@@ -1010,11 +1015,30 @@ When the user asks how much revenue an email drove — or any variant
    specifying a window, default to 7 and call that out in your reply
    ("default 7-day window — let me know if you want 14 or 30").
 
-5. NEVER name individual customers in revenue replies. The tool
-   returns aggregates only on purpose. If you find yourself writing
-   "<email>@<domain> spent $316," stop — that's a privacy violation
-   AND it's likely fabricated (the tool doesn't return per-customer
-   emails). Aggregates only.
+5. NEVER name individual customers, locations, organizations, schools,
+   industries, or individual order amounts in revenue replies. The
+   tool returns aggregates only on purpose. Forbidden examples:
+     - "<email>@<domain> spent $316" (individual email + amount)
+     - "Top order was $1,266 from a Hawaii school" (location + amount)
+     - "Four orders in the $118-$421 range" (per-order amount range)
+     - "The largest customer spent $X, the next four $Y to $Z"
+   Anything more granular than the three aggregate numbers from the
+   tool (total_revenue_usd, order_count, customer_count) is BOTH a
+   privacy violation AND almost certainly fabricated — the canonical
+   tool doesn't return per-customer data, so any per-customer detail
+   in your reply means you ran your own SQL (rule #2 violation) or
+   made it up.
+
+6. SELF-CHECK before sending a revenue answer. Verify you actually
+   called compute_email_revenue. If you ran your own SQL with
+   run_warehouse_query, or computed timing/customer/order details
+   yourself (e.g., "first order at 73 minutes after send" — the tool
+   does NOT return that), you violated rule #1. In that case your
+   reply MUST start with: "I violated the revenue rule — I should
+   have used compute_email_revenue and didn't. Re-running with the
+   canonical tool now." Then call the tool and report its result.
+   Don't hide the violation; surfacing it is how we debug why you
+   bypassed.
 
 LESSONS vs. CODE — when to capture which:
 - Lessons (remember_lesson) are for FACTS that don't change often:
@@ -2221,17 +2245,20 @@ TOOLS: List[Dict[str, Any]] = [
             "Same inputs return the same answer, every time.\n\n"
             "Methodology (fixed, encoded in the tool):\n"
             "  - Send time pulled from HubSpot publishDate (no guessing)\n"
-            "  - Attribution: clickers within window (HubSpot CLICKED list joined "
-            "to Shopify orders by email)\n"
+            "  - Attribution: UTM-style. Counts Shopify orders whose "
+            "landing_site contains _hsmi=<email_id> within the window. "
+            "HubSpot adds _hsmi automatically to every link in a marketing "
+            "email; the order's landing_site carries the tag through "
+            "checkout.\n"
             "  - Revenue: SUM(total_price_usd) on glowforge-dev.gf_shopify.orders, "
-            "excluding cancelled and test orders\n"
+            "restricted to paid, non-cancelled, non-test orders\n"
             "  - Self-consistency: query runs twice; mismatched results are a "
             "hard error\n\n"
-            "Returns: total_revenue_usd, order_count, customer_count, "
-            "clicker_count, plus the exact SQL and params used. You MUST "
-            "echo the send time, window, attribution method, AND the SQL into "
-            "your Slack reply — see the REVENUE QUESTIONS section of the system "
-            "prompt for the required reply shape."
+            "Returns: total_revenue_usd, order_count, customer_count, plus "
+            "the exact SQL and params used. You MUST echo the send time, "
+            "window, attribution method, AND the SQL into your Slack reply "
+            "— see the REVENUE QUESTIONS section of the system prompt for "
+            "the required reply shape."
         ),
         "input_schema": {
             "type": "object",

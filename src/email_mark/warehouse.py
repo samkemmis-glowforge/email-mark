@@ -242,25 +242,33 @@ def compute_email_revenue(
 
     This is the ONE supported way to compute email revenue. Same inputs ->
     identical output, every time. The whole point is to remove the
-    free-form-SQL variance that produced three contradictory answers for
-    the same email in Slack.
+    free-form-SQL variance that produced contradictory answers in Slack.
 
     Methodology (fixed — do not pretend you have other options):
       - Send time: pulled from HubSpot's `publishDate` on the email via
-        get_email_statistics. NEVER guessed from order data or "assumed
-        from mid-May". If publishDate is missing, returns an error.
-      - Attribution: clickers within the window. A customer counts only if
-        their email (a) clicked the marketing email per HubSpot, AND (b)
-        placed a Shopify order between send_time and send_time + window_days.
+        get_email_statistics. NEVER guessed from order data.
+      - Attribution: UTM-style. HubSpot adds `_hsmi=<email_id>` to every
+        link in a marketing email; the landing_site URL on the resulting
+        Shopify order carries that tag. We count orders whose
+        landing_site LIKE '%_hsmi=<email_id>%' AND created_at in
+        [send_time, send_time + window_days). Deterministic from order
+        data alone — no HubSpot list dependency.
       - Revenue: SUM(total_price_usd) on glowforge-dev.gf_shopify.orders,
-        excluding cancelled and test orders. Refunds are NOT subtracted —
-        we measure gross attributed revenue.
+        restricted to paid, non-cancelled, non-test orders. Refunds are
+        NOT subtracted — we measure gross attributed revenue.
       - Self-consistency: same query runs twice with the BQ cache disabled.
-        If the two runs disagree, we return an error rather than picking
-        one — that's an alarm worth raising, not a silent reconciliation.
+        Mismatched results are a hard error rather than silent reconcile.
 
-    PRIVACY: returns aggregate counts only. Does NOT return individual
-    customer emails, order ids, or per-customer totals.
+    PRIVACY: returns aggregate counts only. NEVER returns individual
+    customer emails, locations, organizations, order ids, or per-order
+    amounts.
+
+    Migration note: previously used clicker-list attribution (joining
+    HubSpot's CLICKED engagers to Shopify orders by email). That path
+    depended on legacy HubSpot list scopes that aren't grantable on this
+    Service Key, which caused the tool to silently fail and Mark to fall
+    back to free-form SQL — producing variance. UTM attribution removes
+    that dependency entirely.
 
     Args:
       email_id: HubSpot marketing email ID. Pass as string.
@@ -268,15 +276,12 @@ def compute_email_revenue(
 
     Returns:
       Dict including total_revenue_usd, order_count, customer_count,
-      clicker_count, the exact SQL run, and params_summary.
-      Or {"error": "..."} on any failure mode.
+      the exact SQL run, and params_summary. Or {"error": "..."} on any
+      failure mode — DO NOT improvise around errors with free-form SQL.
     """
-    # Local imports keep warehouse.py importable without HubSpot setup,
-    # and avoid a circular import via hubspot_marketing -> agent helpers.
-    from email_mark.hubspot_marketing import (
-        get_email_engagers_via_list,
-        get_email_statistics,
-    )
+    # Local import keeps warehouse.py importable without HubSpot setup
+    # and avoids a circular import via hubspot_marketing -> agent helpers.
+    from email_mark.hubspot_marketing import get_email_statistics
 
     if not email_id:
         return {"error": "email_id is required."}
@@ -305,62 +310,25 @@ def compute_email_revenue(
         }
     send_iso = str(send_raw)
 
-    # 2. Get the clicker list from HubSpot's Lists API (the supported path).
-    try:
-        clickers_result = get_email_engagers_via_list(
-            email_id=str(email_id),
-            event_type="CLICKED",
-        )
-    except Exception as exc:
-        return {"error": f"Failed to fetch clickers for email {email_id}: {exc}"}
-
-    if isinstance(clickers_result, dict) and "error" in clickers_result:
-        return {"error": f"Clicker lookup failed: {clickers_result['error']}"}
-
-    recipient_emails = clickers_result.get("recipient_emails") or []
-    clicker_count = len(recipient_emails)
-
-    if not recipient_emails:
-        return {
-            "email_id": str(email_id),
-            "send_time_iso": send_iso,
-            "window_days": window_days,
-            "attribution": "clickers",
-            "clicker_count": 0,
-            "clickers_with_orders": 0,
-            "order_count": 0,
-            "customer_count": 0,
-            "total_revenue_usd": 0.0,
-            "sql": None,
-            "params_summary": None,
-            "note": (
-                "Zero clickers returned by HubSpot's Active List API. Either "
-                "no one clicked this email, or the temp list didn't populate "
-                "within the polling window. Revenue is reported as $0; "
-                "surface this caveat in the Slack reply."
-            ),
-        }
-
-    # 3. Build & run the canonical query, twice, cache disabled.
+    # 2. Build & run the canonical UTM-attribution query, twice, cache off.
     sql = (
         "SELECT\n"
         "  COUNT(DISTINCT o.id) AS order_count,\n"
         "  COUNT(DISTINCT LOWER(TRIM(COALESCE(o.email, o.contact_email)))) AS customer_count,\n"
         "  ROUND(COALESCE(SUM(o.total_price_usd), 0), 2) AS total_revenue_usd\n"
         "FROM `glowforge-dev.gf_shopify.orders` o\n"
-        "WHERE LOWER(TRIM(COALESCE(o.email, o.contact_email))) IN UNNEST(@clicker_emails)\n"
+        "WHERE o.landing_site LIKE @hsmi_pattern\n"
         "  AND o.created_at >= TIMESTAMP(@send_time)\n"
         "  AND o.created_at < TIMESTAMP_ADD(TIMESTAMP(@send_time), INTERVAL @window_days DAY)\n"
+        "  AND o.financial_status = 'paid'\n"
         "  AND o.cancelled_at IS NULL\n"
         "  AND (o.test IS NULL OR o.test = FALSE)"
     )
 
-    normalized_emails = sorted({
-        e.strip().lower() for e in recipient_emails if e and e.strip()
-    })
+    hsmi_pattern = f"%_hsmi={email_id}%"
 
     params = [
-        bigquery.ArrayQueryParameter("clicker_emails", "STRING", normalized_emails),
+        bigquery.ScalarQueryParameter("hsmi_pattern", "STRING", hsmi_pattern),
         bigquery.ScalarQueryParameter("send_time", "TIMESTAMP", send_iso),
         bigquery.ScalarQueryParameter("window_days", "INT64", window_days),
     ]
@@ -412,21 +380,20 @@ def compute_email_revenue(
         "email_id": str(email_id),
         "send_time_iso": send_iso,
         "window_days": window_days,
-        "attribution": "clickers",
-        "clicker_count": clicker_count,
-        "clickers_with_orders": a["customer_count"],
+        "attribution": "utm_hsmi",
         "order_count": a["order_count"],
         "customer_count": a["customer_count"],
         "total_revenue_usd": a["total_revenue_usd"],
         "sql": sql,
         "params_summary": {
             "table": "glowforge-dev.gf_shopify.orders",
+            "hsmi_pattern": hsmi_pattern,
             "send_time_utc": send_iso,
             "window_days": window_days,
-            "clicker_count_into_query": len(normalized_emails),
             "filters": (
-                "o.email (or contact_email) matches a clicker email, "
+                "o.landing_site LIKE '%_hsmi=<email_id>%', "
                 "o.created_at in [send_time, send_time + window_days), "
+                "o.financial_status = 'paid', "
                 "o.cancelled_at IS NULL, o.test != TRUE; "
                 "refunds NOT subtracted (gross attributed revenue)"
             ),
