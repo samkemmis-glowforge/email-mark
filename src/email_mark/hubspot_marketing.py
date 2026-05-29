@@ -562,6 +562,19 @@ def get_email_engagers_via_list(
     if not email_id:
         return {"error": "email_id is required."}
 
+    # HubSpot's EMAIL_EVENT filter wants emailId as a NUMBER (INVALID_NUMBER
+    # error if you send a string). Convert defensively — every real HubSpot
+    # marketing email id is numeric.
+    try:
+        email_id_int = int(str(email_id).strip())
+    except (TypeError, ValueError):
+        return {
+            "error": (
+                f"email_id must be numeric (got {email_id!r}); HubSpot's "
+                "EMAIL_EVENT filter rejects non-numeric ids."
+            )
+        }
+
     # v3 EMAIL_EVENT operator enum (per HubSpot's validation-error response):
     # [RECEIVED, LINK_CLICKED, OPENED, OPENED_BUT_LINK_NOT_CLICKED,
     #  RECEIVED_BUT_NOT_OPENED, SENT_BUT_NOT_RECEIVED, UNSUBSCRIBED, SENT,
@@ -604,7 +617,7 @@ def get_email_engagers_via_list(
                 {
                     "filterType": "EMAIL_EVENT",
                     "operator": v3_event,
-                    "emailId": str(email_id),
+                    "emailId": email_id_int,
                 }
             ],
             "filterBranches": [],
