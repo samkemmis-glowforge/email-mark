@@ -575,10 +575,21 @@ def get_email_engagers_via_list(
             "filterBranchType": "AND",
             "filterBranchOperator": "AND",
             "filters": [
+                # v3 list filter for email engagement. HubSpot's accepted
+                # filter types (per their error response on the wrong shape):
+                # [ADS_SEARCH, ADS_TIME, ASSOCIATION, COMMUNICATION_SUBSCRIPTION,
+                #  CONSTANT, CTA, EMAIL_EVENT, EMAIL_SUBSCRIPTION, EVENT,
+                #  FORM_SUBMISSION, FORM_SUBMISSION_ON_PAGE, INTEGRATION_EVENT,
+                #  IN_LIST, PAGE_VIEW, PRIVACY, PROPERTY, SURVEY_MONKEY,
+                #  SURVEY_MONKEY_VALUE, UNIFIED_EVENTS, WEBINAR].
+                # EMAIL_EVENT is the modern replacement for v1's
+                # EmailCampaignActivity. Field names below are a best guess
+                # based on v1 conventions — if HubSpot rejects, the error
+                # response_body will tell us which key needs renaming.
                 {
-                    "filterType": "EMAIL_CAMPAIGN_ACTIVITY",
+                    "filterType": "EMAIL_EVENT",
                     "operator": event_type.upper(),
-                    "campaignId": str(email_id),
+                    "emailId": str(email_id),
                 }
             ],
             "filterBranches": [],
@@ -597,10 +608,12 @@ def get_email_engagers_via_list(
             "error": (
                 f"Failed to create v3 dynamic list (HTTP "
                 f"{create_response.status_code}). Likely causes: 400 means "
-                "HubSpot rejected the EMAIL_CAMPAIGN_ACTIVITY filter shape "
-                "(may want different field names — emailId vs campaignId, "
-                "etc.); 403 means missing crm.lists.write scope. Surface "
-                "the response_body verbatim to the user."
+                "HubSpot rejected the EMAIL_EVENT filter shape (may want "
+                "different field names — eventType vs operator, emailIds "
+                "(plural array) vs emailId, etc.); 403 means missing "
+                "crm.lists.write scope. Surface the response_body verbatim "
+                "to the user — its message field tells you exactly what "
+                "HubSpot expected."
             ),
             "response_body": create_response.text[:500],
             "attempted_filter": create_payload["filterBranch"],
