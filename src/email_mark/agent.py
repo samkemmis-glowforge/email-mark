@@ -999,7 +999,7 @@ When the user asks how much revenue an email drove — or any variant
      - The dollar number (total_revenue_usd)
      - The order count and customer count
      - The send time (send_time_iso) and the window (window_days)
-     - The attribution model (always "UTM via _hsmi tag" for now —
+     - The attribution model (always "clickers within window" for now —
        say so explicitly so the user knows you're not counting
        openers or all recipients)
      - The exact SQL the tool ran, in a Slack code block (use
@@ -2245,21 +2245,18 @@ TOOLS: List[Dict[str, Any]] = [
             "Same inputs return the same answer, every time.\n\n"
             "Methodology (fixed, encoded in the tool):\n"
             "  - Send time pulled from HubSpot publishDate (no guessing)\n"
-            "  - Attribution: UTM-style. The tool first extracts the actual "
-            "_hsmi tracking id from a link in the email's rendered body "
-            "(HubSpot's _hsmi value is NOT the same number as the email's "
-            "API id — they're two different ids for the same email). Then "
-            "counts Shopify orders whose landing_site contains "
-            "_hsmi=<that_tracking_id> within the window.\n"
+            "  - Attribution: clicker-list. Resolves the contacts who "
+            "clicked the email via the v3 lists API, then joins their "
+            "emails to Shopify orders placed in the attribution window.\n"
             "  - Revenue: SUM(total_price_usd) on glowforge-dev.gf_shopify.orders, "
             "restricted to paid, non-cancelled, non-test orders\n"
             "  - Self-consistency: query runs twice; mismatched results are a "
             "hard error\n\n"
-            "Returns: total_revenue_usd, order_count, customer_count, plus "
-            "the exact SQL and params used. You MUST echo the send time, "
-            "window, attribution method, AND the SQL into your Slack reply "
-            "— see the REVENUE QUESTIONS section of the system prompt for "
-            "the required reply shape."
+            "Returns: total_revenue_usd, order_count, customer_count, "
+            "clicker_count, plus the exact SQL and params used. You MUST "
+            "echo the send time, window, attribution method, AND the SQL "
+            "into your Slack reply — see the REVENUE QUESTIONS section of "
+            "the system prompt for the required reply shape."
         ),
         "input_schema": {
             "type": "object",

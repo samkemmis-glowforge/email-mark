@@ -247,12 +247,10 @@ def compute_email_revenue(
     Methodology (fixed — do not pretend you have other options):
       - Send time: pulled from HubSpot's `publishDate` on the email via
         get_email_statistics. NEVER guessed from order data.
-      - Attribution: UTM-style. HubSpot adds `_hsmi=<email_id>` to every
-        link in a marketing email; the landing_site URL on the resulting
-        Shopify order carries that tag. We count orders whose
-        landing_site LIKE '%_hsmi=<email_id>%' AND created_at in
-        [send_time, send_time + window_days). Deterministic from order
-        data alone — no HubSpot list dependency.
+      - Attribution: clicker-list. A contact counts if their email both
+        (a) clicked the marketing email per HubSpot (resolved via the v3
+        lists API — see get_email_engagers_via_list), AND (b) placed a
+        Shopify order between send_time and send_time + window_days.
       - Revenue: SUM(total_price_usd) on glowforge-dev.gf_shopify.orders,
         restricted to paid, non-cancelled, non-test orders. Refunds are
         NOT subtracted — we measure gross attributed revenue.
@@ -263,12 +261,12 @@ def compute_email_revenue(
     customer emails, locations, organizations, order ids, or per-order
     amounts.
 
-    Migration note: previously used clicker-list attribution (joining
-    HubSpot's CLICKED engagers to Shopify orders by email). That path
-    depended on legacy HubSpot list scopes that aren't grantable on this
-    Service Key, which caused the tool to silently fail and Mark to fall
-    back to free-form SQL — producing variance. UTM attribution removes
-    that dependency entirely.
+    Implementation history (read before changing): briefly used UTM
+    attribution (`landing_site LIKE '%_hsmi=...%'`) to avoid HubSpot list
+    scope dependencies. That broke because HubSpot stamps `_hsmi` at
+    send-time, not at template-edit-time, so the value isn't fetchable
+    from the email API object. Migrated back to clicker-list attribution,
+    now on the v3 lists API (which uses scopes Sam's Service Key has).
 
     Args:
       email_id: HubSpot marketing email ID. Pass as string.
@@ -276,12 +274,16 @@ def compute_email_revenue(
 
     Returns:
       Dict including total_revenue_usd, order_count, customer_count,
-      the exact SQL run, and params_summary. Or {"error": "..."} on any
-      failure mode — DO NOT improvise around errors with free-form SQL.
+      clicker_count, the exact SQL run, and params_summary. Or
+      {"error": "..."} on any failure — DO NOT improvise around errors
+      with free-form SQL.
     """
-    # Local import keeps warehouse.py importable without HubSpot setup
-    # and avoids a circular import via hubspot_marketing -> agent helpers.
-    from email_mark.hubspot_marketing import get_email_statistics
+    # Local imports keep warehouse.py importable without HubSpot setup
+    # and avoid a circular import via hubspot_marketing -> agent helpers.
+    from email_mark.hubspot_marketing import (
+        get_email_engagers_via_list,
+        get_email_statistics,
+    )
 
     if not email_id:
         return {"error": "email_id is required."}
@@ -310,35 +312,56 @@ def compute_email_revenue(
         }
     send_iso = str(send_raw)
 
-    # 2. Extract the actual _hsmi tracking id from a link in the email.
-    # HubSpot stamps `_hsmi=<tracking_id>` into every link; that id is NOT
-    # the same as the email's API id (212960105020 vs 420880582 — totally
-    # different numbers for the same email). The tracking id lives in the
-    # rendered widget HTML, so we walk widgets looking for it.
-    hsmi_id = _extract_hsmi_from_email_object(email_obj)
-    if not hsmi_id:
+    # 2. Fetch the clicker email set via v3 lists API.
+    try:
+        clickers_result = get_email_engagers_via_list(
+            email_id=str(email_id),
+            event_type="CLICKED",
+        )
+    except Exception as exc:
+        return {"error": f"Failed to fetch clickers for email {email_id}: {exc}"}
+
+    if isinstance(clickers_result, dict) and "error" in clickers_result:
         return {
             "error": (
-                f"Could not find an _hsmi tracking id in email {email_id}'s "
-                "rendered widget HTML. Most likely HubSpot stamps the tracking "
-                "id at send-time rather than at template-edit-time, so the "
-                "saved widgets don't carry it. The fix is to use a different "
-                "attribution method — most likely migrating clicker-list "
-                "attribution to the v3 lists API. DO NOT estimate revenue "
-                "with free-form SQL; surface this error and stop."
+                f"Clicker lookup failed: {clickers_result['error']} "
+                "DO NOT estimate revenue with free-form SQL; surface this "
+                "error and stop."
             ),
-            "email_id": email_id,
-            "send_time_iso": send_iso,
+            "clicker_lookup_response": clickers_result,
         }
 
-    # 3. Build & run the canonical UTM-attribution query, twice, cache off.
+    recipient_emails = clickers_result.get("recipient_emails") or []
+    clicker_count = len(recipient_emails)
+
+    if not recipient_emails:
+        return {
+            "email_id": str(email_id),
+            "send_time_iso": send_iso,
+            "window_days": window_days,
+            "attribution": "clickers",
+            "clicker_count": 0,
+            "order_count": 0,
+            "customer_count": 0,
+            "total_revenue_usd": 0.0,
+            "sql": None,
+            "params_summary": None,
+            "note": (
+                "Zero clickers returned by the v3 lists API. Either no one "
+                "clicked this email, or the temp list didn't populate within "
+                "the polling window. Revenue is reported as $0; surface this "
+                "caveat in the Slack reply."
+            ),
+        }
+
+    # 3. Build & run the canonical query, twice, cache off.
     sql = (
         "SELECT\n"
         "  COUNT(DISTINCT o.id) AS order_count,\n"
         "  COUNT(DISTINCT LOWER(TRIM(COALESCE(o.email, o.contact_email)))) AS customer_count,\n"
         "  ROUND(COALESCE(SUM(o.total_price_usd), 0), 2) AS total_revenue_usd\n"
         "FROM `glowforge-dev.gf_shopify.orders` o\n"
-        "WHERE o.landing_site LIKE @hsmi_pattern\n"
+        "WHERE LOWER(TRIM(COALESCE(o.email, o.contact_email))) IN UNNEST(@clicker_emails)\n"
         "  AND o.created_at >= TIMESTAMP(@send_time)\n"
         "  AND o.created_at < TIMESTAMP_ADD(TIMESTAMP(@send_time), INTERVAL @window_days DAY)\n"
         "  AND o.financial_status = 'paid'\n"
@@ -346,10 +369,12 @@ def compute_email_revenue(
         "  AND (o.test IS NULL OR o.test = FALSE)"
     )
 
-    hsmi_pattern = f"%_hsmi={hsmi_id}%"
+    normalized_emails = sorted({
+        e.strip().lower() for e in recipient_emails if e and e.strip()
+    })
 
     params = [
-        bigquery.ScalarQueryParameter("hsmi_pattern", "STRING", hsmi_pattern),
+        bigquery.ArrayQueryParameter("clicker_emails", "STRING", normalized_emails),
         bigquery.ScalarQueryParameter("send_time", "TIMESTAMP", send_iso),
         bigquery.ScalarQueryParameter("window_days", "INT64", window_days),
     ]
@@ -399,22 +424,21 @@ def compute_email_revenue(
 
     return {
         "email_id": str(email_id),
-        "hsmi_tracking_id": hsmi_id,
         "send_time_iso": send_iso,
         "window_days": window_days,
-        "attribution": "utm_hsmi",
+        "attribution": "clickers",
+        "clicker_count": clicker_count,
         "order_count": a["order_count"],
         "customer_count": a["customer_count"],
         "total_revenue_usd": a["total_revenue_usd"],
         "sql": sql,
         "params_summary": {
             "table": "glowforge-dev.gf_shopify.orders",
-            "hsmi_pattern": hsmi_pattern,
-            "hsmi_tracking_id": hsmi_id,
             "send_time_utc": send_iso,
             "window_days": window_days,
+            "clicker_count_into_query": len(normalized_emails),
             "filters": (
-                "o.landing_site LIKE '%_hsmi=<hsmi_tracking_id>%', "
+                "o.email (or contact_email) matches a clicker email, "
                 "o.created_at in [send_time, send_time + window_days), "
                 "o.financial_status = 'paid', "
                 "o.cancelled_at IS NULL, o.test != TRUE; "
@@ -422,42 +446,6 @@ def compute_email_revenue(
             ),
         },
     }
-
-
-def _extract_hsmi_from_email_object(email_obj: Dict[str, Any]) -> Optional[str]:
-    """Find the first `_hsmi=<digits>` tracking id in an email's widget HTML.
-
-    HubSpot's marketing email object has a `content.widgets` map where each
-    widget can carry rendered HTML in body.html / body.value / body.rich_text
-    / body.text. Tracking-wrapped links in that HTML look like:
-        https://hs.example.com/...?_hsmi=420880582&_hsenc=...
-    We walk all widgets and return the first numeric `_hsmi` we find. If
-    none is present (e.g., HubSpot didn't stamp tracking ids at template
-    edit time), returns None.
-
-    Tolerates HTML-entity-encoded ampersands (`&amp;_hsmi=`) and both `?`
-    and `&` query-string introducers.
-    """
-    content = email_obj.get("content") if isinstance(email_obj.get("content"), dict) else {}
-    widgets = (content or {}).get("widgets") if isinstance(content, dict) else None
-    if not isinstance(widgets, dict):
-        return None
-
-    # `_hsmi=` may be preceded by `?`, `&`, or `&amp;` in HTML attributes.
-    # We don't strictly anchor on the introducer to be forgiving.
-    hsmi_re = re.compile(r"_hsmi=(\d+)")
-
-    for widget in widgets.values():
-        if not isinstance(widget, dict):
-            continue
-        body = widget.get("body") if isinstance(widget.get("body"), dict) else {}
-        for field in ("html", "value", "rich_text", "text"):
-            raw = body.get(field)
-            if isinstance(raw, str):
-                match = hsmi_re.search(raw)
-                if match:
-                    return match.group(1)
-    return None
 
 
 def get_print_recency_buckets() -> List[Dict[str, Any]]:

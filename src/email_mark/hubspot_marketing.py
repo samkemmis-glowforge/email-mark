@@ -532,48 +532,62 @@ def get_email_engagers_via_list(
     intersect_with: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Get contacts who engaged with a marketing email by creating a
-    temporary HubSpot Active List and reading its members.
+    temporary HubSpot dynamic list (v3) and reading its members.
 
-    Use this when get_email_engagement_contacts (v1 events API) returns
-    empty results — HubSpot has been deprecating that API and it's
-    unreliable for newer Service Keys, while the Lists API is what they're
-    actively investing in.
+    Uses the v3 lists API (which speaks the modern crm.lists.* scopes
+    Sam's Service Key has). The v1 version of this function failed with
+    403 because v1 endpoints check legacy `contacts-lists-*` scope names
+    that aren't grantable on the current Service Key.
 
     Flow:
-      1. Create a dynamic (active) list filtered by "EmailCampaignActivity"
-         + event_type (OPENED, CLICKED, SENT, etc.) + emailId.
+      1. Create a v3 dynamic list with a filterBranch matching
+         EMAIL_CAMPAIGN_ACTIVITY + operator (CLICKED, OPENED, etc.)
+         + emailCampaignId.
       2. Wait initial_wait_seconds, then poll size every poll_interval_seconds
-         until it stabilizes (two reads with same size) or max_wait_seconds.
-      3. Read members with the `email` property, paginating to completion.
-      4. Optionally delete the list to avoid clutter.
+         until it stabilizes (two consecutive identical reads).
+      3. Read members via /crm/v3/lists/{id}/memberships (returns contact
+         IDs), then batch-read their emails via
+         /crm/v3/objects/contacts/batch/read.
+      4. Optionally delete the list to keep HubSpot tidy.
 
-    event_type uses HubSpot's filter operators (different from the v1 events
-    API): OPENED, CLICKED, SENT, BOUNCED, OPTED_OUT, MARKED_AS_SPAM, etc.
+    event_type: CLICKED, OPENED, SENT, BOUNCED, OPTED_OUT, MARKED_AS_SPAM,
+    etc. — same vocabulary as v1.
 
-    Returns recipient_emails (lowercased, deduped), contact_ids, list_id,
-    plus a diagnostics block with timings and population progress.
+    Scopes needed: crm.lists.read, crm.lists.write, crm.objects.contacts.read.
+
+    Return shape preserved from the v1 implementation so existing callers
+    keep working: recipient_emails (lowercased, deduped), contact_ids,
+    list_id, plus a diagnostics block.
     """
     if not email_id:
         return {"error": "email_id is required."}
 
     list_name = f"[mark-tmp] engagers of email {email_id} {event_type.upper()} {int(time.time())}"
+
+    # v3 list create payload. The filterBranch tree expresses the same
+    # "clicked email X" predicate that v1's EmailCampaignActivity filter
+    # family did, but in the modern shape that the v3 lists API speaks.
     create_payload = {
         "name": list_name,
-        "dynamic": True,
-        "filters": [[
-            {
-                "filterFamily": "EmailCampaignActivity",
-                "withinTimeMode": "PAST",
-                "type": "EMAIL_CAMPAIGN_ACTIVITY",
-                "operator": event_type.upper(),
-                "campaignId": str(email_id),
-            }
-        ]],
+        "objectTypeId": "0-1",  # contacts
+        "processingType": "DYNAMIC",
+        "filterBranch": {
+            "filterBranchType": "AND",
+            "filterBranchOperator": "AND",
+            "filters": [
+                {
+                    "filterType": "EMAIL_CAMPAIGN_ACTIVITY",
+                    "operator": event_type.upper(),
+                    "campaignId": str(email_id),
+                }
+            ],
+            "filterBranches": [],
+        },
     }
 
     # 1. Create the list.
     create_response = requests.post(
-        f"{HUBSPOT_BASE}/contacts/v1/lists",
+        f"{HUBSPOT_BASE}/crm/v3/lists",
         headers=_headers(),
         json=create_payload,
         timeout=30,
@@ -581,19 +595,28 @@ def get_email_engagers_via_list(
     if create_response.status_code not in (200, 201):
         return {
             "error": (
-                f"Failed to create list (HTTP {create_response.status_code}). "
-                "Service Key likely needs the 'lists' or 'contacts' scope."
+                f"Failed to create v3 dynamic list (HTTP "
+                f"{create_response.status_code}). Likely causes: 400 means "
+                "HubSpot rejected the EMAIL_CAMPAIGN_ACTIVITY filter shape "
+                "(may want different field names — emailId vs campaignId, "
+                "etc.); 403 means missing crm.lists.write scope. Surface "
+                "the response_body verbatim to the user."
             ),
             "response_body": create_response.text[:500],
+            "attempted_filter": create_payload["filterBranch"],
         }
 
-    list_data = create_response.json()
-    list_id = list_data.get("listId")
+    create_body = create_response.json()
+    # v3 wraps the created object as {"list": {"listId": "..."}}; tolerate
+    # both wrapped and flat shapes.
+    created_list = create_body.get("list") if isinstance(create_body.get("list"), dict) else create_body
+    list_id = created_list.get("listId")
     if list_id is None:
         return {
-            "error": "List was created but no listId in response.",
-            "response": list_data,
+            "error": "v3 list was created but no listId in response.",
+            "response": create_body,
         }
+    list_id = str(list_id)
 
     # 2. Wait initial period, then poll until size stabilizes.
     time.sleep(initial_wait_seconds)
@@ -601,41 +624,42 @@ def get_email_engagers_via_list(
     sizes_seen: List[int] = []
     while time.time() - started < max_wait_seconds:
         size_response = requests.get(
-            f"{HUBSPOT_BASE}/contacts/v1/lists/{list_id}",
+            f"{HUBSPOT_BASE}/crm/v3/lists/{list_id}",
             headers=_headers(),
             timeout=30,
         )
         if size_response.status_code != 200:
             break
-        meta = size_response.json().get("metaData") or {}
-        current_size = meta.get("size")
+        size_body = size_response.json()
+        size_list = size_body.get("list") if isinstance(size_body.get("list"), dict) else size_body
+        addl = size_list.get("additionalProperties") or {}
+        size_raw = addl.get("hs_list_size")
+        try:
+            current_size = int(size_raw) if size_raw is not None else None
+        except (TypeError, ValueError):
+            current_size = None
         if current_size is not None:
             sizes_seen.append(current_size)
-            # Stop when size stops growing (two consecutive identical reads
-            # AND we have a non-zero number).
-            if (
-                len(sizes_seen) >= 2
-                and sizes_seen[-1] == sizes_seen[-2]
-                and sizes_seen[-1] > 0
-            ):
+            # Stable when two consecutive reads agree (even if 0 — that's
+            # legitimately "no one engaged" once confirmed).
+            if len(sizes_seen) >= 2 and sizes_seen[-1] == sizes_seen[-2]:
                 break
         time.sleep(poll_interval_seconds)
 
     final_size = sizes_seen[-1] if sizes_seen else None
     wait_elapsed = int(time.time() - started) + initial_wait_seconds
 
-    # 3. Read members.
-    emails: set = set()
-    contact_ids: set = set()
-    vid_offset: Optional[int] = None
+    # 3a. Read memberships (just contact IDs, paginated).
+    contact_id_set: set = set()
+    after: Optional[str] = None
     pages = 0
     MAX_PAGES = 100
     while pages < MAX_PAGES:
-        params: Dict[str, Any] = {"count": 100, "property": "email"}
-        if vid_offset is not None:
-            params["vidOffset"] = vid_offset
+        params: Dict[str, Any] = {"limit": 250}
+        if after is not None:
+            params["after"] = after
         members_response = requests.get(
-            f"{HUBSPOT_BASE}/contacts/v1/lists/{list_id}/contacts/all",
+            f"{HUBSPOT_BASE}/crm/v3/lists/{list_id}/memberships",
             headers=_headers(),
             params=params,
             timeout=30,
@@ -643,20 +667,38 @@ def get_email_engagers_via_list(
         if members_response.status_code != 200:
             break
         data = members_response.json()
-        for contact in data.get("contacts", []) or []:
-            vid = contact.get("vid")
-            if vid is not None:
-                contact_ids.add(vid)
-            email_prop = (contact.get("properties") or {}).get("email") or {}
-            email_value = email_prop.get("value") if isinstance(email_prop, dict) else None
-            if email_value:
-                emails.add(str(email_value).strip().lower())
-        if not data.get("has-more"):
-            break
-        vid_offset = data.get("vid-offset")
-        if vid_offset is None:
+        for member in data.get("results", []) or []:
+            record_id = member.get("recordId")
+            if record_id is not None:
+                contact_id_set.add(str(record_id))
+        paging = (data.get("paging") or {}).get("next") or {}
+        after = paging.get("after")
+        if not after:
             break
         pages += 1
+
+    # 3b. Batch-fetch emails for each contact ID. v3 batch/read takes
+    # up to 100 ids per call.
+    emails: set = set()
+    all_ids = list(contact_id_set)
+    BATCH = 100
+    batch_errors = 0
+    for start in range(0, len(all_ids), BATCH):
+        chunk = all_ids[start:start + BATCH]
+        batch_response = requests.post(
+            f"{HUBSPOT_BASE}/crm/v3/objects/contacts/batch/read",
+            headers=_headers(),
+            json={"inputs": [{"id": cid} for cid in chunk], "properties": ["email"]},
+            timeout=30,
+        )
+        if batch_response.status_code not in (200, 207):
+            batch_errors += 1
+            continue
+        body = batch_response.json()
+        for contact in body.get("results", []) or []:
+            email_val = (contact.get("properties") or {}).get("email")
+            if email_val:
+                emails.add(str(email_val).strip().lower())
 
     # 4. Best-effort delete to keep the HubSpot UI clean. Failures are
     #    non-fatal — we still return the data we already pulled.
@@ -664,7 +706,7 @@ def get_email_engagers_via_list(
     if delete_after_read:
         try:
             del_response = requests.delete(
-                f"{HUBSPOT_BASE}/contacts/v1/lists/{list_id}",
+                f"{HUBSPOT_BASE}/crm/v3/lists/{list_id}",
                 headers=_headers(),
                 timeout=30,
             )
@@ -673,7 +715,7 @@ def get_email_engagers_via_list(
             list_was_deleted = False
 
     all_emails = sorted(list(emails))
-    all_contact_ids = sorted(list(contact_ids))
+    all_contact_ids = sorted(list(contact_id_set))
 
     # If the caller wants to know which of THEIR emails are in the
     # engagement set, do the set intersection here — deterministically,
@@ -702,7 +744,8 @@ def get_email_engagers_via_list(
                 "final_list_size": final_size,
                 "size_progression": sizes_seen,
                 "wait_elapsed_seconds": wait_elapsed,
-                "pages_fetched": pages + 1,
+                "membership_pages_fetched": pages + 1,
+                "batch_read_errors": batch_errors,
             },
         }
 
@@ -736,7 +779,8 @@ def get_email_engagers_via_list(
             "final_list_size": final_size,
             "size_progression": sizes_seen,
             "wait_elapsed_seconds": wait_elapsed,
-            "pages_fetched": pages + 1,
+            "membership_pages_fetched": pages + 1,
+            "batch_read_errors": batch_errors,
         },
     }
 
