@@ -310,7 +310,28 @@ def compute_email_revenue(
         }
     send_iso = str(send_raw)
 
-    # 2. Build & run the canonical UTM-attribution query, twice, cache off.
+    # 2. Extract the actual _hsmi tracking id from a link in the email.
+    # HubSpot stamps `_hsmi=<tracking_id>` into every link; that id is NOT
+    # the same as the email's API id (212960105020 vs 420880582 — totally
+    # different numbers for the same email). The tracking id lives in the
+    # rendered widget HTML, so we walk widgets looking for it.
+    hsmi_id = _extract_hsmi_from_email_object(email_obj)
+    if not hsmi_id:
+        return {
+            "error": (
+                f"Could not find an _hsmi tracking id in email {email_id}'s "
+                "rendered widget HTML. Most likely HubSpot stamps the tracking "
+                "id at send-time rather than at template-edit-time, so the "
+                "saved widgets don't carry it. The fix is to use a different "
+                "attribution method — most likely migrating clicker-list "
+                "attribution to the v3 lists API. DO NOT estimate revenue "
+                "with free-form SQL; surface this error and stop."
+            ),
+            "email_id": email_id,
+            "send_time_iso": send_iso,
+        }
+
+    # 3. Build & run the canonical UTM-attribution query, twice, cache off.
     sql = (
         "SELECT\n"
         "  COUNT(DISTINCT o.id) AS order_count,\n"
@@ -325,7 +346,7 @@ def compute_email_revenue(
         "  AND (o.test IS NULL OR o.test = FALSE)"
     )
 
-    hsmi_pattern = f"%_hsmi={email_id}%"
+    hsmi_pattern = f"%_hsmi={hsmi_id}%"
 
     params = [
         bigquery.ScalarQueryParameter("hsmi_pattern", "STRING", hsmi_pattern),
@@ -378,6 +399,7 @@ def compute_email_revenue(
 
     return {
         "email_id": str(email_id),
+        "hsmi_tracking_id": hsmi_id,
         "send_time_iso": send_iso,
         "window_days": window_days,
         "attribution": "utm_hsmi",
@@ -388,10 +410,11 @@ def compute_email_revenue(
         "params_summary": {
             "table": "glowforge-dev.gf_shopify.orders",
             "hsmi_pattern": hsmi_pattern,
+            "hsmi_tracking_id": hsmi_id,
             "send_time_utc": send_iso,
             "window_days": window_days,
             "filters": (
-                "o.landing_site LIKE '%_hsmi=<email_id>%', "
+                "o.landing_site LIKE '%_hsmi=<hsmi_tracking_id>%', "
                 "o.created_at in [send_time, send_time + window_days), "
                 "o.financial_status = 'paid', "
                 "o.cancelled_at IS NULL, o.test != TRUE; "
@@ -399,6 +422,42 @@ def compute_email_revenue(
             ),
         },
     }
+
+
+def _extract_hsmi_from_email_object(email_obj: Dict[str, Any]) -> Optional[str]:
+    """Find the first `_hsmi=<digits>` tracking id in an email's widget HTML.
+
+    HubSpot's marketing email object has a `content.widgets` map where each
+    widget can carry rendered HTML in body.html / body.value / body.rich_text
+    / body.text. Tracking-wrapped links in that HTML look like:
+        https://hs.example.com/...?_hsmi=420880582&_hsenc=...
+    We walk all widgets and return the first numeric `_hsmi` we find. If
+    none is present (e.g., HubSpot didn't stamp tracking ids at template
+    edit time), returns None.
+
+    Tolerates HTML-entity-encoded ampersands (`&amp;_hsmi=`) and both `?`
+    and `&` query-string introducers.
+    """
+    content = email_obj.get("content") if isinstance(email_obj.get("content"), dict) else {}
+    widgets = (content or {}).get("widgets") if isinstance(content, dict) else None
+    if not isinstance(widgets, dict):
+        return None
+
+    # `_hsmi=` may be preceded by `?`, `&`, or `&amp;` in HTML attributes.
+    # We don't strictly anchor on the introducer to be forgiving.
+    hsmi_re = re.compile(r"_hsmi=(\d+)")
+
+    for widget in widgets.values():
+        if not isinstance(widget, dict):
+            continue
+        body = widget.get("body") if isinstance(widget.get("body"), dict) else {}
+        for field in ("html", "value", "rich_text", "text"):
+            raw = body.get(field)
+            if isinstance(raw, str):
+                match = hsmi_re.search(raw)
+                if match:
+                    return match.group(1)
+    return None
 
 
 def get_print_recency_buckets() -> List[Dict[str, Any]]:
