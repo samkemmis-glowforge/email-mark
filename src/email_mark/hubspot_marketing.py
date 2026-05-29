@@ -562,7 +562,24 @@ def get_email_engagers_via_list(
     if not email_id:
         return {"error": "email_id is required."}
 
-    list_name = f"[mark-tmp] engagers of email {email_id} {event_type.upper()} {int(time.time())}"
+    # v3 EMAIL_EVENT operator enum (per HubSpot's validation-error response):
+    # [RECEIVED, LINK_CLICKED, OPENED, OPENED_BUT_LINK_NOT_CLICKED,
+    #  RECEIVED_BUT_NOT_OPENED, SENT_BUT_NOT_RECEIVED, UNSUBSCRIBED, SENT,
+    #  OPENED_BUT_NOT_REPLIED, SENT_BUT_LINK_NOT_CLICKED, BOUNCED, REPLIED,
+    #  MARKED_SPAM]
+    # v1 used a different vocabulary (CLICKED, OPTED_OUT, etc.). We accept
+    # both shapes from callers and translate to v3 names internally so
+    # existing callers don't need to change.
+    _V1_TO_V3_EVENT = {
+        "CLICKED": "LINK_CLICKED",
+        "OPTED_OUT": "UNSUBSCRIBED",
+        "MARKED_AS_SPAM": "MARKED_SPAM",
+        # OPENED, SENT, BOUNCED, RECEIVED — names unchanged
+    }
+    raw_event = (event_type or "").upper().strip()
+    v3_event = _V1_TO_V3_EVENT.get(raw_event, raw_event)
+
+    list_name = f"[mark-tmp] engagers of email {email_id} {v3_event} {int(time.time())}"
 
     # v3 list create payload. The filterBranch tree expresses the same
     # "clicked email X" predicate that v1's EmailCampaignActivity filter
@@ -583,12 +600,10 @@ def get_email_engagers_via_list(
                 #  IN_LIST, PAGE_VIEW, PRIVACY, PROPERTY, SURVEY_MONKEY,
                 #  SURVEY_MONKEY_VALUE, UNIFIED_EVENTS, WEBINAR].
                 # EMAIL_EVENT is the modern replacement for v1's
-                # EmailCampaignActivity. Field names below are a best guess
-                # based on v1 conventions — if HubSpot rejects, the error
-                # response_body will tell us which key needs renaming.
+                # EmailCampaignActivity.
                 {
                     "filterType": "EMAIL_EVENT",
-                    "operator": event_type.upper(),
+                    "operator": v3_event,
                     "emailId": str(email_id),
                 }
             ],
