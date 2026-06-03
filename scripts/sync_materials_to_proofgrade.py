@@ -32,10 +32,11 @@ Run from the project root:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import requests
 from dotenv import find_dotenv, load_dotenv
@@ -104,100 +105,147 @@ def fetch_eligible_emails(lookback_days: int) -> List[str]:
     return [row["email"] for row in job.result() if row.get("email")]
 
 
+def _lookup_vids_by_email(
+    emails: List[str],
+) -> Tuple[Dict[str, str], List[str]]:
+    """Resolve HubSpot contact vids from email addresses via batch/read.
+
+    HubSpot's batch/update endpoint with `idProperty=email` doesn't reliably
+    find contacts (silently returns OBJECT_NOT_FOUND even when the contact
+    exists with that exact email). batch/read with `idProperty=email`
+    works, so we do a two-step pattern: read vids first, then update by
+    vid.
+
+    Returns (email -> vid map, list of emails not found).
+    """
+    email_to_vid: Dict[str, str] = {}
+    missing: List[str] = []
+
+    for start in range(0, len(emails), BATCH_SIZE):
+        chunk = emails[start:start + BATCH_SIZE]
+        response = requests.post(
+            f"{HUBSPOT_BASE}/crm/v3/objects/contacts/batch/read",
+            headers=_headers(),
+            params={"idProperty": "email"},
+            json={
+                "inputs": [{"id": e} for e in chunk],
+                "properties": ["email"],
+            },
+            timeout=60,
+        )
+        if response.status_code not in (200, 207):
+            LOG.error(
+                "batch/read HTTP %d: %s",
+                response.status_code,
+                response.text[:500],
+            )
+            missing.extend(chunk)
+            continue
+
+        body = response.json()
+        # HubSpot returns matched contacts in `results`, each with a vid
+        # in `id` and the resolved properties (including the canonical
+        # email) in `properties`.
+        for result in body.get("results", []) or []:
+            vid = result.get("id")
+            props = result.get("properties") or {}
+            canonical_email = (props.get("email") or "").strip().lower()
+            if vid and canonical_email:
+                email_to_vid[canonical_email] = str(vid)
+
+        # Anything in the errors block (typically a single OBJECT_NOT_FOUND
+        # bundling all missing ids in context.ids) goes to missing.
+        for err in body.get("errors", []) or []:
+            context_ids = (err.get("context") or {}).get("ids") or []
+            for missing_id in context_ids:
+                missing.append(missing_id)
+
+    # Catch any inputs that didn't appear in either results or errors.
+    chunk_email_set = {e.strip().lower() for e in emails}
+    found_set = set(email_to_vid.keys())
+    error_set = {m.strip().lower() for m in missing}
+    silently_missing = chunk_email_set - found_set - error_set
+    missing.extend(sorted(silently_missing))
+
+    return email_to_vid, missing
+
+
 def set_proofgrade_property(
     emails: List[str], dry_run: bool = False
 ) -> Dict[str, int]:
     """Set proofgrade_marketing_opt_in + hs_marketable_status on each contact.
 
-    Both properties go in one batch/update payload per HubSpot batch (up to
-    100 contacts per call). Uses idProperty=email so we don't have to look
-    up vids first. Contacts that don't exist come back as errors with
-    category='OBJECT_NOT_FOUND' — we count those separately rather than
-    failing the batch.
+    Two-step pattern:
+      1. batch/read with idProperty=email to resolve vids from emails.
+         (idProperty=email on batch/update doesn't work reliably — silently
+         returns NOT_FOUND for contacts that exist with that exact email.
+         batch/read works.)
+      2. batch/update by vid to set both properties in one call per batch.
+
+    Both properties go in one batch/update payload per HubSpot batch (up
+    to 100 contacts per call). Contacts that don't exist are reported via
+    the not_found counter and skipped, not errored.
 
     Returns counts: attempted, updated, not_found, errored.
     """
-    counts = {"attempted": 0, "updated": 0, "not_found": 0, "errored": 0}
+    counts = {"attempted": len(emails), "updated": 0, "not_found": 0, "errored": 0}
 
-    for start in range(0, len(emails), BATCH_SIZE):
-        batch = emails[start:start + BATCH_SIZE]
-        counts["attempted"] += len(batch)
+    if dry_run:
+        LOG.info(
+            "DRY RUN: would resolve %d emails -> vids, then batch/update both "
+            "properties on the matched contacts.",
+            len(emails),
+        )
+        return counts
 
+    # Step 1: resolve emails to vids.
+    LOG.info("Looking up HubSpot vids for %d emails via batch/read...", len(emails))
+    email_to_vid, missing = _lookup_vids_by_email(emails)
+    counts["not_found"] = len(missing)
+    LOG.info(
+        "vid lookup: %d found, %d not in HubSpot",
+        len(email_to_vid),
+        len(missing),
+    )
+
+    if not email_to_vid:
+        return counts
+
+    # Step 2: batch/update by vid.
+    vids = list(email_to_vid.values())
+    for start in range(0, len(vids), BATCH_SIZE):
+        chunk = vids[start:start + BATCH_SIZE]
         payload = {
             "inputs": [
-                {
-                    "id": email,
-                    "properties": dict(PROPERTIES_TO_SET),
-                }
-                for email in batch
+                {"id": vid, "properties": dict(PROPERTIES_TO_SET)}
+                for vid in chunk
             ],
         }
-
-        if dry_run:
-            LOG.info(
-                "DRY RUN: would update %d contacts (batch %d/%d)",
-                len(batch),
-                start // BATCH_SIZE + 1,
-                (len(emails) + BATCH_SIZE - 1) // BATCH_SIZE,
-            )
-            continue
-
         response = requests.post(
             f"{HUBSPOT_BASE}/crm/v3/objects/contacts/batch/update",
             headers=_headers(),
-            params={"idProperty": "email"},
             json=payload,
             timeout=60,
         )
-
-        # 200 = all updated. 207 = partial success (some updated, some errored).
-        # 4xx/5xx = full failure (e.g., missing scope, bad payload).
         if response.status_code in (200, 207):
             body = response.json()
-            batch_updated = len(body.get("results", []))
-            batch_not_found = 0
-            batch_errored = 0
-            counts["updated"] += batch_updated
+            counts["updated"] += len(body.get("results", []))
             for err in body.get("errors", []) or []:
-                category = (err.get("category") or "").upper()
-                message = err.get("message") or str(err)
-                # HubSpot uses categories like OBJECT_NOT_FOUND for
-                # "no contact with that email exists".
-                if (
-                    "OBJECT_NOT_FOUND" in category
-                    or "NOT_FOUND" in category
-                    or "not found" in message.lower()
-                    or "no contact" in message.lower()
-                ):
-                    batch_not_found += 1
-                    counts["not_found"] += 1
-                else:
-                    batch_errored += 1
-                    counts["errored"] += 1
-                    LOG.warning("Batch error: %s", err)
-
-            # Diagnostic: if HubSpot's response doesn't account for every
-            # input we sent, log the raw body so we can see what shape it
-            # actually used. (HubSpot batch endpoints sometimes return
-            # success counts in different fields than we expect.)
-            accounted_for = batch_updated + batch_not_found + batch_errored
-            if accounted_for < len(batch):
-                import json as _json
+                ids = (err.get("context") or {}).get("ids") or []
+                affected = max(1, len(ids))
+                counts["errored"] += affected
                 LOG.warning(
-                    "HubSpot response only accounted for %d of %d inputs. "
-                    "HTTP %d. Raw body: %s",
-                    accounted_for,
-                    len(batch),
-                    response.status_code,
-                    _json.dumps(body)[:2000],
+                    "batch/update error (%d affected): %s",
+                    affected,
+                    err,
                 )
         else:
             LOG.error(
-                "Batch update HTTP %d: %s",
+                "batch/update HTTP %d: %s",
                 response.status_code,
                 response.text[:500],
             )
-            counts["errored"] += len(batch)
+            counts["errored"] += len(chunk)
 
     return counts
 
