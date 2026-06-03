@@ -1,22 +1,29 @@
 """Sync Shopify materials buyers into the HubSpot Proofgrade dynamic list.
 
-Sets the contact property `proofgrade_marketing_opt_in = "true"` on HubSpot
-contacts who, in the last `--lookback-days` days (default 30):
+Sets TWO HubSpot contact properties in a single batch update:
+  - proofgrade_marketing_opt_in = "true"  (custom property)
+  - hs_marketable_status        = "true"  (billing-impacting standard property)
+
+...on HubSpot contacts who, in the last `--lookback-days` days (default 30):
   - Placed a paid Shopify order
   - Bought at least one product whose product_type='Material'
   - Have buyer_accepts_marketing = TRUE on that order
 
-The HubSpot Proofgrade dynamic list (id 10273) is expected to include
-`proofgrade_marketing_opt_in = true` in its filter criteria. Setting the
-property auto-enrolls matching contacts; this script never touches the
-list itself.
+The HubSpot Proofgrade dynamic list (id 10273) is expected to filter on
+`proofgrade_marketing_opt_in = true AND hs_marketable_status = true`,
+so setting both auto-enrolls matching contacts.
 
-Idempotent — running it daily is safe. Setting the property to "true"
-when it's already "true" is a no-op on HubSpot's side.
+NOTE: hs_marketable_status is a billing-impacting property — flipping a
+contact from non-marketing to marketing increments your HubSpot marketing
+contact count. The buyer_accepts_marketing filter on the BQ side is the
+guardrail: we only flip contacts who explicitly opted in at checkout.
 
-Required HUBSPOT_API_KEY scopes:
-  - crm.objects.contacts.read   (already granted for Mark)
-  - crm.objects.contacts.write  (NEEDS TO BE ADDED — same Service Key)
+Idempotent — running it daily is safe. Setting a property to "true" when
+it's already "true" is a no-op on HubSpot's side.
+
+Required HUBSPOT_API_KEY scopes (both must be on the Service Key):
+  - crm.objects.contacts.read
+  - crm.objects.contacts.write
 
 Run from the project root:
     .venv/bin/python scripts/sync_materials_to_proofgrade.py [--dry-run]
@@ -47,11 +54,23 @@ LOG = logging.getLogger("sync_materials_to_proofgrade")
 # HubSpot batch endpoints accept up to 100 inputs per call.
 BATCH_SIZE = 100
 
-# The contact property the script flips. The Proofgrade dynamic list's
-# filter criteria should include this property — confirm in HubSpot before
-# running.
+# The contact properties the script flips. The Proofgrade dynamic list's
+# filter criteria should include BOTH — confirm in HubSpot before running.
 PROOFGRADE_PROPERTY = "proofgrade_marketing_opt_in"
 PROOFGRADE_PROPERTY_VALUE = "true"
+# hs_marketable_status is a HubSpot standard property; setting it to "true"
+# flips the contact from non-marketing to marketing (counts toward your
+# HubSpot marketing-contacts billing tier). Only safe because the BQ query
+# restricts to contacts who opted in at Shopify checkout.
+MARKETABLE_STATUS_PROPERTY = "hs_marketable_status"
+MARKETABLE_STATUS_VALUE = "true"
+
+# Properties we set on every matched contact, packaged as the body
+# fragment HubSpot's batch/update endpoint expects.
+PROPERTIES_TO_SET = {
+    PROOFGRADE_PROPERTY: PROOFGRADE_PROPERTY_VALUE,
+    MARKETABLE_STATUS_PROPERTY: MARKETABLE_STATUS_VALUE,
+}
 
 
 # Canonical SQL. Parameterized on lookback_days. DISTINCT + lowercase + trim
@@ -88,12 +107,13 @@ def fetch_eligible_emails(lookback_days: int) -> List[str]:
 def set_proofgrade_property(
     emails: List[str], dry_run: bool = False
 ) -> Dict[str, int]:
-    """Set proofgrade_marketing_opt_in=true on each contact, batched.
+    """Set proofgrade_marketing_opt_in + hs_marketable_status on each contact.
 
-    Uses HubSpot's batch update endpoint with idProperty=email so we don't
-    have to look up vids first. Contacts that don't exist come back as
-    errors with category='OBJECT_NOT_FOUND' (or similar) — we count those
-    separately rather than failing the batch.
+    Both properties go in one batch/update payload per HubSpot batch (up to
+    100 contacts per call). Uses idProperty=email so we don't have to look
+    up vids first. Contacts that don't exist come back as errors with
+    category='OBJECT_NOT_FOUND' — we count those separately rather than
+    failing the batch.
 
     Returns counts: attempted, updated, not_found, errored.
     """
@@ -107,7 +127,7 @@ def set_proofgrade_property(
             "inputs": [
                 {
                     "id": email,
-                    "properties": {PROOFGRADE_PROPERTY: PROOFGRADE_PROPERTY_VALUE},
+                    "properties": dict(PROPERTIES_TO_SET),
                 }
                 for email in batch
             ],
@@ -203,18 +223,17 @@ def main() -> int:
         LOG.info("Nothing to do. Exiting.")
         return 0
 
+    props_summary = ", ".join(f"{k}={v!r}" for k, v in PROPERTIES_TO_SET.items())
     if args.dry_run:
         LOG.info(
-            "DRY RUN: would set %s=%r on up to %d contacts.",
-            PROOFGRADE_PROPERTY,
-            PROOFGRADE_PROPERTY_VALUE,
+            "DRY RUN: would set %s on up to %d contacts.",
+            props_summary,
             len(emails),
         )
     else:
         LOG.info(
-            "Setting %s=%r on matching HubSpot contacts...",
-            PROOFGRADE_PROPERTY,
-            PROOFGRADE_PROPERTY_VALUE,
+            "Setting %s on matching HubSpot contacts...",
+            props_summary,
         )
 
     counts = set_proofgrade_property(emails, dry_run=args.dry_run)
