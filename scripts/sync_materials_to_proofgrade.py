@@ -58,13 +58,18 @@ BATCH_SIZE = 100
 # The contact properties the script flips. The Proofgrade dynamic list's
 # filter criteria should include BOTH — confirm in HubSpot before running.
 PROOFGRADE_PROPERTY = "proofgrade_marketing_opt_in"
-PROOFGRADE_PROPERTY_VALUE = "true"
-# hs_marketable_status is a HubSpot standard property; setting it to "true"
+# HubSpot's booleancheckbox fieldType silently coerces the STRING "true"
+# to false on at least some accounts (saw this empirically — Casey's
+# value came back as false after we sent "true"). Sending the JSON
+# boolean true (unquoted) works correctly. Use Python True here so
+# json.dumps emits the unquoted boolean.
+PROOFGRADE_PROPERTY_VALUE = True
+# hs_marketable_status is a HubSpot standard property; setting it to true
 # flips the contact from non-marketing to marketing (counts toward your
 # HubSpot marketing-contacts billing tier). Only safe because the BQ query
 # restricts to contacts who opted in at Shopify checkout.
 MARKETABLE_STATUS_PROPERTY = "hs_marketable_status"
-MARKETABLE_STATUS_VALUE = "true"
+MARKETABLE_STATUS_VALUE = True
 
 # Properties we set on every matched contact, packaged as the body
 # fragment HubSpot's batch/update endpoint expects.
@@ -108,13 +113,19 @@ def fetch_eligible_emails(lookback_days: int) -> List[str]:
 def _lookup_vids_by_email(
     emails: List[str],
 ) -> Tuple[Dict[str, str], List[str]]:
-    """Resolve HubSpot contact vids from email addresses via batch/read.
+    """Resolve HubSpot contact vids from email addresses via v3 search.
 
-    HubSpot's batch/update endpoint with `idProperty=email` doesn't reliably
-    find contacts (silently returns OBJECT_NOT_FOUND even when the contact
-    exists with that exact email). batch/read with `idProperty=email`
-    works, so we do a two-step pattern: read vids first, then update by
-    vid.
+    Why search and not idProperty=email on batch/read or batch/update:
+    on this Service Key, both batch endpoints silently return
+    OBJECT_NOT_FOUND for emails that demonstrably exist as HubSpot
+    contacts (confirmed by spot-checking the UI). The contacts search API
+    finds them reliably (we already use the same endpoint in
+    count_list_intersection).
+
+    Uses the `email IN [list]` filter — single API call per batch of up
+    to 100 emails. HubSpot's search API normalizes email matching
+    case-insensitively, so our lowercase BQ output matches stored emails
+    of any casing.
 
     Returns (email -> vid map, list of emails not found).
     """
@@ -123,19 +134,26 @@ def _lookup_vids_by_email(
 
     for start in range(0, len(emails), BATCH_SIZE):
         chunk = emails[start:start + BATCH_SIZE]
+        payload = {
+            "filterGroups": [{
+                "filters": [{
+                    "propertyName": "email",
+                    "operator": "IN",
+                    "values": chunk,
+                }],
+            }],
+            "properties": ["email"],
+            "limit": BATCH_SIZE,
+        }
         response = requests.post(
-            f"{HUBSPOT_BASE}/crm/v3/objects/contacts/batch/read",
+            f"{HUBSPOT_BASE}/crm/v3/objects/contacts/search",
             headers=_headers(),
-            params={"idProperty": "email"},
-            json={
-                "inputs": [{"id": e} for e in chunk],
-                "properties": ["email"],
-            },
+            json=payload,
             timeout=60,
         )
-        if response.status_code not in (200, 207):
+        if response.status_code != 200:
             LOG.error(
-                "batch/read HTTP %d: %s",
+                "v3 contacts search HTTP %d: %s",
                 response.status_code,
                 response.text[:500],
             )
@@ -143,29 +161,31 @@ def _lookup_vids_by_email(
             continue
 
         body = response.json()
-        # HubSpot returns matched contacts in `results`, each with a vid
-        # in `id` and the resolved properties (including the canonical
-        # email) in `properties`.
+        # Track emails found in this batch (use lowercase normalization so
+        # we can diff against the input list).
+        found_in_batch: set = set()
         for result in body.get("results", []) or []:
             vid = result.get("id")
             props = result.get("properties") or {}
             canonical_email = (props.get("email") or "").strip().lower()
             if vid and canonical_email:
                 email_to_vid[canonical_email] = str(vid)
+                found_in_batch.add(canonical_email)
 
-        # Anything in the errors block (typically a single OBJECT_NOT_FOUND
-        # bundling all missing ids in context.ids) goes to missing.
-        for err in body.get("errors", []) or []:
-            context_ids = (err.get("context") or {}).get("ids") or []
-            for missing_id in context_ids:
-                missing.append(missing_id)
+        # Anything in the chunk we DIDN'T see in the results is missing.
+        for input_email in chunk:
+            if input_email.strip().lower() not in found_in_batch:
+                missing.append(input_email)
 
-    # Catch any inputs that didn't appear in either results or errors.
-    chunk_email_set = {e.strip().lower() for e in emails}
-    found_set = set(email_to_vid.keys())
-    error_set = {m.strip().lower() for m in missing}
-    silently_missing = chunk_email_set - found_set - error_set
-    missing.extend(sorted(silently_missing))
+        # Paginate if there are more results (shouldn't happen with our
+        # batch size of 100 since IN-list returns at most that many, but
+        # belt-and-suspenders).
+        if (body.get("paging") or {}).get("next"):
+            LOG.warning(
+                "search returned more than %d results for a batch of %d "
+                "emails — pagination needed but not yet implemented.",
+                BATCH_SIZE, len(chunk),
+            )
 
     return email_to_vid, missing
 
@@ -176,10 +196,11 @@ def set_proofgrade_property(
     """Set proofgrade_marketing_opt_in + hs_marketable_status on each contact.
 
     Two-step pattern:
-      1. batch/read with idProperty=email to resolve vids from emails.
-         (idProperty=email on batch/update doesn't work reliably — silently
-         returns NOT_FOUND for contacts that exist with that exact email.
-         batch/read works.)
+      1. v3 contacts search (email IN [...]) to resolve vids from emails.
+         idProperty=email on batch/read and batch/update both silently
+         return NOT_FOUND for contacts that demonstrably exist on this
+         Service Key — confirmed by spot-checking the HubSpot UI. The
+         search API works reliably.
       2. batch/update by vid to set both properties in one call per batch.
 
     Both properties go in one batch/update payload per HubSpot batch (up
@@ -199,7 +220,7 @@ def set_proofgrade_property(
         return counts
 
     # Step 1: resolve emails to vids.
-    LOG.info("Looking up HubSpot vids for %d emails via batch/read...", len(emails))
+    LOG.info("Looking up HubSpot vids for %d emails via v3 contacts search...", len(emails))
     email_to_vid, missing = _lookup_vids_by_email(emails)
     counts["not_found"] = len(missing)
     LOG.info(
@@ -230,6 +251,22 @@ def set_proofgrade_property(
         if response.status_code in (200, 207):
             body = response.json()
             counts["updated"] += len(body.get("results", []))
+            # Diagnostic: read back the property values HubSpot says it
+            # stored for the FIRST contact in the batch, so we can confirm
+            # the update actually took effect (vs. HubSpot silently
+            # coercing or ignoring our values).
+            results = body.get("results") or []
+            if results:
+                first = results[0]
+                returned_props = first.get("properties") or {}
+                LOG.info(
+                    "After update: contact %s now has %s=%r, %s=%r",
+                    first.get("id"),
+                    PROOFGRADE_PROPERTY,
+                    returned_props.get(PROOFGRADE_PROPERTY),
+                    MARKETABLE_STATUS_PROPERTY,
+                    returned_props.get(MARKETABLE_STATUS_PROPERTY),
+                )
             for err in body.get("errors", []) or []:
                 ids = (err.get("context") or {}).get("ids") or []
                 affected = max(1, len(ids))
