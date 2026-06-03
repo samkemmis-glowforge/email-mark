@@ -154,7 +154,10 @@ def set_proofgrade_property(
         # 4xx/5xx = full failure (e.g., missing scope, bad payload).
         if response.status_code in (200, 207):
             body = response.json()
-            counts["updated"] += len(body.get("results", []))
+            batch_updated = len(body.get("results", []))
+            batch_not_found = 0
+            batch_errored = 0
+            counts["updated"] += batch_updated
             for err in body.get("errors", []) or []:
                 category = (err.get("category") or "").upper()
                 message = err.get("message") or str(err)
@@ -166,10 +169,28 @@ def set_proofgrade_property(
                     or "not found" in message.lower()
                     or "no contact" in message.lower()
                 ):
+                    batch_not_found += 1
                     counts["not_found"] += 1
                 else:
+                    batch_errored += 1
                     counts["errored"] += 1
                     LOG.warning("Batch error: %s", err)
+
+            # Diagnostic: if HubSpot's response doesn't account for every
+            # input we sent, log the raw body so we can see what shape it
+            # actually used. (HubSpot batch endpoints sometimes return
+            # success counts in different fields than we expect.)
+            accounted_for = batch_updated + batch_not_found + batch_errored
+            if accounted_for < len(batch):
+                import json as _json
+                LOG.warning(
+                    "HubSpot response only accounted for %d of %d inputs. "
+                    "HTTP %d. Raw body: %s",
+                    accounted_for,
+                    len(batch),
+                    response.status_code,
+                    _json.dumps(body)[:2000],
+                )
         else:
             LOG.error(
                 "Batch update HTTP %d: %s",
