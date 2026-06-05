@@ -1128,6 +1128,274 @@ def count_list_intersection(
     }
 
 
+# Blank-canvas template Sam created for "design from scratch" emails.
+# Structure: header image widget (Glowforge logo), ONE custom-HTML widget
+# (Mark's design surface), standard HubSpot footer. The custom-HTML widget
+# is identified at runtime by its type, so its specific widget id doesn't
+# need to be hard-coded — it's found dynamically.
+BLANK_CANVAS_TEMPLATE_ID = "214440003148"
+
+
+def _find_custom_html_widget_id(widgets: Dict[str, Any]) -> Optional[str]:
+    """Find the single custom-HTML widget in a widget dict.
+
+    HubSpot's drag-drop "HTML" module saves with type "raw_html". The
+    blank-canvas template has exactly one such widget — that's the body
+    canvas Mark patches. Returns its widget id, or None if zero or
+    multiple were found (which is an error state for this template).
+    """
+    if not isinstance(widgets, dict):
+        return None
+    candidates: List[str] = []
+    for wid, widget in widgets.items():
+        if not isinstance(widget, dict):
+            continue
+        wtype = (widget.get("type") or "").lower()
+        # HubSpot has called this widget type several things across
+        # versions; check the common forms.
+        if wtype in ("raw_html", "custom_html", "html"):
+            candidates.append(wid)
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _patch_blank_canvas_body(email_id: str, body_html: str) -> Dict[str, Any]:
+    """Find the custom-HTML widget in an email and replace its body.html.
+
+    Internal helper for create_email_draft_v2 and update_email_draft_v2.
+    Returns {"widget_id": <id>, "status": "ok"} on success, or
+    {"error": "..."} with diagnostic info on failure.
+    """
+    response = requests.get(
+        f"{HUBSPOT_BASE}/marketing/v3/emails/{email_id}",
+        headers=_headers(),
+        params={"includeStats": "true"},
+        timeout=30,
+    )
+    if response.status_code != 200:
+        return {
+            "error": (
+                f"Failed to fetch email {email_id} "
+                f"(HTTP {response.status_code})."
+            ),
+            "response_body": response.text[:500],
+        }
+    email = response.json()
+
+    content = email.get("content")
+    if not isinstance(content, dict):
+        return {"error": "Email has no content object — can't patch body."}
+
+    widgets = content.get("widgets")
+    if not isinstance(widgets, dict):
+        return {"error": "Email has no widgets dict — can't patch body."}
+
+    body_widget_id = _find_custom_html_widget_id(widgets)
+    if not body_widget_id:
+        widget_types = [
+            (wid, (w.get("type") if isinstance(w, dict) else None))
+            for wid, w in widgets.items()
+        ]
+        return {
+            "error": (
+                "Could not find a single custom-HTML widget in this email. "
+                "The blank-canvas template should have exactly one widget "
+                "of type 'raw_html' for the body. Either the template was "
+                "modified, the email wasn't created from the blank canvas, "
+                "or HubSpot is using a different type name for the HTML "
+                "module on this account."
+            ),
+            "widget_types_found": widget_types,
+        }
+
+    # Replace the body.html on the located widget, keep everything else.
+    new_widgets = dict(widgets)
+    new_widget = dict(widgets[body_widget_id])
+    new_body = dict(new_widget.get("body") or {})
+    new_body["html"] = body_html
+    new_widget["body"] = new_body
+    new_widgets[body_widget_id] = new_widget
+
+    new_content = dict(content)
+    new_content["widgets"] = new_widgets
+
+    patch_response = requests.patch(
+        f"{HUBSPOT_BASE}/marketing/v3/emails/{email_id}",
+        headers=_headers(),
+        json={"content": new_content},
+        timeout=30,
+    )
+    if patch_response.status_code != 200:
+        return {
+            "error": (
+                f"Failed to patch email body "
+                f"(HTTP {patch_response.status_code})."
+            ),
+            "response_body": patch_response.text[:500],
+        }
+
+    return {
+        "widget_id": body_widget_id,
+        "body_html_length": len(body_html),
+        "status": "ok",
+    }
+
+
+def create_email_draft_v2(
+    name: str,
+    subject: str,
+    body_html: str,
+    preheader: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Create a from-scratch marketing email draft in HubSpot.
+
+    Clones the blank-canvas template, sets name/subject/preheader, and
+    writes body_html into the template's single custom-HTML widget. The
+    template provides the header (Glowforge logo) and the standard
+    HubSpot footer (unsubscribe block) — Mark only owns the body.
+
+    Use this for emails Mark is designing from scratch, where he wants
+    full layout/structure freedom. For copy-tweaks on an existing
+    template, use create_email_draft (v1). For the weekly ICYMI workflow,
+    use create_icymi_draft.
+
+    body_html should be structured, semantic, cross-client-compatible
+    email HTML: table-based layout, inline styles, no SVG, no modern
+    CSS features that Outlook doesn't support. See
+    prompts/email_design_references.md for the full design guidance.
+
+    Returns email_id, edit_url, and a status report. NEVER returns the
+    body_html in the response (it would be huge in chat context).
+    """
+    if not name or not subject:
+        return {"error": "name and subject are required."}
+    if not body_html or not body_html.strip():
+        return {"error": "body_html is required and must be non-empty."}
+
+    try:
+        cloned = clone_marketing_email(BLANK_CANVAS_TEMPLATE_ID, name)
+    except Exception as exc:
+        return {"error": f"Failed to clone blank-canvas template: {exc}"}
+
+    new_id = cloned.get("id")
+    if not new_id:
+        return {
+            "error": "Clone succeeded but response had no id.",
+            "response": cloned,
+        }
+
+    edit_url = (
+        f"https://app.hubspot.com/email/8614495/edit/{new_id}/content"
+    )
+
+    update_fields: Dict[str, Any] = {"name": name, "subject": subject}
+    if preheader:
+        update_fields["previewText"] = preheader
+    try:
+        update_marketing_email(str(new_id), **update_fields)
+    except Exception as exc:
+        return {
+            "error": f"Failed to update email metadata: {exc}",
+            "email_id": str(new_id),
+            "edit_url": edit_url,
+        }
+
+    patch_result = _patch_blank_canvas_body(str(new_id), body_html)
+    if "error" in patch_result:
+        return {
+            **patch_result,
+            "email_id": str(new_id),
+            "edit_url": edit_url,
+            "stage_failed": "body_patch",
+        }
+
+    return {
+        "email_id": str(new_id),
+        "name": name,
+        "subject": subject,
+        "preheader": preheader,
+        "body_html_length": len(body_html),
+        "body_widget_id": patch_result.get("widget_id"),
+        "edit_url": edit_url,
+        "status": "created",
+    }
+
+
+def update_email_draft_v2(
+    email_id: str,
+    body_html: Optional[str] = None,
+    subject: Optional[str] = None,
+    preheader: Optional[str] = None,
+    name: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Iterate on a from-scratch email draft.
+
+    Use this to apply changes to a draft created by create_email_draft_v2.
+    Each of body_html / subject / preheader / name is optional — only the
+    provided ones get patched. Header and footer are never touched.
+
+    Iteration pattern: Mark keeps the current body_html in his session
+    context, the user asks for a change ("make the headline bigger,"
+    "switch to Aurange palette"), Mark regenerates the FULL body_html
+    (no diffing — simpler and avoids drift), calls update_email_draft_v2
+    with the new body, and tells the user to refresh the HubSpot
+    preview.
+
+    Returns email_id, edit_url, and a status report.
+    """
+    if not email_id:
+        return {"error": "email_id is required."}
+
+    if body_html is None and subject is None and preheader is None and name is None:
+        return {"error": "Nothing to update — pass at least one of body_html, subject, preheader, name."}
+
+    edit_url = (
+        f"https://app.hubspot.com/email/8614495/edit/{email_id}/content"
+    )
+
+    # Patch metadata first (name/subject/preheader) if any provided.
+    meta_updates: Dict[str, Any] = {}
+    if name is not None:
+        meta_updates["name"] = name
+    if subject is not None:
+        meta_updates["subject"] = subject
+    if preheader is not None:
+        meta_updates["previewText"] = preheader
+
+    if meta_updates:
+        try:
+            update_marketing_email(str(email_id), **meta_updates)
+        except Exception as exc:
+            return {
+                "error": f"Failed to update email metadata: {exc}",
+                "email_id": str(email_id),
+                "edit_url": edit_url,
+                "stage_failed": "metadata",
+            }
+
+    # Patch body if provided.
+    body_result: Dict[str, Any] = {}
+    if body_html is not None:
+        if not body_html.strip():
+            return {"error": "body_html is empty — refusing to patch an empty body."}
+        body_result = _patch_blank_canvas_body(str(email_id), body_html)
+        if "error" in body_result:
+            return {
+                **body_result,
+                "email_id": str(email_id),
+                "edit_url": edit_url,
+                "stage_failed": "body_patch",
+            }
+
+    return {
+        "email_id": str(email_id),
+        "metadata_updated": dict(meta_updates) if meta_updates else None,
+        "body_html_length": len(body_html) if body_html is not None else None,
+        "body_widget_id": body_result.get("widget_id") if body_html else None,
+        "edit_url": edit_url,
+        "status": "updated",
+    }
+
+
 def clone_marketing_email(source_id: str, new_name: str) -> Dict[str, Any]:
     """Clone an existing marketing email. Returns the new email object."""
     response = requests.post(

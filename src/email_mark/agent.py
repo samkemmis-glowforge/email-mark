@@ -28,6 +28,7 @@ from email_mark.hubspot_marketing import (
     GLOWFORGE_ENGAGEMENT_SENDS_CUTOFF,
     clone_marketing_email,
     count_list_intersection,
+    create_email_draft_v2,
     find_hubspot_lists,
     get_contact_email_events,
     get_email_body_text,
@@ -41,6 +42,7 @@ from email_mark.hubspot_marketing import (
     get_workflow_enrollments,
     list_marketing_emails,
     list_workflows,
+    update_email_draft_v2,
     update_email_body,
     update_email_by_widget_map,
     update_marketing_email,
@@ -136,6 +138,39 @@ def _brand_voice_section() -> str:
     return (
         "\n\nBrand voice and tone — apply these to ALL drafted email content:\n\n"
         + _BRAND_VOICE
+    )
+
+
+def _load_email_design_references() -> str:
+    """Load the email design references doc (universal best practices +
+    Glowforge brand DNA + HubSpot constraints + experimentation
+    guardrails). Mark consults this when designing emails from scratch
+    via create_email_draft_v2 / update_email_draft_v2."""
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    refs_file = repo_root / "prompts" / "email_design_references.md"
+    if not refs_file.exists():
+        return ""
+    text = refs_file.read_text().strip()
+    if not text:
+        return ""
+    return text
+
+
+_EMAIL_DESIGN_REFERENCES = _load_email_design_references()
+
+
+def _email_design_references_section() -> str:
+    if not _EMAIL_DESIGN_REFERENCES:
+        return ""
+    return (
+        "\n\nEMAIL DESIGN REFERENCES — consult these when designing emails "
+        "from scratch (via create_email_draft_v2 / update_email_draft_v2). "
+        "Universal email design best practices, Glowforge brand DNA across "
+        "all sub-brands, HubSpot-specific constraints, and experimentation "
+        "guardrails. Scan the cheat sheet (§5) before every from-scratch "
+        "design; consult the brand application section (§2) when picking "
+        "colors and typography.\n\n"
+        + _EMAIL_DESIGN_REFERENCES
     )
 
 
@@ -741,26 +776,88 @@ EXECUTION STYLE — handling multi-step requests:
   resolved by reasonable inference — e.g., three different campaigns match
   the description and the right one isn't obvious from context.
 
-DRAFTING EMAILS — workflow:
-1. Write the subject + body in chat for the user to review.
-2. AFTER presenting drafts, ALWAYS proactively ask whether to create them
-   as drafts in HubSpot. Don't wait for the user to think to ask. Phrase it
-   like: "Want me to create these in HubSpot as drafts? If yes, which existing
-   email should I clone as the template?" If you have a sensible template
-   guess from prior context, suggest it.
-3. Iterate based on user feedback (tone, length, structure).
-4. Once the user gives explicit approval ("yes," "create them," "go ahead"),
-   call create_email_draft for each one — passing the FULL body_text you wrote
-   in chat (subject, name, AND body all go in one call).
-5. create_email_draft clones a template, updates the subject/name, and replaces
-   the largest body text widget with your body_text. Other template modules
-   (header image, CTA button, footer) carry over unchanged. Always share the
-   edit_url back so the user can review.
-6. The body_update field in the response tells you whether body replacement
-   succeeded. If it failed, surface that to the user honestly so they know
-   to paste the body manually.
-7. If you don't know which template to use, call search_marketing_emails to
-   suggest 2-3 candidates and let the user pick.
+DRAFTING EMAILS — pick the right tool for the job:
+
+There are THREE email-draft tools, each for a different job:
+
+A. create_email_draft_v2 — for FROM-SCRATCH design work. Use when the
+   user asks for a new design, a new format, an experimental layout,
+   or anything where the existing templates feel uninspiring. You own
+   the entire body composition — generate full email HTML and call the
+   tool. See the EMAIL DESIGN section below for the workflow.
+
+B. create_icymi_draft — for the weekly ICYMI "In Case You Missed It"
+   project highlight email. Uses a structured master template with
+   per-project widget slots. See the ICYMI WORKFLOW section below.
+
+C. create_email_draft (legacy) — clones an existing template and
+   swaps body text. Use ONLY when the user explicitly asks to "use
+   the template from email X" or "do another one like Y". For
+   anything else, prefer A. NOTE: this tool has a known bug in its
+   body-injection helper (_build_body_html signature mismatch — the
+   tool may report success without actually updating the body). If
+   you must use it, verify the result via the body_update field and
+   tell the user honestly if it failed.
+
+For ALL three: present the draft for chat review FIRST, then create
+in HubSpot after explicit approval, then share the edit_url back so
+the user can preview in HubSpot's UI.
+
+EMAIL DESIGN — workflow for from-scratch designs (create_email_draft_v2):
+
+1. BEFORE designing, scan the EMAIL DESIGN REFERENCES section
+   (loaded into your system prompt at startup). The cheat sheet (§5)
+   covers the universal best practices and the Glowforge brand
+   defaults. The brand application (§2) tells you which sub-brand's
+   colors and typography to use (Performance / Personal / EDU /
+   Proofgrade / Premium / B2B). When the user's request is ambiguous
+   about which sub-brand, ask.
+
+2. Design in chat first. Output the email's structure as plain text
+   for the user to review — headline, sub-headline, body sections,
+   CTAs, image placements. Do NOT show HTML in chat; show the
+   structure and copy. Get approval on the design BEFORE generating
+   HTML.
+
+3. When the user approves, generate the full body_html as
+   cross-client-compatible email HTML:
+     - Tables for layout (NOT flexbox or grid — Outlook ignores).
+     - Inline styles only (NOT <style> blocks — most clients strip).
+     - Real semantic tags: <h1>, <h2>, <p>, <a>, <ul>.
+     - 600px max width on the outer table.
+     - Web-safe font stack with Poppins/Space Grotesk first, Arial
+       fallback.
+     - Images: alt text on every meaningful one, hosted on URLs the
+       user provided.
+     - One primary CTA per email, button ≥44px tap target, action
+       verb in 2-4 words.
+   Then call create_email_draft_v2 with name, subject, body_html,
+   preheader.
+
+4. Share the edit_url back so the user can review in HubSpot's UI.
+   Don't repeat the body_html in your reply (it's already in HubSpot
+   and would blow up the chat).
+
+5. ITERATION: when the user reviews and asks for changes ("make the
+   headline bigger," "switch to the Aurange palette," "rewrite the
+   second section"), regenerate the FULL body_html with the changes
+   applied (don't try to diff — easier to drift), and call
+   update_email_draft_v2(email_id, body_html=...) with the same
+   email_id. For metadata-only changes (subject, preheader), pass
+   just those.
+
+6. EXPERIMENTATION: the user wants you to push past the existing
+   template aesthetic. Productive experimentation = unexpected color
+   pairings from within the brand palette (using the warm↔cool /
+   light↔dark diagonal pairing), strong typographic moments, new
+   layout shapes. Drift = inventing colors or fonts outside the
+   brand system, multi-primary CTAs, dark patterns. See §4 of the
+   design references for the boundaries.
+
+7. IMAGES: until we have a HubSpot asset library tool, the user
+   provides image URLs in chat. If you need an image for a hero or
+   module, ask the user for the URL. Don't invent image URLs or use
+   placeholders that won't render in HubSpot.
 
 ICYMI WORKFLOW — the weekly "In Case You Missed It" project highlight email:
 This is a recurring task. The user (Sam or another marketer) will send you
@@ -1139,6 +1236,7 @@ If you're ever unsure whether something is sensitive, default to NOT
 sharing it and ask the user to confirm whether the request is appropriate.
 """
     + _brand_voice_section()
+    + _email_design_references_section()
     + _lessons_section()
 )
 
@@ -1444,6 +1542,25 @@ def _tool_create_icymi_draft(args: Dict[str, Any]) -> Dict[str, Any]:
         ),
         "body_update": body_result,
     }
+
+
+def _tool_create_email_draft_v2(args: Dict[str, Any]) -> Dict[str, Any]:
+    return create_email_draft_v2(
+        name=str(args["name"]),
+        subject=str(args["subject"]),
+        body_html=str(args["body_html"]),
+        preheader=args.get("preheader"),
+    )
+
+
+def _tool_update_email_draft_v2(args: Dict[str, Any]) -> Dict[str, Any]:
+    return update_email_draft_v2(
+        email_id=str(args["email_id"]),
+        body_html=args.get("body_html"),
+        subject=args.get("subject"),
+        preheader=args.get("preheader"),
+        name=args.get("name"),
+    )
 
 
 def _tool_create_email_draft(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -2564,6 +2681,120 @@ TOOLS: List[Dict[str, Any]] = [
         },
     },
     {
+        "name": "create_email_draft_v2",
+        "description": (
+            "PREFERRED tool for creating a marketing email Mark designed "
+            "from scratch. Clones a blank-canvas template (Glowforge logo "
+            "header + empty custom-HTML body + standard HubSpot footer) "
+            "and writes the entire body as Mark-generated HTML.\n\n"
+            "Use this when: the user asks for a from-scratch design, a "
+            "new email format, an experimental layout, or something not "
+            "covered by an existing template. The body_html is Mark's "
+            "design surface — he owns the entire body composition.\n\n"
+            "DO NOT use this for the weekly ICYMI workflow (use "
+            "create_icymi_draft — it has structured per-project widgets "
+            "the template needs). DO NOT use this for copy-only tweaks on "
+            "an existing template (use create_email_draft — clones and "
+            "swaps body text on an existing email's structure).\n\n"
+            "body_html requirements: structured, semantic, cross-client-"
+            "compatible email HTML. Table-based layout (NOT flexbox or "
+            "grid — Outlook ignores those). Inline CSS (NOT linked "
+            "stylesheets — most email clients strip <style> blocks). No "
+            "SVG (use raster images). Use real <h1>/<h2>/<p>/<a> "
+            "semantic tags. Read prompts/email_design_references.md "
+            "section 5 (cheat sheet) BEFORE designing.\n\n"
+            "Returns the email_id, edit_url, and status. The body_html "
+            "is NOT echoed back (would blow up your context); keep your "
+            "own copy if you need to iterate."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": (
+                        "Internal name for the draft (visible in HubSpot, "
+                        "not the subject the recipient sees). Follow team "
+                        "convention: '<Program> - <YYYY-MM-DD> - <topic>'."
+                    ),
+                },
+                "subject": {
+                    "type": "string",
+                    "description": (
+                        "Email subject line. The recipient sees this. "
+                        "Mobile clients show ~30-40 chars before truncation."
+                    ),
+                },
+                "body_html": {
+                    "type": "string",
+                    "description": (
+                        "Full email body as cross-client-compatible HTML. "
+                        "Tables-for-layout, inline styles, real semantic "
+                        "tags. Mark's design surface."
+                    ),
+                },
+                "preheader": {
+                    "type": "string",
+                    "description": (
+                        "Preview text shown in inbox after the subject. "
+                        "Strong complement to the subject line — don't just "
+                        "repeat it. Recommended length 40-130 chars."
+                    ),
+                },
+            },
+            "required": ["name", "subject", "body_html"],
+        },
+    },
+    {
+        "name": "update_email_draft_v2",
+        "description": (
+            "Iterate on a from-scratch email draft previously created by "
+            "create_email_draft_v2. Updates the body_html and/or "
+            "metadata (subject/preheader/name) on an existing draft. "
+            "Header and footer are never touched.\n\n"
+            "Iteration pattern: when the user reviews the HubSpot preview "
+            "and asks for a change ('make the headline bigger,' 'switch "
+            "to Aurange,' 'rewrite the second section to be punchier'), "
+            "regenerate the FULL body_html (no diffing — simpler and "
+            "avoids drift), call this tool with the new body, and tell "
+            "the user to refresh their HubSpot preview.\n\n"
+            "Pass only the fields you want to change — omitted fields "
+            "are left untouched. Pass at least one field."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "email_id": {
+                    "type": "string",
+                    "description": (
+                        "HubSpot email ID of the draft to update (the one "
+                        "create_email_draft_v2 returned)."
+                    ),
+                },
+                "body_html": {
+                    "type": "string",
+                    "description": (
+                        "New full email body HTML. Omit to leave the body "
+                        "unchanged. If passed, must be non-empty."
+                    ),
+                },
+                "subject": {
+                    "type": "string",
+                    "description": "New subject line. Omit to keep current.",
+                },
+                "preheader": {
+                    "type": "string",
+                    "description": "New preheader text. Omit to keep current.",
+                },
+                "name": {
+                    "type": "string",
+                    "description": "New internal name. Omit to keep current.",
+                },
+            },
+            "required": ["email_id"],
+        },
+    },
+    {
         "name": "create_email_draft",
         "description": (
             "Create a NEW draft marketing email in HubSpot by cloning an existing "
@@ -2632,6 +2863,8 @@ TOOL_HANDLERS: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     "get_marketing_email_stats": _tool_get_marketing_email_stats,
     "create_icymi_draft": _tool_create_icymi_draft,
     "create_email_draft": _tool_create_email_draft,
+    "create_email_draft_v2": _tool_create_email_draft_v2,
+    "update_email_draft_v2": _tool_update_email_draft_v2,
     "get_subscription_distribution": _tool_get_subscription_distribution,
     "count_inactive_users": _tool_count_inactive_users,
     "get_print_recency_buckets": _tool_get_print_recency_buckets,
