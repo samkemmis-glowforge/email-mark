@@ -1139,10 +1139,13 @@ BLANK_CANVAS_TEMPLATE_ID = "214440003148"
 def _find_custom_html_widget_id(widgets: Dict[str, Any]) -> Optional[str]:
     """Find the single custom-HTML widget in a widget dict.
 
-    HubSpot's drag-drop "HTML" module saves with type "raw_html". The
-    blank-canvas template has exactly one such widget — that's the body
-    canvas Mark patches. Returns its widget id, or None if zero or
-    multiple were found (which is an error state for this template).
+    HubSpot's API returns drag-drop modules with `type: "module"` and the
+    actual module identity in the `path` field, e.g.
+    `path: "@hubspot/raw_html_email"`. The blank-canvas template has
+    exactly one HTML module — that's the body canvas Mark patches.
+
+    Returns its widget id, or None if zero or multiple were found
+    (which is an error state for this template).
     """
     if not isinstance(widgets, dict):
         return None
@@ -1150,9 +1153,22 @@ def _find_custom_html_widget_id(widgets: Dict[str, Any]) -> Optional[str]:
     for wid, widget in widgets.items():
         if not isinstance(widget, dict):
             continue
+        # Primary: check `path` against HubSpot's @hubspot/raw_html_email
+        # naming. Also accept any path containing "raw_html" or "html_email"
+        # so this survives small HubSpot renamings without code changes.
+        path = (widget.get("path") or "").lower()
+        if path:
+            if (
+                path == "@hubspot/raw_html_email"
+                or "raw_html" in path
+                or "html_email" in path
+                or "custom_html" in path
+            ):
+                candidates.append(wid)
+                continue
+        # Fallback: some older widgets / response shapes use `type` directly
+        # instead of the path indirection. Keep accepting those.
         wtype = (widget.get("type") or "").lower()
-        # HubSpot has called this widget type several things across
-        # versions; check the common forms.
         if wtype in ("raw_html", "custom_html", "html"):
             candidates.append(wid)
     return candidates[0] if len(candidates) == 1 else None
@@ -1191,20 +1207,25 @@ def _patch_blank_canvas_body(email_id: str, body_html: str) -> Dict[str, Any]:
 
     body_widget_id = _find_custom_html_widget_id(widgets)
     if not body_widget_id:
-        widget_types = [
-            (wid, (w.get("type") if isinstance(w, dict) else None))
+        widget_info = [
+            {
+                "id": wid,
+                "type": (w.get("type") if isinstance(w, dict) else None),
+                "path": (w.get("path") if isinstance(w, dict) else None),
+            }
             for wid, w in widgets.items()
         ]
         return {
             "error": (
                 "Could not find a single custom-HTML widget in this email. "
-                "The blank-canvas template should have exactly one widget "
-                "of type 'raw_html' for the body. Either the template was "
-                "modified, the email wasn't created from the blank canvas, "
-                "or HubSpot is using a different type name for the HTML "
-                "module on this account."
+                "The blank-canvas template should have exactly one HTML "
+                "module (HubSpot path '@hubspot/raw_html_email'). Either "
+                "the template was modified, the email wasn't created from "
+                "the blank canvas, or HubSpot is using an unfamiliar path "
+                "for the HTML module on this account — check the "
+                "widget_info field to see what paths are actually present."
             ),
-            "widget_types_found": widget_types,
+            "widget_info": widget_info,
         }
 
     # Replace the body.html on the located widget, keep everything else.
