@@ -1550,6 +1550,7 @@ def _tool_create_email_draft_v2(args: Dict[str, Any]) -> Dict[str, Any]:
         subject=str(args["subject"]),
         body_html=str(args["body_html"]),
         preheader=args.get("preheader"),
+        body_widget_id_override=args.get("body_widget_id_override"),
     )
 
 
@@ -1560,6 +1561,7 @@ def _tool_update_email_draft_v2(args: Dict[str, Any]) -> Dict[str, Any]:
         subject=args.get("subject"),
         preheader=args.get("preheader"),
         name=args.get("name"),
+        body_widget_id_override=args.get("body_widget_id_override"),
     )
 
 
@@ -2741,6 +2743,17 @@ TOOLS: List[Dict[str, Any]] = [
                         "repeat it. Recommended length 40-130 chars."
                     ),
                 },
+                "body_widget_id_override": {
+                    "type": "string",
+                    "description": (
+                        "Optional. Skip widget auto-detection and patch "
+                        "this specific widget id. Use only if a previous "
+                        "call returned the 'could not identify HTML "
+                        "widget' error with widget_info — pick the right "
+                        "id from there and pass it here for subsequent "
+                        "calls."
+                    ),
+                },
             },
             "required": ["name", "subject", "body_html"],
         },
@@ -2789,6 +2802,13 @@ TOOLS: List[Dict[str, Any]] = [
                 "name": {
                     "type": "string",
                     "description": "New internal name. Omit to keep current.",
+                },
+                "body_widget_id_override": {
+                    "type": "string",
+                    "description": (
+                        "Optional. Skip widget auto-detection and patch "
+                        "this specific widget id (same as on create)."
+                    ),
                 },
             },
             "required": ["email_id"],

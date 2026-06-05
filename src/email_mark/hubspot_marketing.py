@@ -1136,48 +1136,108 @@ def count_list_intersection(
 BLANK_CANVAS_TEMPLATE_ID = "214440003148"
 
 
+# Fields that strongly indicate a widget is an IMAGE module (rules it out
+# as the HTML body). Image widgets have an `img` dict or a `src` URL.
+_IMAGE_BODY_FIELDS = {"img", "src", "image_url"}
+
+# Fields that strongly indicate a FOOTER module (rules it out as the HTML
+# body). HubSpot's standard footer carries company-info and unsubscribe
+# fields, none of which appear on a custom-HTML widget.
+_FOOTER_BODY_FIELDS = {
+    "company_name", "company_street_address_1", "company_city",
+    "company_state", "company_zip", "company_country",
+    "unsubscribe_link_type", "unsubscribe_section", "office_location_name",
+}
+
+# Fields that strongly indicate a BUTTON/CTA module (rules it out).
+_BUTTON_BODY_FIELDS = {"button_text", "button_url", "cta_id"}
+
+
 def _find_custom_html_widget_id(widgets: Dict[str, Any]) -> Optional[str]:
     """Find the single custom-HTML widget in a widget dict.
 
-    HubSpot's API returns drag-drop modules with `type: "module"` and the
-    actual module identity in the `path` field, e.g.
-    `path: "@hubspot/raw_html_email"`. The blank-canvas template has
-    exactly one HTML module — that's the body canvas Mark patches.
+    Detection strategy, in order:
+      1. HubSpot's `path` field (`@hubspot/raw_html_email` or variants).
+      2. Top-level `type` field (legacy shape: type="raw_html").
+      3. Process-of-elimination: in a template with header(image) +
+         body(html) + footer, identify the image and footer widgets by
+         their distinctive body fields, and return whatever's left if
+         it's a single widget.
 
-    Returns its widget id, or None if zero or multiple were found
-    (which is an error state for this template).
+    The fallback is needed because HubSpot's v3 marketing email API
+    returns `type="module"` with `path=null` for the widgets in some
+    template configurations — neither field discriminates the HTML
+    widget on its own.
+
+    Returns the widget id, or None if zero or multiple plausible HTML
+    widgets remain after all three strategies.
     """
     if not isinstance(widgets, dict):
         return None
+
+    # Strategy 1: explicit path match.
+    path_matches: List[str] = []
+    for wid, widget in widgets.items():
+        if not isinstance(widget, dict):
+            continue
+        path = (widget.get("path") or "").lower()
+        if path and (
+            path == "@hubspot/raw_html_email"
+            or "raw_html" in path
+            or "html_email" in path
+            or "custom_html" in path
+        ):
+            path_matches.append(wid)
+    if len(path_matches) == 1:
+        return path_matches[0]
+
+    # Strategy 2: legacy type-name match.
+    type_matches: List[str] = []
+    for wid, widget in widgets.items():
+        if not isinstance(widget, dict):
+            continue
+        wtype = (widget.get("type") or "").lower()
+        if wtype in ("raw_html", "custom_html", "html"):
+            type_matches.append(wid)
+    if len(type_matches) == 1:
+        return type_matches[0]
+
+    # Strategy 3: process of elimination. A widget is NOT the HTML body
+    # if its body has image-, footer-, or button-distinctive fields. If
+    # exactly one widget survives the elimination, that's our HTML body.
     candidates: List[str] = []
     for wid, widget in widgets.items():
         if not isinstance(widget, dict):
             continue
-        # Primary: check `path` against HubSpot's @hubspot/raw_html_email
-        # naming. Also accept any path containing "raw_html" or "html_email"
-        # so this survives small HubSpot renamings without code changes.
-        path = (widget.get("path") or "").lower()
-        if path:
-            if (
-                path == "@hubspot/raw_html_email"
-                or "raw_html" in path
-                or "html_email" in path
-                or "custom_html" in path
-            ):
-                candidates.append(wid)
-                continue
-        # Fallback: some older widgets / response shapes use `type` directly
-        # instead of the path indirection. Keep accepting those.
-        wtype = (widget.get("type") or "").lower()
-        if wtype in ("raw_html", "custom_html", "html"):
-            candidates.append(wid)
-    return candidates[0] if len(candidates) == 1 else None
+        body = widget.get("body") if isinstance(widget.get("body"), dict) else {}
+        body_keys = set(body.keys()) if isinstance(body, dict) else set()
+        if body_keys & _IMAGE_BODY_FIELDS:
+            continue  # image module — skip
+        if body_keys & _FOOTER_BODY_FIELDS:
+            continue  # footer module — skip
+        if body_keys & _BUTTON_BODY_FIELDS:
+            continue  # button module — skip
+        candidates.append(wid)
+    if len(candidates) == 1:
+        return candidates[0]
+
+    return None
 
 
-def _patch_blank_canvas_body(email_id: str, body_html: str) -> Dict[str, Any]:
+def _patch_blank_canvas_body(
+    email_id: str,
+    body_html: str,
+    body_widget_id_override: Optional[str] = None,
+) -> Dict[str, Any]:
     """Find the custom-HTML widget in an email and replace its body.html.
 
     Internal helper for create_email_draft_v2 and update_email_draft_v2.
+
+    If body_widget_id_override is provided, skips detection entirely and
+    patches that specific widget. Useful when auto-detection fails on
+    an unusual template — caller can dump the widget structure once,
+    identify the right widget id by hand, and pass it forever after.
+
     Returns {"widget_id": <id>, "status": "ok"} on success, or
     {"error": "..."} with diagnostic info on failure.
     """
@@ -1205,25 +1265,45 @@ def _patch_blank_canvas_body(email_id: str, body_html: str) -> Dict[str, Any]:
     if not isinstance(widgets, dict):
         return {"error": "Email has no widgets dict — can't patch body."}
 
-    body_widget_id = _find_custom_html_widget_id(widgets)
-    if not body_widget_id:
-        widget_info = [
-            {
-                "id": wid,
-                "type": (w.get("type") if isinstance(w, dict) else None),
-                "path": (w.get("path") if isinstance(w, dict) else None),
+    if body_widget_id_override:
+        if body_widget_id_override not in widgets:
+            return {
+                "error": (
+                    f"body_widget_id_override={body_widget_id_override!r} "
+                    "isn't present on this email. Widgets actually present: "
+                    f"{list(widgets.keys())}"
+                ),
             }
-            for wid, w in widgets.items()
-        ]
+        body_widget_id = body_widget_id_override
+    else:
+        body_widget_id = _find_custom_html_widget_id(widgets)
+
+    if not body_widget_id:
+        # Surface enough info to either fix the auto-detector OR have the
+        # caller pass body_widget_id_override on the next call.
+        widget_info = []
+        for wid, w in widgets.items():
+            if not isinstance(w, dict):
+                widget_info.append({"id": wid, "not_a_dict": True})
+                continue
+            body = w.get("body") if isinstance(w.get("body"), dict) else {}
+            widget_info.append({
+                "id": wid,
+                "type": w.get("type"),
+                "path": w.get("path"),
+                "label": w.get("label"),
+                "name": w.get("name"),
+                "body_keys": list(body.keys()) if isinstance(body, dict) else None,
+            })
         return {
             "error": (
-                "Could not find a single custom-HTML widget in this email. "
-                "The blank-canvas template should have exactly one HTML "
-                "module (HubSpot path '@hubspot/raw_html_email'). Either "
-                "the template was modified, the email wasn't created from "
-                "the blank canvas, or HubSpot is using an unfamiliar path "
-                "for the HTML module on this account — check the "
-                "widget_info field to see what paths are actually present."
+                "Could not identify the custom-HTML widget in this email. "
+                "Tried path-match (@hubspot/raw_html_email), legacy "
+                "type-match (raw_html), and process-of-elimination "
+                "(non-image, non-footer, non-button widgets). None gave a "
+                "unique match. Inspect widget_info below to identify the "
+                "right widget by hand, then re-call with "
+                "body_widget_id_override=<that_id>."
             ),
             "widget_info": widget_info,
         }
@@ -1266,6 +1346,7 @@ def create_email_draft_v2(
     subject: str,
     body_html: str,
     preheader: Optional[str] = None,
+    body_widget_id_override: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create a from-scratch marketing email draft in HubSpot.
 
@@ -1320,7 +1401,9 @@ def create_email_draft_v2(
             "edit_url": edit_url,
         }
 
-    patch_result = _patch_blank_canvas_body(str(new_id), body_html)
+    patch_result = _patch_blank_canvas_body(
+        str(new_id), body_html, body_widget_id_override=body_widget_id_override
+    )
     if "error" in patch_result:
         return {
             **patch_result,
@@ -1347,6 +1430,7 @@ def update_email_draft_v2(
     subject: Optional[str] = None,
     preheader: Optional[str] = None,
     name: Optional[str] = None,
+    body_widget_id_override: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Iterate on a from-scratch email draft.
 
@@ -1398,7 +1482,11 @@ def update_email_draft_v2(
     if body_html is not None:
         if not body_html.strip():
             return {"error": "body_html is empty — refusing to patch an empty body."}
-        body_result = _patch_blank_canvas_body(str(email_id), body_html)
+        body_result = _patch_blank_canvas_body(
+            str(email_id),
+            body_html,
+            body_widget_id_override=body_widget_id_override,
+        )
         if "error" in body_result:
             return {
                 **body_result,
