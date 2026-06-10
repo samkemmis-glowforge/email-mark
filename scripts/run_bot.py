@@ -301,7 +301,13 @@ def handle_mention(event, say):
         )
     _maybe_rehydrate(conversation_id, rehydrate_fn)
 
-    reply = chat(text, conversation_id=conversation_id)
+    reply = chat(
+        text,
+        conversation_id=conversation_id,
+        channel=event.get("channel"),
+        user=event.get("user"),
+        slack_message_ts=event.get("ts"),
+    )
     say(text=_markdown_to_slack(reply), thread_ts=reply_thread_ts)
 
 
@@ -336,7 +342,13 @@ def handle_dm(event, say):
         lambda: _rehydrate_dm_history(event["channel"]),
     )
 
-    say(_markdown_to_slack(chat(text, conversation_id=conversation_id)))
+    say(_markdown_to_slack(chat(
+        text,
+        conversation_id=conversation_id,
+        channel=event.get("channel"),
+        user=event.get("user"),
+        slack_message_ts=event.get("ts"),
+    )))
 
 
 def main() -> None:

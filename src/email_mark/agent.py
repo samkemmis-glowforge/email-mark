@@ -51,6 +51,12 @@ from email_mark.slack_helpers import (
     lookup_user as slack_lookup_user,
     send_dm as slack_send_dm,
 )
+from email_mark.answer_cards import (
+    format_card_for_slack,
+    get_recent_cards,
+    record_card as _record_answer_card,
+    search_cards,
+)
 from email_mark.warehouse import (
     compute_email_revenue,
     count_inactive_users,
@@ -1544,6 +1550,35 @@ def _tool_create_icymi_draft(args: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _tool_show_recent_answer_cards(args: Dict[str, Any]) -> Dict[str, Any]:
+    limit = int(args.get("limit", 5))
+    channel = args.get("channel")
+    user = args.get("user")
+    cards = get_recent_cards(limit=limit, channel=channel, user=user)
+    return {
+        "count": len(cards),
+        "cards": [
+            format_card_for_slack(c, full=bool(args.get("full")))
+            for c in cards
+        ],
+    }
+
+
+def _tool_search_answer_cards(args: Dict[str, Any]) -> Dict[str, Any]:
+    needle = str(args["needle"])
+    limit = int(args.get("limit", 10))
+    channel = args.get("channel")
+    cards = search_cards(needle, limit=limit, channel=channel)
+    return {
+        "count": len(cards),
+        "needle": needle,
+        "cards": [
+            format_card_for_slack(c, full=bool(args.get("full")))
+            for c in cards
+        ],
+    }
+
+
 def _tool_create_email_draft_v2(args: Dict[str, Any]) -> Dict[str, Any]:
     return create_email_draft_v2(
         name=str(args["name"]),
@@ -2683,6 +2718,66 @@ TOOLS: List[Dict[str, Any]] = [
         },
     },
     {
+        "name": "show_recent_answer_cards",
+        "description": (
+            "Show the N most recent answer cards (your past responses) "
+            "for this channel. Use when the user asks 'what did you say "
+            "earlier', 'show me my last few answers', 'what was my last "
+            "response about revenue'. Returns the question, the tool "
+            "sequence you used, and your response for each.\n\n"
+            "Set full=true to include the FULL tool call args and outputs "
+            "(longer but lets the user audit exactly what you ran). "
+            "Default false shows just tool names + response previews."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "description": "How many recent cards to return. Default 5.",
+                },
+                "full": {
+                    "type": "boolean",
+                    "description": (
+                        "If true, include full tool args and outputs in each "
+                        "card. Use sparingly — long responses."
+                    ),
+                },
+            },
+        },
+    },
+    {
+        "name": "search_answer_cards",
+        "description": (
+            "Search past answer cards for ones whose question or response "
+            "contains a substring. Use when the user asks 'find my past "
+            "answers about X', 'show history for the Proofgrade revenue "
+            "question', 'when did I last answer about list 10273'. "
+            "Returns matching cards with question + tools used + response."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "needle": {
+                    "type": "string",
+                    "description": (
+                        "Substring to search for. Matches against both the "
+                        "user question and the response text."
+                    ),
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max matches to return. Default 10.",
+                },
+                "full": {
+                    "type": "boolean",
+                    "description": "Include full tool details. Default false.",
+                },
+            },
+            "required": ["needle"],
+        },
+    },
+    {
         "name": "create_email_draft_v2",
         "description": (
             "PREFERRED tool for creating a marketing email Mark designed "
@@ -2884,6 +2979,8 @@ TOOL_HANDLERS: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     "create_icymi_draft": _tool_create_icymi_draft,
     "create_email_draft": _tool_create_email_draft,
     "create_email_draft_v2": _tool_create_email_draft_v2,
+    "show_recent_answer_cards": _tool_show_recent_answer_cards,
+    "search_answer_cards": _tool_search_answer_cards,
     "update_email_draft_v2": _tool_update_email_draft_v2,
     "get_subscription_distribution": _tool_get_subscription_distribution,
     "count_inactive_users": _tool_count_inactive_users,
@@ -3007,12 +3104,20 @@ def chat(
     *,
     conversation_id: Optional[str] = None,
     system_prompt: str = SYSTEM_PROMPT,
+    channel: Optional[str] = None,
+    user: Optional[str] = None,
+    slack_message_ts: Optional[str] = None,
 ) -> str:
     """Run an agent loop until Claude produces a final text response.
 
     If conversation_id is provided, prior messages from that conversation
     are loaded as context, and the updated history is saved back at the end.
     Without conversation_id, every call is a fresh conversation.
+
+    channel / user / slack_message_ts are optional metadata used to build
+    the answer card written at the end of the response — they let us
+    scope retrieval by channel later (DM cards stay out of public channel
+    history).
     """
     client = _get_client()
 
@@ -3026,8 +3131,12 @@ def chat(
     messages.append({"role": "user", "content": user_message})
 
     chat_start = time.perf_counter()
+    chat_start_unix = time.time()  # for ISO timestamps in answer cards
     turn_count = 0
     tool_call_count = 0
+    # Audit trail of every tool call this turn — populated as we dispatch
+    # tools, then written to the answer card at the end.
+    tool_call_log: List[Dict[str, Any]] = []
 
     # ----- Prompt caching setup -----
     # The system prompt and tool definitions don't change between turns,
@@ -3135,7 +3244,18 @@ def chat(
             for block in response.content:
                 if getattr(block, "type", None) == "tool_use":
                     tool_call_count += 1
+                    tool_start = time.perf_counter()
                     result = _execute_tool(block.name, block.input)
+                    tool_elapsed = time.perf_counter() - tool_start
+                    # Audit trail — written to the answer card so we can
+                    # forensic-debug any future "wait why did Mark say X?"
+                    # without having to dump session state in chat.
+                    tool_call_log.append({
+                        "name": block.name,
+                        "input": block.input,
+                        "output": result,
+                        "elapsed_s": round(tool_elapsed, 3),
+                    })
                     tool_results.append(
                         {
                             "type": "tool_result",
@@ -3179,5 +3299,23 @@ def chat(
         if len(messages) > MAX_CONVERSATION_MESSAGES:
             messages = messages[-MAX_CONVERSATION_MESSAGES:]
         _conversations[conversation_id] = messages
+
+    # Record the answer card — full audit trail for forensic debugging
+    # and future eval corpus growth. Wrapped in try/except in
+    # answer_cards.record_card itself; do NOT let instrumentation break
+    # the user-facing return.
+    _record_answer_card(
+        user_message=user_message,
+        final_response=final_text or "(no response)",
+        tool_calls=tool_call_log,
+        turn_count=turn_count,
+        tool_call_count=tool_call_count,
+        started_at=chat_start_unix,
+        completed_at=time.time(),
+        channel=channel,
+        user=user,
+        conversation_id=conversation_id,
+        slack_message_ts=slack_message_ts,
+    )
 
     return final_text or "(no response)"

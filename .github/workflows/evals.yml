@@ -1,0 +1,49 @@
+name: Mark evals
+
+# Block deploys on regressions. Runs the eval harness against every push
+# to main and on every PR. Cases live in evals/cases.py — add new ones
+# when Mark surprises you in production.
+#
+# Uses the real Anthropic API (the whole point is to verify Claude's
+# behavior under our prompt + tool schemas), but patches all tool
+# handlers so no real HubSpot / BigQuery / Slack calls happen. Cost
+# ~$0.50/run at current case count.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  evals:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run Mark eval harness
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Tell the lessons loader to use the repo seed, not a persistent path.
+          LESSONS_FILE_PATH: ""
+          # Use an in-temp answer-cards db (the runner sets this too).
+          ANSWER_CARDS_DB_PATH: /tmp/eval-cards.db
+          # Bot tokens left unset — eval mocks tool handlers, no Slack
+          # calls happen at runtime. HUBSPOT_API_KEY also unset for the
+          # same reason. If a case fails because of a missing token, that
+          # means the production code is being called outside the mock
+          # path and needs investigation.
+          HUBSPOT_API_KEY: "stub-not-used-during-evals"
+        run: |
+          python -m evals.runner --verbose
