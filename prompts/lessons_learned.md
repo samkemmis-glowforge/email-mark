@@ -34,6 +34,41 @@ context to avoid the trap, not to teach the full topic.
   contacts or not.
   (Learned 2026-05-11)
 
+- HubSpot's `POST /crm/v3/objects/contacts/batch/update` SILENTLY
+  IGNORES writes to `hs_marketable_status`. The endpoint returns 200 OK,
+  the response often doesn't echo the field, and the property simply
+  doesn't change — no error, no warning, nothing in the contact's
+  property history. Casey's marketable status being "true" after a sync
+  run is NOT evidence the sync set it; she was probably already
+  marketing. The only reliable way to flip non-marketing to marketing
+  programmatically is a HubSpot Workflow with the dedicated "Set
+  marketing contact status" action. Our sync_materials_to_proofgrade
+  pattern is: script sets a custom property (e.g.
+  `proofgrade_marketing_opt_in = true`), a Workflow triggers on that
+  change and flips `hs_marketable_status` via the action. Don't try to
+  set `hs_marketable_status` directly from the API on this account.
+  (Learned 2026-06-11)
+
+## Shopify — opt-in semantics
+
+- Shopify has TWO distinct marketing opt-in signals on its data:
+  order-level and customer-level. `orders.buyer_accepts_marketing` is
+  a SNAPSHOT of what the customer ticked at checkout for that one
+  order, and never changes after the order is placed. The customer's
+  CURRENT subscription status lives at
+  `customers.email_marketing_consent.state` (values: `'subscribed'`,
+  `'not_subscribed'`, `'unsubscribed'`, `'pending'`). The older
+  `customers.accepts_marketing` boolean is deprecated and returns
+  NULL on Glowforge's current schema. For any "is this person opted
+  in to marketing right now" question, use
+  `customers.email_marketing_consent.state = 'subscribed'`. Using the
+  order-level flag misses people who subscribed via channels other
+  than checkout (newsletter signup, account preferences) AND can
+  include people who have since unsubscribed. The
+  sync_materials_to_proofgrade.py script's BQ query uses the
+  customer-level state for this reason.
+  (Learned 2026-06-11)
+
 ## HubSpot — billing levers
 
 - Marketing contact count is the dominant cost driver on Glowforge's

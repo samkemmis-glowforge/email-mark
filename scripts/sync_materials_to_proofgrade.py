@@ -80,18 +80,31 @@ PROPERTIES_TO_SET = {
 
 
 # Canonical SQL. Parameterized on lookback_days. DISTINCT + lowercase + trim
-# ensures we deduplicate emails on our side before hitting HubSpot. The
-# `buyer_accepts_marketing = TRUE` filter is strict — NULL counts as
-# "not opted in" and is excluded.
+# ensures we deduplicate emails on our side before hitting HubSpot.
+#
+# Opt-in semantics: we use CUSTOMER-LEVEL subscription state, not the
+# order-level `buyer_accepts_marketing` snapshot. The order-level field
+# reflects what the customer ticked at checkout — many customers
+# subscribe through other channels (newsletter signup, account
+# preferences) and their order records keep showing FALSE despite a
+# current SUBSCRIBED status. Using c.email_marketing_consent.state
+# catches everyone who is CURRENTLY opted in, regardless of how they
+# got there.
+#
+# Note: Shopify's older `c.accepts_marketing` boolean column is
+# deprecated and returns NULL on this schema; the truth lives in the
+# structured `c.email_marketing_consent` record.
 QUERY_SQL = """
 SELECT DISTINCT LOWER(TRIM(o.email)) AS email
 FROM `glowforge-dev.gf_shopify.orders` o,
      UNNEST(o.line_items) AS item
 JOIN `glowforge-dev.gf_shopify.products` p
   ON item.value.product_id = p.id
+JOIN `glowforge-dev.gf_shopify.customers` c
+  ON LOWER(TRIM(c.email)) = LOWER(TRIM(o.email))
 WHERE p.product_type = 'Material'
   AND o.financial_status = 'paid'
-  AND o.buyer_accepts_marketing = TRUE
+  AND c.email_marketing_consent.state = 'subscribed'
   AND o.created_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @lookback_days DAY)
   AND o.email IS NOT NULL
   AND TRIM(o.email) != ''
@@ -314,7 +327,7 @@ def main() -> int:
 
     LOG.info(
         "Querying eligible materials buyers (lookback %d days, "
-        "buyer_accepts_marketing=TRUE)...",
+        "customer-level email_marketing_consent.state='subscribed')...",
         args.lookback_days,
     )
     try:
