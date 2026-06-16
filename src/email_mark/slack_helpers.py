@@ -2,10 +2,15 @@
 
 Uses the same SLACK_BOT_TOKEN we already have in env. Requires the `users:read`
 scope, which the bot already has.
+
+For CSV file uploads (the `share_table` tool side-channel), additionally
+requires the `files:write` scope.
 """
 
 from __future__ import annotations
 
+import csv
+import io
 import os
 import time
 from typing import Any, Dict, List, Optional
@@ -100,3 +105,81 @@ def send_dm(user_id: str, text: str) -> Dict[str, Any]:
     channel = open_response["channel"]["id"]
     msg = client.chat_postMessage(channel=channel, text=text)
     return {"ok": msg.get("ok"), "channel": channel, "ts": msg.get("ts")}
+
+
+def upload_csv_to_thread(
+    *,
+    channel: str,
+    thread_ts: Optional[str],
+    headers: List[str],
+    rows: List[List[Any]],
+    filename: str,
+    initial_comment: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Upload a CSV file as a thread attachment in the given channel.
+
+    The CSV is built in-memory from headers + rows and uploaded via
+    Slack's files_upload_v2. Used by the `share_table` agent tool as a
+    side-channel for grid-shaped data — the file lands as a Slack
+    attachment (Slack renders its own scrollable preview + download
+    button), and the model's prose summary still posts through the
+    normal text path.
+
+    Requires the `files:write` scope on SLACK_BOT_TOKEN.
+
+    Returns {"ok": True, "file_id": ..., "permalink": ...} on success,
+    or {"ok": False, "error": "..."} on failure. Designed to NEVER
+    raise — the calling tool surfaces the error to the model so it can
+    report cleanly in chat.
+    """
+    if not filename.endswith(".csv"):
+        filename = f"{filename}.csv"
+
+    # Build the CSV in memory. csv.writer handles quoting/escaping
+    # correctly so cells with commas or newlines don't break the file.
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(headers)
+    for row in rows:
+        writer.writerow(["" if cell is None else cell for cell in row])
+    csv_content = buf.getvalue()
+
+    try:
+        client = _get_client()
+        # files_upload_v2 accepts either `file` (bytes/path) or `content`
+        # (string). We use content since the CSV is already in memory.
+        upload_kwargs: Dict[str, Any] = {
+            "channel": channel,
+            "content": csv_content,
+            "filename": filename,
+            "title": filename,
+        }
+        if thread_ts:
+            upload_kwargs["thread_ts"] = thread_ts
+        if initial_comment:
+            upload_kwargs["initial_comment"] = initial_comment
+
+        response = client.files_upload_v2(**upload_kwargs)
+        if not response.get("ok"):
+            return {
+                "ok": False,
+                "error": (
+                    response.get("error")
+                    or "files_upload_v2 returned ok=false with no error field"
+                ),
+            }
+        # Response shape: response['files'] is a list with one file dict.
+        files = response.get("files") or response.get("file") or []
+        if isinstance(files, dict):
+            files = [files]
+        first = files[0] if files else {}
+        return {
+            "ok": True,
+            "file_id": first.get("id"),
+            "permalink": first.get("permalink"),
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc}",
+        }

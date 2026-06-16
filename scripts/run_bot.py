@@ -307,6 +307,7 @@ def handle_mention(event, say):
         channel=event.get("channel"),
         user=event.get("user"),
         slack_message_ts=event.get("ts"),
+        thread_ts=reply_thread_ts,
     )
     say(text=_markdown_to_slack(reply), thread_ts=reply_thread_ts)
 
@@ -348,6 +349,9 @@ def handle_dm(event, say):
         channel=event.get("channel"),
         user=event.get("user"),
         slack_message_ts=event.get("ts"),
+        # DMs aren't threaded — pass None so share_table posts the CSV
+        # to the DM channel without a thread_ts.
+        thread_ts=None,
     )))
 
 

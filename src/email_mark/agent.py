@@ -51,12 +51,15 @@ from email_mark.slack_helpers import (
     lookup_user as slack_lookup_user,
     send_dm as slack_send_dm,
 )
+from contextvars import ContextVar
+
 from email_mark.answer_cards import (
     format_card_for_slack,
     get_recent_cards,
     record_card as _record_answer_card,
     search_cards,
 )
+from email_mark.slack_helpers import upload_csv_to_thread
 from email_mark.warehouse import (
     compute_email_revenue,
     count_inactive_users,
@@ -70,6 +73,13 @@ load_dotenv(find_dotenv())
 
 MODEL = "claude-sonnet-4-5"
 MAX_AGENT_TURNS = 25  # Hard cap so a runaway loop can't burn through tokens.
+
+# Per-turn Slack context for tools that need to know which channel/thread
+# they're operating in. Set at the start of chat() based on the Slack event
+# that triggered the turn; tools (currently just `share_table`) read these
+# to target file uploads at the right thread.
+_current_channel: ContextVar[Optional[str]] = ContextVar("_current_channel", default=None)
+_current_thread_ts: ContextVar[Optional[str]] = ContextVar("_current_thread_ts", default=None)
 HUBSPOT_PORTAL_ID = "8614495"  # Glowforge HubSpot portal — used for UI URLs.
 
 # Canonical ICYMI master template. Mark always clones this for the weekly
@@ -731,6 +741,25 @@ markers. Slack won't render `*bold*text` — it needs `*bold* text` or
 `*bold*\ntext`. Same for italic.
 
 Your training defaults to Markdown. Catch yourself.
+
+TABLES — never emit Markdown tables. Slack doesn't render `|---|---|`
+syntax; it shows raw pipes and dashes, which is ugly. For ANY
+grid-shaped result (multiple rows AND multiple columns), call the
+`share_table` tool — it uploads the data as a CSV file to the current
+thread, Slack renders its own clean preview + download button, and the
+data stays exact and copy-pasteable.
+
+When to call share_table: revenue-by-email lists, contact properties
+across multiple contacts, query results with several columns, side-by-
+side comparisons. Anything you'd naturally render as a table.
+
+When NOT to call share_table: single-column lists (use inline bullets),
+2-3 facts about 2-3 things (inline prose), single-row results (just
+write the sentence).
+
+After share_table uploads, your prose reply still gives the summary —
+"Found 14 contacts matching the filter, details attached as CSV." Don't
+repeat the table data in your prose; the file IS the data.
 
 You have tools to look up real data in HubSpot and to create draft emails.
 Use them rather than guessing. When a tool returns data, summarize in plain
@@ -1547,6 +1576,75 @@ def _tool_create_icymi_draft(args: Dict[str, Any]) -> Dict[str, Any]:
             f"https://app.hubspot.com/email/{HUBSPOT_PORTAL_ID}/edit/{new_id}/content"
         ),
         "body_update": body_result,
+    }
+
+
+def _tool_share_table(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Upload a grid-shaped dataset to the current Slack thread as a CSV.
+
+    Side-channel pattern: the file lands as a Slack attachment in the
+    thread, and Mark's prose summary still posts through the normal
+    text path. Returns a minimal confirmation to keep the model's
+    context lean — we don't echo the table data back at the LLM.
+    """
+    headers = args.get("headers") or []
+    rows = args.get("rows") or []
+    filename = (args.get("filename") or "").strip() or f"table-{int(time.time())}"
+    caption = args.get("caption")
+
+    if not isinstance(headers, list) or not headers:
+        return {"shared": False, "error": "headers required (non-empty list of column names)"}
+    if not isinstance(rows, list) or not rows:
+        return {"shared": False, "error": "rows required (non-empty list of row lists)"}
+    for i, row in enumerate(rows):
+        if not isinstance(row, list):
+            return {"shared": False, "error": f"row {i} is not a list"}
+        if len(row) != len(headers):
+            return {
+                "shared": False,
+                "error": (
+                    f"row {i} has {len(row)} cells but headers has "
+                    f"{len(headers)} columns — every row must match the "
+                    "header width."
+                ),
+            }
+
+    channel = _current_channel.get()
+    thread_ts = _current_thread_ts.get()
+    if not channel:
+        return {
+            "shared": False,
+            "error": (
+                "share_table needs a Slack channel context. This call "
+                "happened outside a Slack-handled message (e.g., the "
+                "scripts/test_agent.py CLI or an eval harness run), so "
+                "there's no thread to upload to. Surface the table as "
+                "inline text instead for this turn."
+            ),
+        }
+
+    result = upload_csv_to_thread(
+        channel=channel,
+        thread_ts=thread_ts,
+        headers=headers,
+        rows=rows,
+        filename=filename,
+        initial_comment=caption,
+    )
+
+    if not result.get("ok"):
+        return {
+            "shared": False,
+            "error": result.get("error") or "upload failed with no error message",
+        }
+
+    final_name = filename if filename.endswith(".csv") else f"{filename}.csv"
+    return {
+        "shared": True,
+        "filename": final_name,
+        "rows": len(rows),
+        "columns": len(headers),
+        "permalink": result.get("permalink"),
     }
 
 
@@ -2718,6 +2816,76 @@ TOOLS: List[Dict[str, Any]] = [
         },
     },
     {
+        "name": "share_table",
+        "description": (
+            "Upload a grid-shaped dataset to the current Slack thread "
+            "as a CSV file. Use this for ANY tabular result with "
+            "multiple rows AND multiple columns — never emit Markdown "
+            "tables in chat. Slack renders the CSV with its own "
+            "scrollable preview + download button, the data stays "
+            "exact and copy-pasteable, and the file doesn't bloat your "
+            "context (only a small confirmation comes back).\n\n"
+            "WHEN TO USE: anything that would naturally be displayed "
+            "as a table — list of emails with metrics, contacts with "
+            "properties, query results across multiple columns, "
+            "comparison data across categories.\n\n"
+            "WHEN NOT TO USE: a single column of values (use a bulleted "
+            "list inline). A handful of rows where you'd be sharing 2-3 "
+            "facts about 2-3 things (inline prose is clearer). Anything "
+            "that's really just a single sentence reshaped as a table.\n\n"
+            "PAIRING: this tool delivers the FILE. Your chat reply "
+            "still gives the prose summary — '14 contacts found, "
+            "details attached as CSV.' Don't repeat the table data in "
+            "your prose; the file IS the data."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "headers": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Column names, in left-to-right order. Required."
+                    ),
+                },
+                "rows": {
+                    "type": "array",
+                    "items": {
+                        "type": "array",
+                        "items": {},  # cells can be any scalar — handled by csv.writer
+                    },
+                    "description": (
+                        "Row data. Each row is a list of cells in the "
+                        "same order as headers. Every row must have "
+                        "the same length as headers."
+                    ),
+                },
+                "filename": {
+                    "type": "string",
+                    "description": (
+                        "Short slug for the CSV filename (e.g. "
+                        "'proofgrade-revenue-by-email', "
+                        "'engaged-contacts-2026-06-11'). Lowercase, "
+                        "hyphens, no spaces. The .csv extension is "
+                        "added automatically. Optional — defaults to "
+                        "a timestamped name."
+                    ),
+                },
+                "caption": {
+                    "type": "string",
+                    "description": (
+                        "Optional short text posted alongside the file "
+                        "as an initial comment (e.g. 'Revenue by "
+                        "Proofgrade email, last 30 days'). Keep it "
+                        "brief — the file's filename + your prose "
+                        "reply usually carry enough context."
+                    ),
+                },
+            },
+            "required": ["headers", "rows"],
+        },
+    },
+    {
         "name": "show_recent_answer_cards",
         "description": (
             "Show the N most recent answer cards (your past responses) "
@@ -2981,6 +3149,7 @@ TOOL_HANDLERS: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     "create_email_draft_v2": _tool_create_email_draft_v2,
     "show_recent_answer_cards": _tool_show_recent_answer_cards,
     "search_answer_cards": _tool_search_answer_cards,
+    "share_table": _tool_share_table,
     "update_email_draft_v2": _tool_update_email_draft_v2,
     "get_subscription_distribution": _tool_get_subscription_distribution,
     "count_inactive_users": _tool_count_inactive_users,
@@ -3107,6 +3276,7 @@ def chat(
     channel: Optional[str] = None,
     user: Optional[str] = None,
     slack_message_ts: Optional[str] = None,
+    thread_ts: Optional[str] = None,
 ) -> str:
     """Run an agent loop until Claude produces a final text response.
 
@@ -3114,10 +3284,43 @@ def chat(
     are loaded as context, and the updated history is saved back at the end.
     Without conversation_id, every call is a fresh conversation.
 
-    channel / user / slack_message_ts are optional metadata used to build
-    the answer card written at the end of the response — they let us
-    scope retrieval by channel later (DM cards stay out of public channel
-    history).
+    channel / user / slack_message_ts are metadata used to build the
+    answer card written at the end of the response.
+
+    channel / thread_ts are also set on per-turn contextvars so tools
+    like `share_table` can target the right Slack thread for file
+    uploads without needing channel/thread args plumbed through every
+    tool signature. thread_ts should be the thread root (event.thread_ts
+    if reply, event.ts if a new top-level mention).
+    """
+    # Bind per-turn Slack context for tools that need it (share_table).
+    channel_token = _current_channel.set(channel)
+    thread_ts_token = _current_thread_ts.set(thread_ts)
+    try:
+        return _chat_inner(
+            user_message,
+            conversation_id=conversation_id,
+            system_prompt=system_prompt,
+            channel=channel,
+            user=user,
+            slack_message_ts=slack_message_ts,
+        )
+    finally:
+        _current_channel.reset(channel_token)
+        _current_thread_ts.reset(thread_ts_token)
+
+
+def _chat_inner(
+    user_message: str,
+    *,
+    conversation_id: Optional[str] = None,
+    system_prompt: str = SYSTEM_PROMPT,
+    channel: Optional[str] = None,
+    user: Optional[str] = None,
+    slack_message_ts: Optional[str] = None,
+) -> str:
+    """Body of chat() — wrapped so the public chat() can set/reset
+    contextvars in a finally block. All real work happens here.
     """
     client = _get_client()
 
