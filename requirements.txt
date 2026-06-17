@@ -13,5 +13,11 @@ requests>=2.31.0
 # BigQuery warehouse access
 google-cloud-bigquery>=3.20.0
 
+# Google Sheets API — reads the social content calendar via a service account.
+# (Optional: the calendar reader falls back to the public CSV export when
+# these aren't installed / credentials aren't set.)
+google-api-python-client>=2.100.0
+google-auth>=2.30.0
+
 # Loads environment variables from .env
 python-dotenv>=1.0.0

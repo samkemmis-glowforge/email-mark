@@ -1,0 +1,50 @@
+name: Scheduled social post drafts
+
+# Drafts the upcoming week's social posts and drops them in the Slack review
+# channel. Runs Monday mornings; also runnable on demand. Draft-only — never
+# publishes to Meta.
+
+on:
+  schedule:
+    # 13:00 UTC Monday (~6am PT). Adjust to taste.
+    - cron: "0 13 * * 1"
+  workflow_dispatch:
+    inputs:
+      within_days:
+        description: "Look-ahead window in days"
+        required: false
+        default: "7"
+      dry_run:
+        description: "Print drafts instead of posting to Slack (true/false)"
+        required: false
+        default: "false"
+
+jobs:
+  draft:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: Draft upcoming posts
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_REVIEW_CHANNEL: ${{ secrets.SLACK_REVIEW_CHANNEL }}
+          CONTENT_CALENDAR_SHEET_ID: ${{ secrets.CONTENT_CALENDAR_SHEET_ID }}
+          CONTENT_CALENDAR_GID: ${{ secrets.CONTENT_CALENDAR_GID }}
+          # Optional: a Google service-account key for authenticated sheet reads.
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          if [ -n "$GOOGLE_SERVICE_ACCOUNT_JSON" ]; then
+            echo "$GOOGLE_SERVICE_ACCOUNT_JSON" > "$RUNNER_TEMP/gcp.json"
+            export GOOGLE_APPLICATION_CREDENTIALS="$RUNNER_TEMP/gcp.json"
+          fi
+          WITHIN="${{ github.event.inputs.within_days || '7' }}"
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            python scripts/run_scheduled_drafts.py --within-days "$WITHIN" --dry-run
+          else
+            python scripts/run_scheduled_drafts.py --within-days "$WITHIN"
+          fi

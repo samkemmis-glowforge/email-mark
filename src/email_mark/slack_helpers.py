@@ -107,6 +107,28 @@ def send_dm(user_id: str, text: str) -> Dict[str, Any]:
     return {"ok": msg.get("ok"), "channel": channel, "ts": msg.get("ts")}
 
 
+def post_message(channel: str, text: str) -> Dict[str, Any]:
+    """Post a message to a channel. Returns {ok, channel, ts}."""
+    msg = _get_client().chat_postMessage(channel=channel, text=text)
+    return {"ok": msg.get("ok"), "channel": msg.get("channel"), "ts": msg.get("ts")}
+
+
+def post_to_review_channel(text: str) -> Dict[str, Any]:
+    """Post a social post-draft into the configured review channel.
+
+    Channel comes from SLACK_REVIEW_CHANNEL. Returns {ok, error?} so callers
+    (the scheduled-drafts job, the post_draft_to_review_channel tool) can
+    report cleanly. Never raises.
+    """
+    channel = os.environ.get("SLACK_REVIEW_CHANNEL", "").strip()
+    if not channel:
+        return {"ok": False, "error": "SLACK_REVIEW_CHANNEL not set"}
+    try:
+        return post_message(channel, text)
+    except Exception as exc:  # noqa: BLE001 — surface, don't crash the caller
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
 def upload_csv_to_thread(
     *,
     channel: str,

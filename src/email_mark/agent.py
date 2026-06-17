@@ -20,6 +20,7 @@ from anthropic import Anthropic
 from dotenv import find_dotenv, load_dotenv
 
 from email_mark.forum import fetch_forum_post
+from email_mark import content_calendar, meta_client
 from email_mark.hubspot_crm import (
     list_contact_properties,
     search_contacts,
@@ -49,6 +50,7 @@ from email_mark.hubspot_marketing import (
 )
 from email_mark.slack_helpers import (
     lookup_user as slack_lookup_user,
+    post_to_review_channel,
     send_dm as slack_send_dm,
 )
 from contextvars import ContextVar
@@ -154,6 +156,35 @@ def _brand_voice_section() -> str:
     return (
         "\n\nBrand voice and tone — apply these to ALL drafted email content:\n\n"
         + _BRAND_VOICE
+    )
+
+
+# ---------------------------------------------------------------------------
+# Social playbook loading: an optional file at prompts/social_playbook.md gets
+# injected into the system prompt at startup. Platform formats, caption
+# structure, posting cadence, and the review workflow for organic social.
+# ---------------------------------------------------------------------------
+
+
+def _load_social_playbook() -> str:
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    playbook_file = repo_root / "prompts" / "social_playbook.md"
+    if not playbook_file.exists():
+        return ""
+    return playbook_file.read_text().strip()
+
+
+_SOCIAL_PLAYBOOK = _load_social_playbook()
+
+
+def _social_playbook_section() -> str:
+    if not _SOCIAL_PLAYBOOK:
+        return ""
+    return (
+        "\n\nSOCIAL PLAYBOOK — platform formats, caption structure, cadence "
+        "rules, and the review workflow. Consult before drafting any social "
+        "post.\n\n"
+        + _SOCIAL_PLAYBOOK
     )
 
 
@@ -1269,9 +1300,41 @@ useful.
 
 If you're ever unsure whether something is sensitive, default to NOT
 sharing it and ask the user to confirm whether the request is appropriate.
+
+SOCIAL MEDIA — drafting scheduled posts and reporting on Meta performance:
+Beyond email, you also run Glowforge's organic social on Meta (Facebook +
+Instagram). Two jobs:
+
+1. DRAFT SCHEDULED POSTS. The content calendar (a Google Sheet) defines what
+   to post and when — social posts go out Mondays and Fridays. Use
+   get_upcoming_social_posts to see what's due; each row carries the date,
+   theme, caption angle, audience focus, product focus, and Drive asset
+   link(s). Draft each caption in the slightly-more-casual, fun Glowforge
+   social voice (see the SOCIAL PLAYBOOK and BRAND VOICE) — lead with the
+   maker/creativity, then the project, then Glowforge; use the approved
+   hashtags (#laserthursday #whatmadethis #glowforge) only when they fit;
+   avoid "fire/burns", "users", and "the Glowforge". Show the draft in chat
+   first for review (caption, platform(s), date, asset link), iterate, then
+   on approval call post_draft_to_review_channel to hand it to the team's
+   review channel. You do NOT publish — a human posts.
+
+2. REPORT ON PERFORMANCE. Use get_facebook_page_insights /
+   get_instagram_insights for organic reach/impressions/engagement/follower
+   trends, get_recent_posts for per-post engagement, and get_ad_performance
+   for paid-social spend/results. Summarize plainly; route grid-shaped
+   breakdowns through share_table. Default to the trailing 28 days unless
+   asked otherwise, and state the window. Never invent figures — if a Meta
+   tool errors, say so.
+
+PUBLISHING is OFF by default (draft-only). The publish_to_meta tool is gated
+behind SOCIAL_MARK_ALLOW_PUBLISH and will refuse unless an admin enabled it;
+don't claim a post went live. The Email/ICYMI rows in the calendar are your
+email job (handled elsewhere in this prompt); the Social rows are the ones
+you draft as posts.
 """
     + _brand_voice_section()
     + _email_design_references_section()
+    + _social_playbook_section()
     + _lessons_section()
 )
 
@@ -1458,6 +1521,91 @@ def _tool_lookup_slack_user(args: Dict[str, Any]) -> Dict[str, Any]:
 
 def _tool_send_slack_dm(args: Dict[str, Any]) -> Dict[str, Any]:
     return slack_send_dm(str(args["user_id"]), str(args["text"]))
+
+
+# ---------------------------------------------------------------------------
+# Social media tools (Meta + content calendar). Draft-only: posts go to Slack
+# for review; publishing is gated behind SOCIAL_MARK_ALLOW_PUBLISH.
+# ---------------------------------------------------------------------------
+
+
+def _tool_get_upcoming_social_posts(args: Dict[str, Any]) -> Dict[str, Any]:
+    within = int(args.get("within_days", 10))
+    rows = content_calendar.get_upcoming_social_posts(within_days=within)
+    return {"count": len(rows), "posts": [r.to_dict() for r in rows]}
+
+
+def _tool_post_draft_to_review_channel(args: Dict[str, Any]) -> Dict[str, Any]:
+    caption = str(args.get("caption", "")).strip()
+    if not caption:
+        return {"error": "caption is required."}
+    platform = str(args.get("platform", "Facebook + Instagram"))
+    post_date = str(args.get("post_date", "")).strip()
+    asset_link = str(args.get("asset_link", "")).strip()
+    theme = str(args.get("theme", "")).strip()
+
+    meta_line = " · ".join(
+        p for p in [post_date or None, platform or None, theme or None] if p
+    )
+    parts = [":calendar: *Post draft for review*"]
+    if meta_line:
+        parts.append(meta_line)
+    parts.append("")
+    parts.append(caption)
+    if asset_link:
+        parts.append("")
+        parts.append(f"*Asset:* {asset_link}")
+    parts.append("")
+    parts.append("_Review, tweak, and post manually. React :white_check_mark: when posted._")
+    return post_to_review_channel("\n".join(parts))
+
+
+def _tool_get_facebook_page_insights(args: Dict[str, Any]) -> Dict[str, Any]:
+    return meta_client.get_page_insights(
+        metrics=args.get("metrics"),
+        since=args.get("since"),
+        until=args.get("until"),
+        period=args.get("period", "day"),
+    )
+
+
+def _tool_get_instagram_insights(args: Dict[str, Any]) -> Dict[str, Any]:
+    return meta_client.get_instagram_insights(
+        metrics=args.get("metrics"),
+        since=args.get("since"),
+        until=args.get("until"),
+        period=args.get("period", "day"),
+    )
+
+
+def _tool_get_recent_social_posts(args: Dict[str, Any]) -> Dict[str, Any]:
+    return meta_client.get_recent_posts(
+        platform=str(args.get("platform", "facebook")),
+        limit=int(args.get("limit", 10)),
+    )
+
+
+def _tool_get_ad_performance(args: Dict[str, Any]) -> Dict[str, Any]:
+    return meta_client.get_ad_performance(
+        fields=args.get("fields"),
+        date_preset=str(args.get("date_preset", "last_28d")),
+        level=str(args.get("level", "campaign")),
+    )
+
+
+def _tool_publish_to_meta(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Gated. Refuses unless SOCIAL_MARK_ALLOW_PUBLISH is explicitly on."""
+    platform = str(args.get("platform", "facebook")).lower()
+    caption = str(args.get("caption", ""))
+    image_url = args.get("image_url") or None
+    try:
+        if platform == "instagram":
+            if not image_url:
+                return {"error": "Instagram requires image_url."}
+            return meta_client.publish_instagram_post(image_url=image_url, caption=caption)
+        return meta_client.publish_facebook_post(message=caption, image_url=image_url)
+    except meta_client.MetaError as exc:
+        return {"error": str(exc)}
 
 
 def _tool_get_subscription_distribution(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -3125,6 +3273,133 @@ TOOLS: List[Dict[str, Any]] = [
             "required": ["template_email_id", "draft_name", "subject", "body_text"],
         },
     },
+    {
+        "name": "get_upcoming_social_posts",
+        "description": (
+            "Read the content calendar and return upcoming SOCIAL posts "
+            "(Email/ICYMI rows are excluded — those are your email job). Each "
+            "post has the scheduled date, day, theme, caption angle, audience "
+            "focus, product focus, and Google Drive asset link(s). Use this to "
+            "see what's due before drafting social posts."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "within_days": {
+                    "type": "integer",
+                    "description": "Look-ahead window from today, in days. Default 10.",
+                }
+            },
+        },
+    },
+    {
+        "name": "post_draft_to_review_channel",
+        "description": (
+            "Send a FINALIZED social post draft to the team's Slack review "
+            "channel (SLACK_REVIEW_CHANNEL), where the person who publishes "
+            "picks it up. Call ONLY after the user has reviewed and approved "
+            "the caption in chat. You do not publish to Meta — this is the "
+            "handoff."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "caption": {"type": "string", "description": "The approved caption copy."},
+                "platform": {
+                    "type": "string",
+                    "description": "Target platform(s), e.g. 'Instagram' or 'Facebook + Instagram'.",
+                },
+                "post_date": {"type": "string", "description": "Scheduled date, e.g. 'Mon Jun 22'."},
+                "asset_link": {"type": "string", "description": "Drive link to the image/video asset."},
+                "theme": {"type": "string", "description": "Short theme label from the calendar row."},
+            },
+            "required": ["caption"],
+        },
+    },
+    {
+        "name": "get_facebook_page_insights",
+        "description": (
+            "Facebook Page organic insights (impressions, reach, post "
+            "engagements, fans, views) over a date range. Dates are "
+            "YYYY-MM-DD; default is the trailing 28 days. Pass custom "
+            "`metrics` only if you know the Graph API metric names."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "metrics": {"type": "array", "items": {"type": "string"}},
+                "since": {"type": "string"},
+                "until": {"type": "string"},
+                "period": {"type": "string", "description": "day | week | days_28. Default day."},
+            },
+        },
+    },
+    {
+        "name": "get_instagram_insights",
+        "description": (
+            "Instagram Business account insights (reach, impressions, profile "
+            "views, follower count) over a date range. Dates YYYY-MM-DD; "
+            "default trailing 28 days."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "metrics": {"type": "array", "items": {"type": "string"}},
+                "since": {"type": "string"},
+                "until": {"type": "string"},
+                "period": {"type": "string"},
+            },
+        },
+    },
+    {
+        "name": "get_recent_social_posts",
+        "description": (
+            "Recent organic posts with per-post engagement, to see which "
+            "content resonated. platform: 'facebook' (Page feed) or "
+            "'instagram' (IG media)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "platform": {"type": "string", "description": "facebook | instagram. Default facebook."},
+                "limit": {"type": "integer", "description": "How many posts. Default 10."},
+            },
+        },
+    },
+    {
+        "name": "get_ad_performance",
+        "description": (
+            "Paid-social performance from the Meta Ad account (spend, "
+            "impressions, reach, clicks, CPC, CTR, actions). date_preset like "
+            "'last_7d', 'last_28d', 'last_30d'; level 'campaign' | 'adset' | 'ad'."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "fields": {"type": "array", "items": {"type": "string"}},
+                "date_preset": {"type": "string"},
+                "level": {"type": "string"},
+            },
+        },
+    },
+    {
+        "name": "publish_to_meta",
+        "description": (
+            "GATED — publishing is disabled by default (draft-only). Refuses "
+            "unless an admin has set SOCIAL_MARK_ALLOW_PUBLISH=true. Don't "
+            "call it expecting a post to go live; use "
+            "post_draft_to_review_channel for the human-review handoff."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "platform": {"type": "string", "description": "facebook | instagram."},
+                "caption": {"type": "string"},
+                "image_url": {"type": "string", "description": "Required for Instagram."},
+            },
+            "required": ["platform", "caption"],
+        },
+    },
 ]
 
 TOOL_HANDLERS: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
@@ -3164,6 +3439,13 @@ TOOL_HANDLERS: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     "list_contact_properties": _tool_list_contact_properties,
     "lookup_slack_user": _tool_lookup_slack_user,
     "send_slack_dm": _tool_send_slack_dm,
+    "get_upcoming_social_posts": _tool_get_upcoming_social_posts,
+    "post_draft_to_review_channel": _tool_post_draft_to_review_channel,
+    "get_facebook_page_insights": _tool_get_facebook_page_insights,
+    "get_instagram_insights": _tool_get_instagram_insights,
+    "get_recent_social_posts": _tool_get_recent_social_posts,
+    "get_ad_performance": _tool_get_ad_performance,
+    "publish_to_meta": _tool_publish_to_meta,
 }
 
 
