@@ -110,12 +110,18 @@ def get_page_insights(
     (YYYY-MM-DD); default is the trailing 28 days.
     """
     page_id = _require("META_PAGE_ID", "read Facebook Page insights")
+    # Late-2025 Meta purge killed `page_impressions*`, `page_fans`,
+    # `page_views_total`, `page_fan_adds`, `page_consumptions`. These four
+    # are the empirically-confirmed survivors as of v21.0. Also note:
+    # Page Insights REQUIRE a Page Access Token (not a System User token).
+    # Generate via GET /me/accounts with your system user token; the
+    # `access_token` field in the response for your Page is what goes
+    # in META_ACCESS_TOKEN.
     metrics = metrics or [
-        "page_impressions",
-        "page_impressions_unique",
         "page_post_engagements",
-        "page_fans",
-        "page_views_total",
+        "page_video_views",
+        "page_actions_post_reactions_total",
+        "page_total_actions",
     ]
     until = until or date.today().isoformat()
     since = since or (date.today() - timedelta(days=28)).isoformat()
@@ -135,7 +141,11 @@ def get_instagram_insights(
 ) -> Dict[str, Any]:
     """Instagram Business account insights over a date range."""
     ig_id = _require("META_IG_USER_ID", "read Instagram insights")
-    metrics = metrics or ["reach", "impressions", "profile_views", "follower_count"]
+    # `impressions` was deprecated for IG account-level insights; `views` is
+    # the current account-level equivalent. The rest are stable. Other valid
+    # metrics include accounts_engaged / total_interactions, but those require
+    # an extra `metric_type=total_value` param — keep them out of defaults.
+    metrics = metrics or ["reach", "views", "profile_views", "follower_count"]
     until = until or date.today().isoformat()
     since = since or (date.today() - timedelta(days=28)).isoformat()
     data = _get(
