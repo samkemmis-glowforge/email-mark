@@ -132,6 +132,31 @@ def get_page_insights(
     return {"since": since, "until": until, "metrics": data.get("data", [])}
 
 
+# IG splits account-level metrics into two families that CAN'T be combined
+# in one API call:
+#   - Time series: one value per day, called with just `period=day`.
+#       reach, follower_count.
+#   - Total value: one rollup for the date range, requires
+#       `metric_type=total_value`. views, profile_views, accounts_engaged,
+#       total_interactions, likes, comments, shares, saves, replies,
+#       website_clicks, profile_links_taps.
+# get_instagram_insights() routes its metrics into both calls and merges
+# the responses so the caller gets one unified result.
+_IG_TOTAL_VALUE_METRICS = {
+    "views",
+    "profile_views",
+    "accounts_engaged",
+    "total_interactions",
+    "likes",
+    "comments",
+    "shares",
+    "saves",
+    "replies",
+    "website_clicks",
+    "profile_links_taps",
+}
+
+
 def get_instagram_insights(
     *,
     metrics: Optional[List[str]] = None,
@@ -139,20 +164,52 @@ def get_instagram_insights(
     until: Optional[str] = None,
     period: str = "day",
 ) -> Dict[str, Any]:
-    """Instagram Business account insights over a date range."""
+    """Instagram Business account insights over a date range.
+
+    Auto-splits requested metrics into time-series vs total-value calls so
+    callers can mix the two families without worrying about Meta's split.
+    """
     ig_id = _require("META_IG_USER_ID", "read Instagram insights")
-    # `impressions` was deprecated for IG account-level insights; `views` is
-    # the current account-level equivalent. The rest are stable. Other valid
-    # metrics include accounts_engaged / total_interactions, but those require
-    # an extra `metric_type=total_value` param — keep them out of defaults.
-    metrics = metrics or ["reach", "views", "profile_views", "follower_count"]
+    metrics = metrics or [
+        "reach",
+        "follower_count",
+        "views",
+        "profile_views",
+        "accounts_engaged",
+        "total_interactions",
+    ]
     until = until or date.today().isoformat()
     since = since or (date.today() - timedelta(days=28)).isoformat()
-    data = _get(
-        f"{ig_id}/insights",
-        {"metric": ",".join(metrics), "since": since, "until": until, "period": period},
-    )
-    return {"since": since, "until": until, "metrics": data.get("data", [])}
+
+    ts_metrics = [m for m in metrics if m not in _IG_TOTAL_VALUE_METRICS]
+    tv_metrics = [m for m in metrics if m in _IG_TOTAL_VALUE_METRICS]
+
+    combined: List[Any] = []
+    if ts_metrics:
+        ts = _get(
+            f"{ig_id}/insights",
+            {
+                "metric": ",".join(ts_metrics),
+                "since": since,
+                "until": until,
+                "period": period,
+            },
+        )
+        combined.extend(ts.get("data", []))
+    if tv_metrics:
+        tv = _get(
+            f"{ig_id}/insights",
+            {
+                "metric": ",".join(tv_metrics),
+                "since": since,
+                "until": until,
+                "period": period,
+                "metric_type": "total_value",
+            },
+        )
+        combined.extend(tv.get("data", []))
+
+    return {"since": since, "until": until, "metrics": combined}
 
 
 def get_recent_posts(*, platform: str = "facebook", limit: int = 10) -> Dict[str, Any]:
