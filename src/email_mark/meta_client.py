@@ -288,6 +288,38 @@ def publish_facebook_post(
     return _post(f"{page_id}/feed", {"message": message})
 
 
+def draft_facebook_post(
+    *,
+    message: str,
+    image_url: Optional[str] = None,
+    scheduled_publish_time: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Create an UNPUBLISHED (draft) post on the Facebook Page.
+
+    The draft appears in Meta Business Suite → Planner → Drafts, ready for a
+    human to review, edit, and publish manually. Unlike publish_facebook_post,
+    this is NOT gated by SOCIAL_MARK_ALLOW_PUBLISH because drafts are inert
+    until a human clicks Publish in MBS — the human is the safety gate.
+
+    If `scheduled_publish_time` (unix timestamp, must be 10 minutes to 6
+    months in the future) is provided, the post is scheduled to auto-publish
+    instead of left as a pure draft. Scheduled posts also appear in MBS,
+    under Planner → Scheduled.
+
+    Returns the Graph response, which includes the new post's `id`.
+    """
+    page_id = _require("META_PAGE_ID", "draft to the Facebook Page")
+    params: Dict[str, Any] = {"published": "false"}
+    if scheduled_publish_time is not None:
+        params["scheduled_publish_time"] = scheduled_publish_time
+    if image_url:
+        params["caption"] = message
+        params["url"] = image_url
+        return _post(f"{page_id}/photos", params)
+    params["message"] = message
+    return _post(f"{page_id}/feed", params)
+
+
 def publish_instagram_post(*, image_url: str, caption: str) -> Dict[str, Any]:
     """Publish an image + caption to Instagram (create container, then publish)."""
     _guard_publish()

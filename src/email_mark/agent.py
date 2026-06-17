@@ -1309,14 +1309,32 @@ Instagram). Two jobs:
    to post and when — social posts go out Mondays and Fridays. Use
    get_upcoming_social_posts to see what's due; each row carries the date,
    theme, caption angle, audience focus, product focus, and Drive asset
-   link(s). Draft each caption in the slightly-more-casual, fun Glowforge
-   social voice (see the SOCIAL PLAYBOOK and BRAND VOICE) — lead with the
-   maker/creativity, then the project, then Glowforge; use the approved
-   hashtags (#laserthursday #whatmadethis #glowforge) only when they fit;
-   avoid "fire/burns", "users", and "the Glowforge". Show the draft in chat
-   first for review (caption, platform(s), date, asset link), iterate, then
-   on approval call post_draft_to_review_channel to hand it to the team's
-   review channel. You do NOT publish — a human posts.
+   link(s). For each row, COMPOSE the actual caption text in the slightly-
+   more-casual, fun Glowforge social voice (see the SOCIAL PLAYBOOK and
+   BRAND VOICE) — lead with the maker/creativity, then the project, then
+   Glowforge; use the approved hashtags (#laserthursday #whatmadethis
+   #glowforge) only when they fit; avoid "fire/burns", "users", and "the
+   Glowforge".
+
+   HANDOFF — three paths, pick the right one:
+   (a) FACEBOOK: default to calling draft_facebook_post with the composed
+       caption (and image_url if the calendar row has a usable public link).
+       This creates a NATIVE draft in Meta Business Suite → Planner →
+       Drafts, the same UX as drafting an email in HubSpot — Sam reviews,
+       edits, and publishes there. Same pattern as create_email_draft_v2
+       for emails.
+   (b) INSTAGRAM: there's no native IG draft API, so call
+       post_draft_to_review_channel with the composed IG caption so a human
+       can paste it into IG Business Suite. Note in your reply that IG
+       can't be drafted directly via API.
+   (c) DISCUSSION-FIRST: if the user wants to review captions in Slack
+       before they touch MBS at all, use post_draft_to_review_channel for
+       both platforms — keeps the conversation in chat.
+
+   For (a) and (b), you can either show the caption in chat first for
+   approval then call the tool, or batch-draft multiple rows at once when
+   the user clearly asks for the week's worth. You do NOT publish — a
+   human always reviews and clicks Publish.
 
 2. REPORT ON PERFORMANCE. Use get_facebook_page_insights /
    get_instagram_insights for organic reach/impressions/engagement/follower
@@ -1606,6 +1624,36 @@ def _tool_publish_to_meta(args: Dict[str, Any]) -> Dict[str, Any]:
         return meta_client.publish_facebook_post(message=caption, image_url=image_url)
     except meta_client.MetaError as exc:
         return {"error": str(exc)}
+
+
+def _tool_draft_facebook_post(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Create a native FB draft in Meta Business Suite — NOT gated.
+
+    Drafts don't go live until a human clicks Publish in MBS, so the safety
+    gate that wraps publish_to_meta doesn't apply here.
+    """
+    caption = str(args.get("caption", "")).strip()
+    if not caption:
+        return {"error": "caption is required."}
+    image_url = args.get("image_url") or None
+    scheduled_ts = args.get("scheduled_publish_time")
+    try:
+        result = meta_client.draft_facebook_post(
+            message=caption,
+            image_url=image_url,
+            scheduled_publish_time=int(scheduled_ts) if scheduled_ts else None,
+        )
+    except meta_client.MetaError as exc:
+        return {"error": str(exc)}
+    return {
+        "ok": True,
+        "draft_id": result.get("id") or result.get("post_id"),
+        "review_url": "https://business.facebook.com/latest/posts/drafts",
+        "note": (
+            "Draft is in Meta Business Suite → Planner → Drafts. Open the "
+            "review URL to edit or publish."
+        ),
+    }
 
 
 def _tool_get_subscription_distribution(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -3400,6 +3448,51 @@ TOOLS: List[Dict[str, Any]] = [
             "required": ["platform", "caption"],
         },
     },
+    {
+        "name": "draft_facebook_post",
+        "description": (
+            "Create a NATIVE Facebook draft in Meta Business Suite — the "
+            "same UX as drafting an email in HubSpot. The draft lands in "
+            "MBS → Planner → Drafts where a human reviews, edits, and "
+            "publishes. NOT gated by SOCIAL_MARK_ALLOW_PUBLISH because "
+            "drafts are inert until a human clicks Publish. This is the "
+            "PREFERRED way to hand off a finalized FB caption — use it "
+            "instead of post_draft_to_review_channel for Facebook posts. "
+            "Slack-channel handoff still makes sense for Instagram (no "
+            "first-class IG draft API) or for posts the team wants to "
+            "discuss before they live in MBS."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "caption": {
+                    "type": "string",
+                    "description": (
+                        "Composed Facebook caption text in Glowforge social "
+                        "voice — ready to publish. 1-3 short sentences, "
+                        "approved hashtags only."
+                    ),
+                },
+                "image_url": {
+                    "type": "string",
+                    "description": (
+                        "Optional public URL of an image to attach. If "
+                        "omitted, the draft is text-only."
+                    ),
+                },
+                "scheduled_publish_time": {
+                    "type": "integer",
+                    "description": (
+                        "Optional unix timestamp (seconds) to schedule the "
+                        "post for auto-publish. Must be 10 minutes to 6 "
+                        "months in the future. Omit for pure draft (no "
+                        "auto-publish until a human clicks Publish)."
+                    ),
+                },
+            },
+            "required": ["caption"],
+        },
+    },
 ]
 
 TOOL_HANDLERS: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
@@ -3446,6 +3539,7 @@ TOOL_HANDLERS: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     "get_recent_social_posts": _tool_get_recent_social_posts,
     "get_ad_performance": _tool_get_ad_performance,
     "publish_to_meta": _tool_publish_to_meta,
+    "draft_facebook_post": _tool_draft_facebook_post,
 }
 
 
