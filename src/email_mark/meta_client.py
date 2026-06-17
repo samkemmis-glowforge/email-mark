@@ -294,30 +294,46 @@ def draft_facebook_post(
     image_url: Optional[str] = None,
     scheduled_publish_time: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Create an UNPUBLISHED (draft) post on the Facebook Page.
+    """Create a SCHEDULED post on the Facebook Page (the working "draft" UX).
 
-    The draft appears in Meta Business Suite → Planner → Drafts, ready for a
-    human to review, edit, and publish manually. Unlike publish_facebook_post,
-    this is NOT gated by SOCIAL_MARK_ALLOW_PUBLISH because drafts are inert
-    until a human clicks Publish in MBS — the human is the safety gate.
+    Pure unpublished posts (published=false alone) exist in the API but are
+    INVISIBLE in the modern MBS Planner UI — Meta only shows API-scheduled
+    posts in the human-facing surfaces. So this function defaults to
+    scheduling the post 24h from creation, which gives the same UX as a
+    HubSpot draft: it appears in MBS → Planner → Scheduled where a human
+    can review, edit the caption, change the time, or delete it before it
+    fires. If 24h passes without intervention, the post goes live — which
+    is generally the desired outcome for a calendar-driven cadence.
 
-    If `scheduled_publish_time` (unix timestamp, must be 10 minutes to 6
-    months in the future) is provided, the post is scheduled to auto-publish
-    instead of left as a pure draft. Scheduled posts also appear in MBS,
-    under Planner → Scheduled.
+    Caller can override by passing `scheduled_publish_time` (unix seconds,
+    must be 10 min to 6 months in the future). For example, Mark batching
+    from the content calendar should pass each row's target publish time.
 
-    Returns the Graph response, which includes the new post's `id`.
+    NOT gated by SOCIAL_MARK_ALLOW_PUBLISH because the human reviews in MBS
+    before the scheduled time fires — MBS is the safety gate.
+
+    Returns the Graph response (includes the new post `id`) plus the
+    `scheduled_publish_time` actually used (added by this function so the
+    caller can surface a human-readable "scheduled for X" message).
     """
+    import time as _time
+
     page_id = _require("META_PAGE_ID", "draft to the Facebook Page")
-    params: Dict[str, Any] = {"published": "false"}
-    if scheduled_publish_time is not None:
-        params["scheduled_publish_time"] = scheduled_publish_time
+    if scheduled_publish_time is None:
+        scheduled_publish_time = int(_time.time()) + 24 * 3600
+    params: Dict[str, Any] = {
+        "published": "false",
+        "scheduled_publish_time": scheduled_publish_time,
+    }
     if image_url:
         params["caption"] = message
         params["url"] = image_url
-        return _post(f"{page_id}/photos", params)
-    params["message"] = message
-    return _post(f"{page_id}/feed", params)
+        result = _post(f"{page_id}/photos", params)
+    else:
+        params["message"] = message
+        result = _post(f"{page_id}/feed", params)
+    result["scheduled_publish_time"] = scheduled_publish_time
+    return result
 
 
 def publish_instagram_post(*, image_url: str, caption: str) -> Dict[str, Any]:

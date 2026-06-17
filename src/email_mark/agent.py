@@ -1319,10 +1319,15 @@ Instagram). Two jobs:
    HANDOFF — three paths, pick the right one:
    (a) FACEBOOK: default to calling draft_facebook_post with the composed
        caption (and image_url if the calendar row has a usable public link).
-       This creates a NATIVE draft in Meta Business Suite → Planner →
-       Drafts, the same UX as drafting an email in HubSpot — Sam reviews,
-       edits, and publishes there. Same pattern as create_email_draft_v2
-       for emails.
+       This creates a SCHEDULED post in Meta Business Suite → Planner →
+       Scheduled — same review UX as a HubSpot email draft. (Pure
+       unpublished drafts via API don't show in MBS UI; scheduling is the
+       workaround that gives the human a visible, editable artifact.) When
+       you know the target publish time from the calendar row, pass it as
+       scheduled_publish_time (unix seconds) — e.g., calendar says "Fri Jun
+       19" → schedule for that Friday at 9am PT. If no specific date is
+       given, omit the param and it defaults to 24h from now, which gives
+       the team a day to review/edit/cancel in MBS.
    (b) INSTAGRAM: there's no native IG draft API, so call
        post_draft_to_review_channel with the composed IG caption so a human
        can paste it into IG Business Suite. Note in your reply that IG
@@ -1627,11 +1632,15 @@ def _tool_publish_to_meta(args: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _tool_draft_facebook_post(args: Dict[str, Any]) -> Dict[str, Any]:
-    """Create a native FB draft in Meta Business Suite — NOT gated.
+    """Create a scheduled FB post in Meta Business Suite — NOT gated.
 
-    Drafts don't go live until a human clicks Publish in MBS, so the safety
-    gate that wraps publish_to_meta doesn't apply here.
+    Defaults to scheduling 24h from now. Caller (Mark) can override with an
+    explicit unix timestamp. Scheduled posts appear in MBS → Planner →
+    Scheduled, fully editable until they fire. The human reviewing in MBS
+    is the safety gate, so SOCIAL_MARK_ALLOW_PUBLISH does not apply.
     """
+    from datetime import datetime, timezone
+
     caption = str(args.get("caption", "")).strip()
     if not caption:
         return {"error": "caption is required."}
@@ -1645,13 +1654,22 @@ def _tool_draft_facebook_post(args: Dict[str, Any]) -> Dict[str, Any]:
         )
     except meta_client.MetaError as exc:
         return {"error": str(exc)}
+
+    fire_ts = result.get("scheduled_publish_time")
+    fire_human = (
+        datetime.fromtimestamp(fire_ts, tz=timezone.utc).strftime("%a %b %d %Y %H:%M UTC")
+        if fire_ts else None
+    )
     return {
         "ok": True,
-        "draft_id": result.get("id") or result.get("post_id"),
-        "review_url": "https://business.facebook.com/latest/posts/drafts",
+        "post_id": result.get("id") or result.get("post_id"),
+        "scheduled_for": fire_human,
+        "review_url": "https://business.facebook.com/latest/posts/scheduled_posts",
         "note": (
-            "Draft is in Meta Business Suite → Planner → Drafts. Open the "
-            "review URL to edit or publish."
+            "Scheduled in Meta Business Suite → Planner → Scheduled. The "
+            "human can edit the caption, change the time, or delete it "
+            "before it fires. If untouched it auto-publishes at the "
+            "scheduled time."
         ),
     }
 
@@ -3451,16 +3469,20 @@ TOOLS: List[Dict[str, Any]] = [
     {
         "name": "draft_facebook_post",
         "description": (
-            "Create a NATIVE Facebook draft in Meta Business Suite — the "
-            "same UX as drafting an email in HubSpot. The draft lands in "
-            "MBS → Planner → Drafts where a human reviews, edits, and "
-            "publishes. NOT gated by SOCIAL_MARK_ALLOW_PUBLISH because "
-            "drafts are inert until a human clicks Publish. This is the "
-            "PREFERRED way to hand off a finalized FB caption — use it "
-            "instead of post_draft_to_review_channel for Facebook posts. "
-            "Slack-channel handoff still makes sense for Instagram (no "
-            "first-class IG draft API) or for posts the team wants to "
-            "discuss before they live in MBS."
+            "Create a SCHEDULED Facebook post in Meta Business Suite — the "
+            "Meta-compatible equivalent of a HubSpot email draft. Lands in "
+            "MBS → Planner → Scheduled, fully editable. Defaults to firing "
+            "24 hours from creation if no time is specified; that gives the "
+            "team a full day to review/edit/cancel in MBS. NOT gated by "
+            "SOCIAL_MARK_ALLOW_PUBLISH — the human reviewing in MBS is the "
+            "safety gate. This is the PREFERRED way to hand off a "
+            "finalized FB caption. Note: pure 'draft only' posts via API "
+            "don't appear in MBS Planner UI (Meta limitation), which is "
+            "why this tool schedules instead of drafts. For Instagram (no "
+            "draft API) or 'discuss in Slack first' workflows, use "
+            "post_draft_to_review_channel instead. When batching from the "
+            "calendar, set scheduled_publish_time to each row's intended "
+            "publish time so the post fires on the right day."
         ),
         "input_schema": {
             "type": "object",
