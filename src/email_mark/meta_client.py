@@ -71,6 +71,26 @@ def _post(path: str, data: Dict[str, Any]) -> Dict[str, Any]:
     return _handle(resp)
 
 
+def _post_multipart(
+    path: str,
+    data: Dict[str, Any],
+    image_bytes: bytes,
+    image_filename: str,
+    image_mime: str,
+) -> Dict[str, Any]:
+    """POST with image bytes as multipart. Used by draft_facebook_post when
+    the caller has actual file bytes (e.g., pulled from Drive) rather than a
+    public image URL Meta can fetch itself.
+    """
+    data = dict(data)
+    data.setdefault("access_token", _token())
+    files = {"source": (image_filename, image_bytes, image_mime)}
+    resp = requests.post(
+        f"{GRAPH_BASE}/{path.lstrip('/')}", data=data, files=files, timeout=120
+    )
+    return _handle(resp)
+
+
 def _handle(resp: requests.Response) -> Dict[str, Any]:
     try:
         payload = resp.json()
@@ -292,6 +312,9 @@ def draft_facebook_post(
     *,
     message: str,
     image_url: Optional[str] = None,
+    image_bytes: Optional[bytes] = None,
+    image_filename: str = "asset.jpg",
+    image_mime: str = "image/jpeg",
     scheduled_publish_time: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Create a SCHEDULED post on the Facebook Page (the working "draft" UX).
@@ -325,7 +348,19 @@ def draft_facebook_post(
         "published": "false",
         "scheduled_publish_time": scheduled_publish_time,
     }
-    if image_url:
+    if image_bytes is not None:
+        # Multipart binary upload — caller already has the bytes (e.g., pulled
+        # from Drive via service account). Meta endpoint: same /photos, but
+        # body is multipart with 'source' instead of a 'url' field.
+        params["caption"] = message
+        result = _post_multipart(
+            f"{page_id}/photos",
+            params,
+            image_bytes=image_bytes,
+            image_filename=image_filename,
+            image_mime=image_mime,
+        )
+    elif image_url:
         params["caption"] = message
         params["url"] = image_url
         result = _post(f"{page_id}/photos", params)

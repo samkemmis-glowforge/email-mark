@@ -1318,16 +1318,19 @@ Instagram). Two jobs:
 
    HANDOFF — three paths, pick the right one:
    (a) FACEBOOK: default to calling draft_facebook_post with the composed
-       caption (and image_url if the calendar row has a usable public link).
-       This creates a SCHEDULED post in Meta Business Suite → Planner →
-       Scheduled — same review UX as a HubSpot email draft. (Pure
-       unpublished drafts via API don't show in MBS UI; scheduling is the
-       workaround that gives the human a visible, editable artifact.) When
-       you know the target publish time from the calendar row, pass it as
-       scheduled_publish_time (unix seconds) — e.g., calendar says "Fri Jun
-       19" → schedule for that Friday at 9am PT. If no specific date is
-       given, omit the param and it defaults to 24h from now, which gives
-       the team a day to review/edit/cancel in MBS.
+       caption. For the image, pass the calendar row's asset link as
+       drive_url (the tool fetches the bytes from Google Drive via service
+       account and uploads them to Meta — the Drive folder isn't public,
+       so don't try image_url on Drive links, it'll silently fail). Pass
+       only one Drive URL per call — typically asset_links[0] from the
+       row. This creates a SCHEDULED post in Meta Business Suite →
+       Planner → Scheduled — same review UX as a HubSpot email draft.
+       (Pure unpublished drafts via API don't show in MBS UI; scheduling
+       is the workaround.) When you know the target publish time from the
+       calendar row, pass it as scheduled_publish_time (unix seconds) —
+       e.g., calendar says "Fri Jun 19" → schedule for that Friday at 9am
+       PT. If no specific date is given, omit the param and it defaults
+       to 24h from now, giving the team a day to review/edit/cancel.
    (b) INSTAGRAM: there's no native IG draft API, so call
        post_draft_to_review_channel with the composed IG caption so a human
        can paste it into IG Business Suite. Note in your reply that IG
@@ -1638,18 +1641,58 @@ def _tool_draft_facebook_post(args: Dict[str, Any]) -> Dict[str, Any]:
     explicit unix timestamp. Scheduled posts appear in MBS → Planner →
     Scheduled, fully editable until they fire. The human reviewing in MBS
     is the safety gate, so SOCIAL_MARK_ALLOW_PUBLISH does not apply.
+
+    Image source: caller can pass either `drive_url` (a Google Drive link
+    from the calendar) — we fetch via service account and upload bytes
+    multipart — or `image_url` (a direct public image URL Meta can fetch
+    itself). Drive is preferred for Glowforge assets since the folder
+    isn't public.
     """
     from datetime import datetime, timezone
+    from email_mark import drive_client
 
     caption = str(args.get("caption", "")).strip()
     if not caption:
         return {"error": "caption is required."}
     image_url = args.get("image_url") or None
+    drive_url = args.get("drive_url") or None
     scheduled_ts = args.get("scheduled_publish_time")
+
+    image_bytes: Optional[bytes] = None
+    image_filename = "asset.jpg"
+    image_mime = "image/jpeg"
+    if drive_url:
+        file_id = drive_client.extract_file_id(drive_url)
+        if not file_id:
+            return {
+                "error": (
+                    f"Could not parse a Drive file ID out of {drive_url!r}. "
+                    "Expected a URL like https://drive.google.com/file/d/.../view "
+                    "or .../open?id=..."
+                )
+            }
+        try:
+            image_bytes, image_mime = drive_client.download_file(file_id)
+        except drive_client.DriveError as exc:
+            return {"error": f"Drive: {exc}"}
+        ext = {
+            "image/jpeg": "jpg",
+            "image/jpg": "jpg",
+            "image/png": "png",
+            "image/gif": "gif",
+            "image/bmp": "bmp",
+            "image/tiff": "tif",
+            "image/webp": "webp",
+        }.get(image_mime, "jpg")
+        image_filename = f"asset.{ext}"
+
     try:
         result = meta_client.draft_facebook_post(
             message=caption,
-            image_url=image_url,
+            image_url=image_url if not image_bytes else None,
+            image_bytes=image_bytes,
+            image_filename=image_filename,
+            image_mime=image_mime,
             scheduled_publish_time=int(scheduled_ts) if scheduled_ts else None,
         )
     except meta_client.MetaError as exc:
@@ -3498,8 +3541,24 @@ TOOLS: List[Dict[str, Any]] = [
                 "image_url": {
                     "type": "string",
                     "description": (
-                        "Optional public URL of an image to attach. If "
-                        "omitted, the draft is text-only."
+                        "Optional public URL of an image Meta can fetch "
+                        "directly. Only works for truly public URLs (NOT "
+                        "Drive links). Use drive_url instead for assets "
+                        "from the calendar."
+                    ),
+                },
+                "drive_url": {
+                    "type": "string",
+                    "description": (
+                        "Google Drive URL of an image asset, taken from "
+                        "the calendar row's asset_links. The tool fetches "
+                        "the file bytes via service account and uploads "
+                        "them to Meta. PREFERRED over image_url for "
+                        "Glowforge content since the Drive folder isn't "
+                        "public. Forms accepted: "
+                        "https://drive.google.com/file/d/FILE_ID/view, "
+                        "https://drive.google.com/open?id=FILE_ID, etc. "
+                        "File must be JPG/PNG/GIF/BMP/TIFF/WebP."
                     ),
                 },
                 "scheduled_publish_time": {
