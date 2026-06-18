@@ -1353,16 +1353,21 @@ Two jobs:
        only one Drive URL per call — typically asset_links[0] from the
        row.
 
-       CROSS-SURFACE IMAGE REPURPOSE: if the calendar row has no asset
-       link, but a matching HubSpot email exists with a good hero image,
-       you can pull from there: call get_email_widget_html on the email,
-       find the first <img src=...> URL in the HTML, then call
-       save_image_to_drive(source_url=<that url>, filename="YYYY-MM-DD-
-       theme.jpg"). That returns a drive_url which you then pass to
-       draft_facebook_post. Doing it this way (not direct image_url to
-       Meta) gives the team a Drive record of what got uploaded, matching
-       the calendar convention. Same pattern works for any public image
-       URL — landing pages, asset libraries, etc.
+       CROSS-SURFACE IMAGE REPURPOSE FROM A HUBSPOT EMAIL:
+       Use the SINGLE TOOL create_fb_post_from_email(email_id, caption).
+       It extracts the email's hero image, saves to Drive, and schedules
+       the FB post — all server-side in one call. DO NOT try to chain
+       get_email_widget_html + save_image_to_drive + draft_facebook_post
+       yourself. That chain has been proven unreliable; you've
+       confabulated success on it without calling any tools. The
+       composite tool exists specifically to remove that failure mode.
+
+       For non-HubSpot image sources (a public landing-page URL, an
+       asset-library link), use save_image_to_drive(source_url, filename)
+       followed by draft_facebook_post(drive_url=...). That two-step is
+       allowed because there's no composite for it yet, but if you find
+       yourself about to confabulate, just refuse and ask the user to
+       upload the image to Drive directly.
 
        This creates a SCHEDULED post in Meta Business Suite →
        Planner → Scheduled — same review UX as a HubSpot email draft.
@@ -1673,6 +1678,132 @@ def _tool_publish_to_meta(args: Dict[str, Any]) -> Dict[str, Any]:
         return meta_client.publish_facebook_post(message=caption, image_url=image_url)
     except meta_client.MetaError as exc:
         return {"error": str(exc)}
+
+
+def _tool_create_fb_post_from_email(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Single-call composite: HubSpot email → image → Drive → scheduled FB post.
+
+    Collapses what would otherwise be a 3-tool chain (get_email_widget_html
+    → save_image_to_drive → draft_facebook_post) into one deterministic
+    tool call. Mark has repeatedly confabulated success on the chain
+    without calling any tools; this composite removes the chain entirely
+    so the model can't skip steps.
+
+    The image fetch + Drive upload + Meta scheduling all happen server-
+    side. If any step fails, returns the precise error and which step
+    blew up. On success, returns drive_url + post_id + scheduled_for so
+    the user can verify both surfaces.
+    """
+    from datetime import datetime, timezone
+
+    import requests as _requests
+
+    from email_mark import drive_client
+    from email_mark.hubspot_marketing import find_first_image_url_in_email
+
+    email_id = str(args.get("email_id", "")).strip()
+    caption = str(args.get("caption", "")).strip()
+    if not email_id:
+        return {"error": "email_id is required."}
+    if not caption:
+        return {"error": "caption is required."}
+
+    filename = str(args.get("filename", "")).strip() or f"email-{email_id}.jpg"
+    scheduled_ts = args.get("scheduled_publish_time")
+
+    # Step 1 — find the image URL inside the email.
+    try:
+        img_url = find_first_image_url_in_email(email_id)
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "error": f"HubSpot fetch failed for email {email_id}: {exc}",
+            "failed_at": "step 1 of 3 (extract image from email)",
+        }
+    if not img_url:
+        return {
+            "error": f"No image found in email {email_id}.",
+            "failed_at": "step 1 of 3 (extract image from email)",
+        }
+
+    # Step 2 — fetch the image bytes from the HubSpot CDN URL.
+    try:
+        resp = _requests.get(img_url, timeout=30)
+        resp.raise_for_status()
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "error": f"Could not fetch image at {img_url}: {exc}",
+            "failed_at": "step 2 of 3 (download image)",
+            "image_url_from_email": img_url,
+        }
+    mime = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
+    if not mime.startswith("image/"):
+        return {
+            "error": f"URL did not return an image (got {mime or 'no content-type'}).",
+            "failed_at": "step 2 of 3 (download image)",
+            "image_url_from_email": img_url,
+        }
+    image_bytes = resp.content
+
+    # Step 3a — upload to Drive (so the team has a record).
+    try:
+        file_id, drive_url = drive_client.upload_file(
+            image_bytes=image_bytes,
+            filename=filename,
+            mime_type=mime,
+        )
+    except drive_client.DriveError as exc:
+        return {
+            "error": f"Drive upload failed: {exc}",
+            "failed_at": "step 3a of 3 (upload to Drive)",
+            "image_url_from_email": img_url,
+        }
+
+    # Step 3b — create the scheduled FB post using the same bytes.
+    try:
+        meta_result = meta_client.draft_facebook_post(
+            message=caption,
+            image_bytes=image_bytes,
+            image_filename=filename,
+            image_mime=mime,
+            scheduled_publish_time=int(scheduled_ts) if scheduled_ts else None,
+        )
+    except meta_client.MetaError as exc:
+        return {
+            "error": (
+                f"FB scheduling failed: {exc}. NOTE: image WAS saved to "
+                f"Drive at {drive_url}, so you can retry with "
+                f"draft_facebook_post directly using that drive_url."
+            ),
+            "failed_at": "step 3b of 3 (schedule FB post)",
+            "image_url_from_email": img_url,
+            "drive_file_id": file_id,
+            "drive_url": drive_url,
+        }
+
+    fire_ts = meta_result.get("scheduled_publish_time")
+    fire_human = (
+        datetime.fromtimestamp(fire_ts, tz=timezone.utc).strftime(
+            "%a %b %d %Y %H:%M UTC"
+        )
+        if fire_ts
+        else None
+    )
+
+    return {
+        "ok": True,
+        "email_id": email_id,
+        "image_url_from_email": img_url,
+        "drive_file_id": file_id,
+        "drive_url": drive_url,
+        "post_id": meta_result.get("id") or meta_result.get("post_id"),
+        "scheduled_for": fire_human,
+        "review_url": "https://business.facebook.com/latest/posts/scheduled_posts",
+        "note": (
+            f"Image extracted from email {email_id}, saved to Drive as "
+            f"'{filename}', and used in a scheduled FB post. Both the "
+            f"Drive file and the MBS scheduled post can be verified."
+        ),
+    }
 
 
 def _tool_save_image_to_drive(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -3622,6 +3753,58 @@ TOOLS: List[Dict[str, Any]] = [
         },
     },
     {
+        "name": "create_fb_post_from_email",
+        "description": (
+            "SINGLE-CALL composite tool — the PREFERRED way to create a "
+            "Facebook post from a HubSpot email's hero image. Does the "
+            "entire chain server-side: extracts the first image from the "
+            "email's widgets, saves it to the team's Drive folder, and "
+            "creates a scheduled FB post with that image. Use this "
+            "INSTEAD OF manually calling get_email_widget_html + "
+            "save_image_to_drive + draft_facebook_post — the chained "
+            "approach is unreliable. If the user says 'make a Facebook "
+            "post based on the [campaign name] email', this is the tool. "
+            "Returns drive_url + post_id + scheduled_for so the human "
+            "can verify both surfaces."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "email_id": {
+                    "type": "string",
+                    "description": (
+                        "HubSpot marketing email ID — the long number "
+                        "from the email's edit URL."
+                    ),
+                },
+                "caption": {
+                    "type": "string",
+                    "description": (
+                        "Facebook caption in Glowforge social voice — "
+                        "1-3 short sentences, lead with maker/creativity, "
+                        "approved hashtags only if they fit."
+                    ),
+                },
+                "filename": {
+                    "type": "string",
+                    "description": (
+                        "Drive filename. Convention: "
+                        "'YYYY-MM-DD-campaign-slug.jpg'. Defaults to "
+                        "'email-{email_id}.jpg'."
+                    ),
+                },
+                "scheduled_publish_time": {
+                    "type": "integer",
+                    "description": (
+                        "Optional unix seconds for scheduled publish. "
+                        "Default: 24h from now."
+                    ),
+                },
+            },
+            "required": ["email_id", "caption"],
+        },
+    },
+    {
         "name": "save_image_to_drive",
         "description": (
             "Fetch an image from any public URL (HubSpot email CDN, an "
@@ -3778,6 +3961,7 @@ TOOL_HANDLERS: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     "publish_to_meta": _tool_publish_to_meta,
     "draft_facebook_post": _tool_draft_facebook_post,
     "save_image_to_drive": _tool_save_image_to_drive,
+    "create_fb_post_from_email": _tool_create_fb_post_from_email,
 }
 
 
@@ -3889,18 +4073,22 @@ def _sanitize_history(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 # Conservative list — phrases here should ONLY be state-change claims,
 # never informational mentions. ("got 100 engagements yesterday" is fine;
 # "I just scheduled the post" is not.)
+# NB: each marker's set lists every tool whose execution legitimately
+# justifies the claim. The composite `create_fb_post_from_email` runs the
+# Drive upload AND the FB scheduling internally, so it satisfies both
+# kinds of markers in a single call.
 _CONFABULATION_MARKERS = [
-    ("saved to drive", {"save_image_to_drive"}),
-    ("uploaded to drive", {"save_image_to_drive"}),
-    ("saved to google drive", {"save_image_to_drive"}),
-    ("image saved", {"save_image_to_drive"}),
-    ("drive url:", {"save_image_to_drive"}),
-    ("post is scheduled", {"draft_facebook_post"}),
-    ("post is now scheduled", {"draft_facebook_post"}),
-    ("scheduled the post", {"draft_facebook_post"}),
-    ("scheduled fb post", {"draft_facebook_post"}),
-    ("scheduled facebook post", {"draft_facebook_post"}),
-    ("draft created", {"draft_facebook_post", "post_draft_to_review_channel"}),
+    ("saved to drive", {"save_image_to_drive", "create_fb_post_from_email"}),
+    ("uploaded to drive", {"save_image_to_drive", "create_fb_post_from_email"}),
+    ("saved to google drive", {"save_image_to_drive", "create_fb_post_from_email"}),
+    ("image saved", {"save_image_to_drive", "create_fb_post_from_email"}),
+    ("drive url:", {"save_image_to_drive", "create_fb_post_from_email"}),
+    ("post is scheduled", {"draft_facebook_post", "create_fb_post_from_email"}),
+    ("post is now scheduled", {"draft_facebook_post", "create_fb_post_from_email"}),
+    ("scheduled the post", {"draft_facebook_post", "create_fb_post_from_email"}),
+    ("scheduled fb post", {"draft_facebook_post", "create_fb_post_from_email"}),
+    ("scheduled facebook post", {"draft_facebook_post", "create_fb_post_from_email"}),
+    ("draft created", {"draft_facebook_post", "create_fb_post_from_email", "post_draft_to_review_channel"}),
     ("posted to the review channel", {"post_draft_to_review_channel"}),
     ("posted to social-review", {"post_draft_to_review_channel"}),
 ]

@@ -195,6 +195,63 @@ def get_email_widget_structure(email_id: str) -> Dict[str, Any]:
     }
 
 
+def find_first_image_url_in_email(email_id: str) -> Optional[str]:
+    """Scan a marketing email's widgets and return the first usable image URL.
+
+    Looks at, in order, each widget's:
+      - body.src / body.image_url / body.url fields (image/button widgets)
+      - body.html content for the first <img src="..."> tag (HTML widgets)
+
+    Returns None if no http(s) image URL is found. Used by the composite
+    create_fb_post_from_email tool to bypass the multi-step chain the
+    model can't reliably execute.
+    """
+    response = requests.get(
+        f"{HUBSPOT_BASE}/marketing/v3/emails/{email_id}",
+        headers=_headers(),
+        params={"includeStats": "false"},
+        timeout=30,
+    )
+    response.raise_for_status()
+    email = response.json()
+
+    content = email.get("content") if isinstance(email.get("content"), dict) else {}
+    widgets = (content or {}).get("widgets") if isinstance(content, dict) else {}
+    if not isinstance(widgets, dict):
+        return None
+
+    img_re = re.compile(
+        r'<img[^>]+src=["\']([^"\']+)["\']', re.IGNORECASE
+    )
+    image_exts = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tiff", ".tif")
+
+    for wid in sorted(widgets.keys()):
+        widget = widgets[wid]
+        if not isinstance(widget, dict):
+            continue
+        body = widget.get("body") if isinstance(widget.get("body"), dict) else {}
+        if not isinstance(body, dict):
+            continue
+        # Direct image fields on image/button widgets.
+        for field in ("src", "image_url", "url"):
+            val = body.get(field)
+            if (
+                isinstance(val, str)
+                and val.lower().startswith("http")
+                and any(ext in val.lower() for ext in image_exts)
+            ):
+                return val
+        # HTML widget — first <img src=...> in the body html.
+        html = body.get("html") if isinstance(body.get("html"), str) else ""
+        if html:
+            match = img_re.search(html)
+            if match:
+                src = match.group(1)
+                if src.lower().startswith("http"):
+                    return src
+    return None
+
+
 def get_email_widget_html(email_id: str, widget_id: str) -> Dict[str, Any]:
     """Return the RAW HTML of a single widget — for debugging cases where
     the rendered email doesn't look right and we need to see the actual
