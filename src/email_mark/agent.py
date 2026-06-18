@@ -4221,6 +4221,14 @@ def _chat_inner(
     INFERENCE_TIMEOUT_SECONDS = 120
 
     final_text = ""
+    # When the confabulation guard fires and we still have a retry budget,
+    # we set this to {"type": "any"} for the NEXT API call so the model is
+    # physically required by the API to emit a tool_use block. Reset to
+    # None after each use so subsequent turns go back to auto.
+    next_tool_choice: Optional[Dict[str, Any]] = None
+    confab_retries_used = 0
+    MAX_CONFAB_RETRIES = 1
+
     for turn_idx in range(MAX_AGENT_TURNS):
         turn_count = turn_idx + 1
 
@@ -4229,13 +4237,14 @@ def _chat_inner(
         in_flight_msg_count = len(messages)
         print(
             f"[timing] inference turn={turn_count} "
-            f"starting (messages_in_history={in_flight_msg_count})",
+            f"starting (messages_in_history={in_flight_msg_count}) "
+            f"tool_choice={next_tool_choice or 'auto'}",
             flush=True,
         )
 
         inference_start = time.perf_counter()
         try:
-            response = client.messages.create(
+            create_kwargs: Dict[str, Any] = dict(
                 model=MODEL,
                 max_tokens=4096,
                 system=system_blocks,
@@ -4243,6 +4252,11 @@ def _chat_inner(
                 messages=messages,
                 timeout=INFERENCE_TIMEOUT_SECONDS,
             )
+            if next_tool_choice is not None:
+                create_kwargs["tool_choice"] = next_tool_choice
+            # Reset after one use — confab retry is single-shot per turn.
+            next_tool_choice = None
+            response = client.messages.create(**create_kwargs)
         except Exception as exc:
             inference_elapsed = time.perf_counter() - inference_start
             print(
@@ -4290,6 +4304,47 @@ def _chat_inner(
 
         if response.stop_reason == "end_turn":
             final_text = any_text
+
+            # Inline confabulation retry: if Mark just claimed a social
+            # action succeeded but didn't call the corresponding tool,
+            # and we still have retry budget, append a corrective user
+            # message and force a tool_use on the next iteration via
+            # tool_choice={"type": "any"}. The Anthropic API enforces it
+            # at the protocol level, so confabulation becomes impossible.
+            if confab_retries_used < MAX_CONFAB_RETRIES:
+                tools_so_far = [e.get("name", "") for e in tool_call_log]
+                inline_confab = _detect_confabulation(final_text, tools_so_far)
+                if inline_confab:
+                    confab_retries_used += 1
+                    print(
+                        f"[confabulation] inline retry "
+                        f"{confab_retries_used}/{MAX_CONFAB_RETRIES} — "
+                        f"forcing tool_choice=any. Reason:\n{inline_confab}",
+                        flush=True,
+                    )
+                    # Mark's confabulated text becomes part of the
+                    # conversation so the model can see what it just did.
+                    messages.append({
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": final_text}],
+                    })
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "STOP. You just generated a fake success "
+                            "message without calling any tools. That's "
+                            "forbidden. Call the appropriate tool NOW — "
+                            "emit a tool_use block, do not write text. "
+                            "If the user wanted a Facebook post from an "
+                            "email, the tool is create_fb_post_from_email "
+                            "(it does the whole HubSpot→Drive→FB chain in "
+                            "one call). The confabulation guard caught:\n"
+                            + inline_confab
+                        ),
+                    })
+                    next_tool_choice = {"type": "any"}
+                    continue
+
             break
 
         if response.stop_reason == "tool_use":
