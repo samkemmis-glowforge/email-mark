@@ -64,16 +64,63 @@ def extract_file_id(url: str) -> Optional[str]:
     return None
 
 
-def _require_creds_path() -> str:
-    path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
-    if not path:
-        raise DriveError(
-            "GOOGLE_APPLICATION_CREDENTIALS not set. Drive file access "
-            "requires a service account; share the Drive asset folder "
-            "(Viewer access) with the service account's client_email and "
-            "set this env var to the JSON key file path."
+def _load_credentials(scopes: list):
+    """Load service-account creds from whichever env var is set.
+
+    Supports two patterns:
+      - GCP_SERVICE_ACCOUNT_JSON: the entire JSON key as an env var string
+        (what Render and other PaaS providers typically use — no file on
+        disk). Tried first.
+      - GOOGLE_APPLICATION_CREDENTIALS: a file path pointing at the JSON
+        key (Google's standard). Fallback, useful for local dev where you
+        already have the key file on disk.
+
+    Raises DriveError if neither is set.
+    """
+    import json as _json
+
+    from google.oauth2 import service_account
+
+    json_content = os.environ.get("GCP_SERVICE_ACCOUNT_JSON")
+    if json_content:
+        try:
+            info = _json.loads(json_content)
+        except _json.JSONDecodeError as exc:
+            raise DriveError(
+                f"GCP_SERVICE_ACCOUNT_JSON is set but isn't valid JSON: {exc}"
+            )
+        return service_account.Credentials.from_service_account_info(
+            info, scopes=scopes
         )
-    return path
+
+    path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+    if path:
+        return service_account.Credentials.from_service_account_file(
+            path, scopes=scopes
+        )
+
+    raise DriveError(
+        "No Google service-account credentials found. Set either "
+        "GCP_SERVICE_ACCOUNT_JSON (entire JSON key as an env var) or "
+        "GOOGLE_APPLICATION_CREDENTIALS (path to the JSON key file). "
+        "Then share the relevant Drive folders with the service "
+        "account's client_email."
+    )
+
+
+def _service():
+    """Build the Drive v3 service client with service-account creds.
+
+    Scope is `drive` (not `drive.readonly` and not `drive.file`) so we can
+    BOTH read files shared with the service account AND upload new files
+    into folders the service account has Editor access to. The service
+    account identity is tightly scoped by what's been shared with it, so
+    using the broader scope is safe — it can't see anything not shared.
+    """
+    from googleapiclient.discovery import build
+
+    creds = _load_credentials(["https://www.googleapis.com/auth/drive"])
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
 def download_file(file_id: str) -> Tuple[bytes, str]:
@@ -84,19 +131,11 @@ def download_file(file_id: str) -> Tuple[bytes, str]:
     failure. The mime_type check is strict — Mark should never accidentally
     upload a Google Doc or PDF as a Facebook photo.
     """
-    # Lazy imports so the package doesn't import these unless someone
-    # actually needs Drive access.
-    from google.oauth2 import service_account
-    from googleapiclient.discovery import build
+    # Lazy imports for the API error type + download helper.
     from googleapiclient.errors import HttpError
     from googleapiclient.http import MediaIoBaseDownload
 
-    creds_path = _require_creds_path()
-    creds = service_account.Credentials.from_service_account_file(
-        creds_path,
-        scopes=["https://www.googleapis.com/auth/drive.readonly"],
-    )
-    service = build("drive", "v3", credentials=creds, cache_discovery=False)
+    service = _service()
 
     # Metadata first — gives us mime_type, name, and verifies access.
     try:
@@ -132,3 +171,68 @@ def download_file(file_id: str) -> Tuple[bytes, str]:
         except HttpError as exc:
             raise DriveError(f"Drive download failed: {exc}")
     return buf.getvalue(), mime
+
+
+def upload_file(
+    *,
+    image_bytes: bytes,
+    filename: str,
+    mime_type: str,
+    folder_id: Optional[str] = None,
+) -> Tuple[str, str]:
+    """Upload bytes to a Drive folder via the service account.
+
+    Returns (file_id, web_view_link). The web_view_link is the URL you'd
+    open in a browser to see the file — also the URL that works as
+    `drive_url` for draft_facebook_post.
+
+    folder_id defaults to the SOCIAL_ASSETS_DRIVE_FOLDER_ID env var. The
+    target folder must be shared with the service account's client_email
+    at EDITOR access (not just Viewer — uploads write into the folder).
+    """
+    from googleapiclient.errors import HttpError
+    from googleapiclient.http import MediaIoBaseUpload
+
+    if mime_type not in _IMAGE_MIME_TYPES:
+        raise DriveError(
+            f"Refusing to upload {mime_type} to Drive — only image types "
+            f"are allowed via this path."
+        )
+
+    folder = folder_id or os.environ.get("SOCIAL_ASSETS_DRIVE_FOLDER_ID")
+    if not folder:
+        raise DriveError(
+            "SOCIAL_ASSETS_DRIVE_FOLDER_ID not set, and no folder_id "
+            "passed. Configure the env var to the Drive folder ID where "
+            "social-mark should drop image assets, and share that folder "
+            "with the service account's client_email at Editor access."
+        )
+
+    service = _service()
+    media = MediaIoBaseUpload(
+        io.BytesIO(image_bytes), mimetype=mime_type, resumable=False
+    )
+    metadata = {"name": filename, "parents": [folder]}
+    try:
+        created = (
+            service.files()
+            .create(
+                body=metadata,
+                media_body=media,
+                fields="id,webViewLink",
+                supportsAllDrives=True,
+            )
+            .execute()
+        )
+    except HttpError as exc:
+        if exc.resp.status in (403, 404):
+            raise DriveError(
+                f"Could not upload to folder {folder}: {exc}. Confirm the "
+                f"folder ID is correct and the service account has "
+                f"Editor access to it."
+            )
+        raise DriveError(f"Drive upload failed: {exc}")
+    except Exception as exc:
+        raise DriveError(f"Drive upload failed: {exc}")
+
+    return created["id"], created.get("webViewLink", "")
