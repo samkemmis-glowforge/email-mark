@@ -1323,7 +1323,20 @@ Instagram). Two jobs:
        account and uploads them to Meta — the Drive folder isn't public,
        so don't try image_url on Drive links, it'll silently fail). Pass
        only one Drive URL per call — typically asset_links[0] from the
-       row. This creates a SCHEDULED post in Meta Business Suite →
+       row.
+
+       CROSS-SURFACE IMAGE REPURPOSE: if the calendar row has no asset
+       link, but a matching HubSpot email exists with a good hero image,
+       you can pull from there: call get_email_widget_html on the email,
+       find the first <img src=...> URL in the HTML, then call
+       save_image_to_drive(source_url=<that url>, filename="YYYY-MM-DD-
+       theme.jpg"). That returns a drive_url which you then pass to
+       draft_facebook_post. Doing it this way (not direct image_url to
+       Meta) gives the team a Drive record of what got uploaded, matching
+       the calendar convention. Same pattern works for any public image
+       URL — landing pages, asset libraries, etc.
+
+       This creates a SCHEDULED post in Meta Business Suite →
        Planner → Scheduled — same review UX as a HubSpot email draft.
        (Pure unpublished drafts via API don't show in MBS UI; scheduling
        is the workaround.) When you know the target publish time from the
@@ -1632,6 +1645,77 @@ def _tool_publish_to_meta(args: Dict[str, Any]) -> Dict[str, Any]:
         return meta_client.publish_facebook_post(message=caption, image_url=image_url)
     except meta_client.MetaError as exc:
         return {"error": str(exc)}
+
+
+def _tool_save_image_to_drive(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Fetch an image from a public URL and store it in the team's Drive
+    folder for social assets, then return the new file's Drive URL so the
+    caller can pass it as `drive_url` to draft_facebook_post.
+
+    Use this to repurpose images across surfaces — e.g., pull the hero
+    image out of a HubSpot email draft (via get_email_widget_html → find
+    the <img src=...> URL) and stage it in Drive so the team has a record
+    of what went out on social, and so the existing Drive→Meta upload path
+    can attach it.
+    """
+    import mimetypes
+
+    import requests
+
+    from email_mark import drive_client
+
+    source_url = str(args.get("source_url", "")).strip()
+    filename = str(args.get("filename", "")).strip()
+    folder_id = args.get("folder_id") or None
+    if not source_url:
+        return {"error": "source_url is required."}
+    if not filename:
+        return {"error": "filename is required (e.g. '2026-06-19-juneteenth.jpg')."}
+
+    try:
+        resp = requests.get(source_url, timeout=30)
+        resp.raise_for_status()
+    except Exception as exc:
+        return {"error": f"Could not fetch {source_url}: {exc}"}
+
+    mime = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
+    if not mime or not mime.startswith("image/"):
+        # Fall back to guessing from the filename if the server didn't say.
+        guessed, _ = mimetypes.guess_type(filename)
+        if guessed and guessed.startswith("image/"):
+            mime = guessed
+        else:
+            return {
+                "error": (
+                    f"Fetched URL didn't return an image (content-type was "
+                    f"{mime or 'missing'}). Pass a direct image URL, not a "
+                    f"webpage link."
+                )
+            }
+
+    try:
+        file_id, drive_url = drive_client.upload_file(
+            image_bytes=resp.content,
+            filename=filename,
+            mime_type=mime,
+            folder_id=folder_id,
+        )
+    except drive_client.DriveError as exc:
+        return {"error": f"Drive: {exc}"}
+
+    return {
+        "ok": True,
+        "file_id": file_id,
+        "drive_url": drive_url,
+        "filename": filename,
+        "mime_type": mime,
+        "bytes": len(resp.content),
+        "note": (
+            "Pass `drive_url` (or the file_id wrapped in a Drive URL) as "
+            "the drive_url arg to draft_facebook_post to attach this image "
+            "to a scheduled FB post."
+        ),
+    }
 
 
 def _tool_draft_facebook_post(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -3510,6 +3594,50 @@ TOOLS: List[Dict[str, Any]] = [
         },
     },
     {
+        "name": "save_image_to_drive",
+        "description": (
+            "Fetch an image from any public URL (HubSpot email CDN, an "
+            "asset library, etc.) and store it in the team's social-assets "
+            "Drive folder. Returns a Drive URL you can immediately pass as "
+            "`drive_url` to draft_facebook_post. Use this to repurpose "
+            "images across surfaces — e.g., grab the hero image from a "
+            "HubSpot email (via get_email_widget_html → find img src) and "
+            "stage it in Drive before drafting the matching social post. "
+            "The Drive folder gives the team an auditable record of "
+            "everything social-mark uploads, separate from the API."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "source_url": {
+                    "type": "string",
+                    "description": (
+                        "Public URL of the image to fetch. Must serve "
+                        "image bytes directly (content-type: image/*), not "
+                        "an HTML page that embeds an image."
+                    ),
+                },
+                "filename": {
+                    "type": "string",
+                    "description": (
+                        "Filename to save the image under in Drive, "
+                        "including extension. Convention: "
+                        "'YYYY-MM-DD-theme-slug.jpg' so files sort by date "
+                        "(e.g., '2026-06-19-juneteenth.jpg')."
+                    ),
+                },
+                "folder_id": {
+                    "type": "string",
+                    "description": (
+                        "Optional Drive folder ID override. Defaults to "
+                        "SOCIAL_ASSETS_DRIVE_FOLDER_ID env var."
+                    ),
+                },
+            },
+            "required": ["source_url", "filename"],
+        },
+    },
+    {
         "name": "draft_facebook_post",
         "description": (
             "Create a SCHEDULED Facebook post in Meta Business Suite — the "
@@ -3621,6 +3749,7 @@ TOOL_HANDLERS: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     "get_ad_performance": _tool_get_ad_performance,
     "publish_to_meta": _tool_publish_to_meta,
     "draft_facebook_post": _tool_draft_facebook_post,
+    "save_image_to_drive": _tool_save_image_to_drive,
 }
 
 
