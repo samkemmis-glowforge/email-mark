@@ -3882,6 +3882,54 @@ def _sanitize_history(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return msgs
 
 
+# Confabulation markers: phrases in Mark's final response that strongly
+# imply a specific social tool was JUST executed in this turn. If the
+# phrase appears but the tool wasn't called, that's a hallucination —
+# Mark is generating a plausible "Done!" without actually doing the work.
+# Conservative list — phrases here should ONLY be state-change claims,
+# never informational mentions. ("got 100 engagements yesterday" is fine;
+# "I just scheduled the post" is not.)
+_CONFABULATION_MARKERS = [
+    ("saved to drive", {"save_image_to_drive"}),
+    ("uploaded to drive", {"save_image_to_drive"}),
+    ("saved to google drive", {"save_image_to_drive"}),
+    ("image saved", {"save_image_to_drive"}),
+    ("drive url:", {"save_image_to_drive"}),
+    ("post is scheduled", {"draft_facebook_post"}),
+    ("post is now scheduled", {"draft_facebook_post"}),
+    ("scheduled the post", {"draft_facebook_post"}),
+    ("scheduled fb post", {"draft_facebook_post"}),
+    ("scheduled facebook post", {"draft_facebook_post"}),
+    ("draft created", {"draft_facebook_post", "post_draft_to_review_channel"}),
+    ("posted to the review channel", {"post_draft_to_review_channel"}),
+    ("posted to social-review", {"post_draft_to_review_channel"}),
+]
+
+
+def _detect_confabulation(
+    final_text: Optional[str], tools_called: List[str]
+) -> Optional[str]:
+    """If the response claims a social action succeeded but the
+    corresponding tool wasn't called this turn, return a human-readable
+    explanation; otherwise None.
+    """
+    text = (final_text or "").lower()
+    called = set(tools_called or [])
+    triggered = []
+    for phrase, expected in _CONFABULATION_MARKERS:
+        if phrase in text and not (expected & called):
+            triggered.append((phrase, expected))
+    if not triggered:
+        return None
+    lines = []
+    for phrase, expected in triggered:
+        lines.append(
+            f"  - claimed '{phrase}' but never called "
+            + " or ".join(sorted(expected))
+        )
+    return "\n".join(lines)
+
+
 def chat(
     user_message: str,
     *,
@@ -4110,6 +4158,41 @@ def _chat_inner(
         f"conversation_id={conversation_id or 'none'}",
         flush=True,
     )
+
+    # Confabulation guard — intercept claims of social-tool success that
+    # weren't backed by a real tool call this turn. Mark has repeatedly
+    # generated convincing "Done!" responses without actually calling the
+    # tools (fabricated file IDs, made-up Drive URLs, wrong response
+    # shapes). The prompt rule alone hasn't held; this code check is the
+    # backstop. If we catch a confabulation, overwrite the response with
+    # a loud warning so the user knows nothing actually shipped.
+    tools_called_names = [entry.get("name", "") for entry in tool_call_log]
+    confab_reason = _detect_confabulation(final_text, tools_called_names)
+    if confab_reason:
+        print(
+            f"[confabulation] intercepted hallucinated success:\n{confab_reason}\n"
+            f"tools_called={tools_called_names}",
+            flush=True,
+        )
+        original = final_text or "(no response)"
+        final_text = (
+            ":warning: *Confabulation intercepted — nothing actually shipped.*\n\n"
+            "I was about to claim a social action succeeded, but I never "
+            "called the tool that would have performed it. Here's what I "
+            "almost told you:\n\n"
+            f"```\n{original.strip()[:1500]}\n```\n\n"
+            "*What's actually wrong:*\n"
+            f"```\n{confab_reason}\n```\n\n"
+            "*Tools I called this turn:* "
+            + (", ".join(tools_called_names) if tools_called_names else "(none)")
+            + "\n\n"
+            "This is a known failure mode where I generate a plausible "
+            "success message without doing the work. Try (1) breaking the "
+            "request into one tool at a time, or (2) explicitly naming the "
+            "tools and asking me to paste back each raw result. If it keeps "
+            "happening, flag it to the team — there's a guard for this but "
+            "the underlying behavior needs a deeper fix."
+        )
 
     if conversation_id is not None:
         # Trim oldest first if we exceed the cap.
