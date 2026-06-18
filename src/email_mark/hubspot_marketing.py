@@ -198,13 +198,19 @@ def get_email_widget_structure(email_id: str) -> Dict[str, Any]:
 def find_first_image_url_in_email(email_id: str) -> Optional[str]:
     """Scan a marketing email's widgets and return the first usable image URL.
 
-    Looks at, in order, each widget's:
-      - body.src / body.image_url / body.url fields (image/button widgets)
-      - body.html content for the first <img src="..."> tag (HTML widgets)
+    Image storage in HubSpot widgets varies by module type:
+      - @hubspot/image_email modules: body.img.src (NESTED in an `img` dict
+        that also has alt/width/height — this is the most common hero
+        location)
+      - Custom modules: body.src / body.image_url / body.url (direct field)
+      - HTML/rich-text modules: body.html with embedded <img src="..."> tags
 
-    Returns None if no http(s) image URL is found. Used by the composite
-    create_fb_post_from_email tool to bypass the multi-step chain the
-    model can't reliably execute.
+    Widget iteration is two-pass to prioritize the email's actual content
+    over HubSpot's template wrapper (header/footer/social icons):
+      Pass 1: widgets whose id matches `module_\\d+` (user content area)
+      Pass 2: everything else (template wrapper — module-N-N-N IDs)
+
+    Returns None if no http(s) image URL is found.
     """
     response = requests.get(
         f"{HUBSPOT_BASE}/marketing/v3/emails/{email_id}",
@@ -225,22 +231,31 @@ def find_first_image_url_in_email(email_id: str) -> Optional[str]:
     )
     image_exts = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tiff", ".tif")
 
-    for wid in sorted(widgets.keys()):
-        widget = widgets[wid]
-        if not isinstance(widget, dict):
-            continue
+    def _looks_like_image_url(val: Any) -> bool:
+        return (
+            isinstance(val, str)
+            and val.lower().startswith("http")
+            and any(ext in val.lower() for ext in image_exts)
+        )
+
+    def _find_in_widget(widget: Dict[str, Any]) -> Optional[str]:
         body = widget.get("body") if isinstance(widget.get("body"), dict) else {}
         if not isinstance(body, dict):
-            continue
-        # Direct image fields on image/button widgets.
+            return None
+        # Direct image fields (custom modules).
         for field in ("src", "image_url", "url"):
             val = body.get(field)
-            if (
-                isinstance(val, str)
-                and val.lower().startswith("http")
-                and any(ext in val.lower() for ext in image_exts)
-            ):
+            if _looks_like_image_url(val):
                 return val
+        # Nested image dict — HubSpot's @hubspot/image_email module
+        # stores its image as body.img = {alt, src, width, height}.
+        for nested_field in ("img", "image"):
+            nested = body.get(nested_field)
+            if isinstance(nested, dict):
+                for inner in ("src", "url", "image_url"):
+                    val = nested.get(inner)
+                    if _looks_like_image_url(val):
+                        return val
         # HTML widget — first <img src=...> in the body html.
         html = body.get("html") if isinstance(body.get("html"), str) else ""
         if html:
@@ -249,6 +264,27 @@ def find_first_image_url_in_email(email_id: str) -> Optional[str]:
                 src = match.group(1)
                 if src.lower().startswith("http"):
                     return src
+        return None
+
+    # Two-pass priority — user content first, template wrapper second.
+    # User-content widgets in HubSpot use IDs like `module_17761759630771`
+    # (numeric, timestamp-derived). Template wrapper widgets use IDs like
+    # `module-5-0-4` (positional). Without this split, alphabetical sort
+    # puts module-* before module_*, so we'd grab a footer/social icon
+    # instead of the hero.
+    user_content_pat = re.compile(r"^module_\d+")
+    sorted_keys = sorted(widgets.keys())
+    user_keys = [k for k in sorted_keys if user_content_pat.match(k)]
+    template_keys = [k for k in sorted_keys if k not in set(user_keys)]
+
+    for key_list in (user_keys, template_keys):
+        for wid in key_list:
+            widget = widgets[wid]
+            if not isinstance(widget, dict):
+                continue
+            found = _find_in_widget(widget)
+            if found:
+                return found
     return None
 
 
