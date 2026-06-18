@@ -341,33 +341,51 @@ def draft_facebook_post(
     """
     import time as _time
 
+    import json as _json
+
     page_id = _require("META_PAGE_ID", "draft to the Facebook Page")
     if scheduled_publish_time is None:
         scheduled_publish_time = int(_time.time()) + 24 * 3600
-    params: Dict[str, Any] = {
-        "published": "false",
-        "scheduled_publish_time": scheduled_publish_time,
-    }
+
+    # Two-step pattern for image posts: Meta's /photos endpoint with
+    # `published=false + scheduled_publish_time` quietly drops the schedule
+    # and lands the upload in the "unpublished photos" bucket, which is
+    # invisible in MBS → Planner → Scheduled. The fix is to upload the
+    # photo unpublished WITHOUT a schedule (step 1), then create a
+    # scheduled FEED post that attaches it via `attached_media` (step 2).
+    # The feed post is what appears in MBS Scheduled.
+    media_fbid: Optional[str] = None
     if image_bytes is not None:
-        # Multipart binary upload — caller already has the bytes (e.g., pulled
-        # from Drive via service account). Meta endpoint: same /photos, but
-        # body is multipart with 'source' instead of a 'url' field.
-        params["caption"] = message
-        result = _post_multipart(
+        photo = _post_multipart(
             f"{page_id}/photos",
-            params,
+            {"published": "false"},
             image_bytes=image_bytes,
             image_filename=image_filename,
             image_mime=image_mime,
         )
+        media_fbid = photo.get("id")
     elif image_url:
-        params["caption"] = message
-        params["url"] = image_url
-        result = _post(f"{page_id}/photos", params)
-    else:
-        params["message"] = message
-        result = _post(f"{page_id}/feed", params)
+        photo = _post(
+            f"{page_id}/photos",
+            {"published": "false", "url": image_url},
+        )
+        media_fbid = photo.get("id")
+
+    feed_params: Dict[str, Any] = {
+        "message": message,
+        "published": "false",
+        "scheduled_publish_time": scheduled_publish_time,
+    }
+    if media_fbid:
+        # Meta accepts attached_media as a JSON-encoded list of refs.
+        feed_params["attached_media"] = _json.dumps(
+            [{"media_fbid": media_fbid}]
+        )
+
+    result = _post(f"{page_id}/feed", feed_params)
     result["scheduled_publish_time"] = scheduled_publish_time
+    if media_fbid:
+        result["media_fbid"] = media_fbid
     return result
 
 
