@@ -36,4 +36,5 @@ Tools (HubSpot, BigQuery, etc.) get added over time so the bot can do real work,
 
 - `src/email_mark/` — Python package (Claude client and tool connectors)
 - `scripts/` — entrypoints (the bot itself, plus connector smoke tests)
-- `docs/` — design notes
+- `prompts/` — playbooks injected into Mark's system prompt (brand voice, social, **ads**, lessons learned)
+- `docs/` — design notes (see [docs/ads.md](docs/ads.md) for the paid-ads project)

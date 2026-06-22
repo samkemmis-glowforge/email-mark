@@ -188,6 +188,38 @@ def _social_playbook_section() -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# Ads playbook loading: an optional file at prompts/ads_playbook.md gets
+# injected into the system prompt at startup. Paid-ads ideation, draft-only
+# execution, and cross-platform reporting (Meta + Google + TikTok/LinkedIn +
+# Pinterest + Reddit). Reuses the same Meta/HubSpot wiring as the rest of Mark.
+# ---------------------------------------------------------------------------
+
+
+def _load_ads_playbook() -> str:
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    playbook_file = repo_root / "prompts" / "ads_playbook.md"
+    if not playbook_file.exists():
+        return ""
+    return playbook_file.read_text().strip()
+
+
+_ADS_PLAYBOOK = _load_ads_playbook()
+
+
+def _ads_playbook_section() -> str:
+    if not _ADS_PLAYBOOK:
+        return ""
+    return (
+        "\n\nADS PLAYBOOK \u2014 paid advertising (the \"ads-mark\" hat): how to "
+        "ideate campaigns, draft launch-ready ad copy and briefs, and report "
+        "on spend across Meta, Google, TikTok, LinkedIn, Pinterest, and "
+        "Reddit. ads-mark is DRAFT-ONLY \u2014 never launch, edit, pause, or spend "
+        "on a live ad account. Consult before any paid-ads work.\n\n"
+        + _ADS_PLAYBOOK
+    )
+
+
 def _load_email_design_references() -> str:
     """Load the email design references doc (universal best practices +
     Glowforge brand DNA + HubSpot constraints + experimentation
@@ -1344,39 +1376,38 @@ Two jobs:
    #glowforge) only when they fit; avoid "fire/burns", "users", and "the
    Glowforge".
 
-   HANDOFF — three paths, pick the right one:
-   (a) FACEBOOK: default to calling draft_facebook_post with the composed
-       caption. For the image, pass the calendar row's asset link as
-       drive_url (the tool fetches the bytes from Google Drive via service
-       account and uploads them to Meta — the Drive folder isn't public,
-       so don't try image_url on Drive links, it'll silently fail). Pass
-       only one Drive URL per call — typically asset_links[0] from the
-       row.
+   HANDOFF — Glowforge manages organic social inside HubSpot (NOT inside
+   Meta Business Suite). All scheduled posts you create should land in
+   HubSpot → Marketing → Social → Manage, where the social person
+   reviews and HubSpot publishes to the connected FB Page + IG account
+   at the scheduled time. There are two tools, picked by source:
 
-       CROSS-SURFACE IMAGE REPURPOSE FROM A HUBSPOT EMAIL:
-       Use the SINGLE TOOL create_fb_post_from_email(email_id, caption).
-       It extracts the email's hero image, saves to Drive, and schedules
-       the FB post — all server-side in one call. DO NOT try to chain
-       get_email_widget_html + save_image_to_drive + draft_facebook_post
-       yourself. That chain has been proven unreliable; you've
-       confabulated success on it without calling any tools. The
-       composite tool exists specifically to remove that failure mode.
+   (a) POST FROM A HUBSPOT EMAIL: use create_fb_post_from_email(
+       email_id, caption, channels='both'). Single call. Extracts the
+       email's hero image, stages it in Drive (audit trail), and
+       schedules HubSpot Broadcast posts for FB + IG. Defaults to
+       cross-posting; pass channels=['facebook'] or ['instagram'] to
+       limit. PREFERRED for repurposing email content.
 
-       For non-HubSpot image sources (a public landing-page URL, an
-       asset-library link), use save_image_to_drive(source_url, filename)
-       followed by draft_facebook_post(drive_url=...). That two-step is
-       allowed because there's no composite for it yet, but if you find
-       yourself about to confabulate, just refuse and ask the user to
-       upload the image to Drive directly.
+   (b) STANDALONE CAPTION (calendar row, ad-hoc, etc.): use
+       schedule_hubspot_social_post(body, channels, photo_url). For an
+       image, photo_url must be HubSpot-fetchable — HubSpot CDN URLs
+       are fine, Drive URLs are NOT (folder isn't public). For calendar
+       rows where the asset lives in Drive, currently no clean path
+       exists; surface that to the user and ask them to drop the asset
+       in a HubSpot-accessible location, or pull from a HubSpot email
+       via path (a).
 
-       This creates a SCHEDULED post in Meta Business Suite →
-       Planner → Scheduled — same review UX as a HubSpot email draft.
-       (Pure unpublished drafts via API don't show in MBS UI; scheduling
-       is the workaround.) When you know the target publish time from the
-       calendar row, pass it as scheduled_publish_time (unix seconds) —
-       e.g., calendar says "Fri Jun 19" → schedule for that Friday at 9am
-       PT. If no specific date is given, omit the param and it defaults
-       to 24h from now, giving the team a day to review/edit/cancel.
+   DO NOT use the Meta-direct write tools (draft_facebook_post,
+   publish_to_meta). They write to MBS Planner instead of HubSpot,
+   where the team won't see them. Those tools are kept for fallback /
+   diagnostics only.
+
+   When you know the target publish time from the calendar row, pass
+   it as scheduled_publish_time (unix seconds) — e.g., calendar says
+   "Fri Jun 19" → schedule for that Friday at 9am PT. If no specific
+   date is given, omit the param and it defaults to 24h from now,
+   giving the team a day to review/edit/cancel.
    (b) INSTAGRAM: there's no native IG draft API, so call
        post_draft_to_review_channel with the composed IG caption so a human
        can paste it into IG Business Suite. Note in your reply that IG
@@ -1407,6 +1438,7 @@ you draft as posts.
     + _brand_voice_section()
     + _email_design_references_section()
     + _social_playbook_section()
+    + _ads_playbook_section()
     + _lessons_section()
 )
 
@@ -1680,25 +1712,104 @@ def _tool_publish_to_meta(args: Dict[str, Any]) -> Dict[str, Any]:
         return {"error": str(exc)}
 
 
+def _tool_schedule_hubspot_social_post(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Schedule a social post via HubSpot's Broadcast API.
+
+    This is the PRIMARY publish path now that we know Glowforge manages
+    social via HubSpot. Posts created here land in HubSpot → Marketing →
+    Social → Manage → Scheduled, where the social person reviews and
+    HubSpot in turn publishes to the connected FB Page / IG account at
+    the scheduled time. Replaces the previous Meta-direct draft path
+    (which created posts in MBS Planner, invisible to HubSpot users).
+    """
+    from datetime import datetime, timezone
+
+    from email_mark import hubspot_social
+
+    body = str(args.get("body", "") or args.get("caption", "")).strip()
+    if not body:
+        return {"error": "body (caption) is required."}
+
+    channels_arg = args.get("channels", "facebook")
+    if isinstance(channels_arg, str):
+        if channels_arg.lower() == "both":
+            channels = ["facebook", "instagram"]
+        else:
+            channels = [channels_arg.strip().lower()]
+    elif isinstance(channels_arg, list):
+        channels = [str(c).strip().lower() for c in channels_arg if c]
+    else:
+        return {"error": f"channels must be a string or list, got {type(channels_arg).__name__}."}
+
+    scheduled_ts = args.get("scheduled_publish_time")
+    trigger_at_unix = (
+        int(scheduled_ts) if scheduled_ts else int(time.time()) + 24 * 3600
+    )
+    photo_url = args.get("photo_url") or None
+
+    results = hubspot_social.create_posts_to_channels(
+        channels=channels,
+        body=body,
+        trigger_at_unix=trigger_at_unix,
+        photo_url=photo_url,
+    )
+
+    # Build a clean per-channel summary for Mark to read.
+    fire_human = datetime.fromtimestamp(
+        trigger_at_unix, tz=timezone.utc
+    ).strftime("%a %b %d %Y %H:%M UTC")
+    summaries = []
+    any_failed = False
+    for r in results:
+        channel_name = r.get("_channel_name", "?")
+        if r.get("error"):
+            any_failed = True
+            summaries.append({
+                "channel": channel_name,
+                "ok": False,
+                "error": r["error"],
+            })
+        else:
+            summaries.append({
+                "channel": channel_name,
+                "ok": True,
+                "broadcast_guid": r.get("broadcastGuid"),
+                "status": r.get("status"),
+                "trigger_at_ms": r.get("triggerAt"),
+            })
+
+    return {
+        "ok": not any_failed,
+        "scheduled_for": fire_human,
+        "channels": summaries,
+        "review_url": "https://app.hubspot.com/social/8614495/manage",
+        "note": (
+            "Scheduled in HubSpot → Marketing → Social → Manage. The "
+            "team reviews and HubSpot publishes to the connected accounts "
+            "at the scheduled time. Edit or cancel in HubSpot before the "
+            "trigger time fires."
+        ),
+    }
+
+
 def _tool_create_fb_post_from_email(args: Dict[str, Any]) -> Dict[str, Any]:
-    """Single-call composite: HubSpot email → image → Drive → scheduled FB post.
+    """Single-call composite: HubSpot email → image → Drive → HubSpot
+    scheduled social post.
 
-    Collapses what would otherwise be a 3-tool chain (get_email_widget_html
-    → save_image_to_drive → draft_facebook_post) into one deterministic
-    tool call. Mark has repeatedly confabulated success on the chain
-    without calling any tools; this composite removes the chain entirely
-    so the model can't skip steps.
+    Now publishes via HubSpot's Broadcast API (where the team actually
+    manages social) instead of the previous Meta-direct path (where
+    posts were invisible to HubSpot's UI). Drive upload is preserved as
+    an audit trail. Since the image comes from HubSpot's own CDN, we
+    pass that URL directly to broadcast — no re-upload needed.
 
-    The image fetch + Drive upload + Meta scheduling all happen server-
-    side. If any step fails, returns the precise error and which step
-    blew up. On success, returns drive_url + post_id + scheduled_for so
-    the user can verify both surfaces.
+    Cross-posts to Facebook + Instagram by default; caller can override
+    via channels=['facebook'] or channels=['instagram'].
     """
     from datetime import datetime, timezone
 
     import requests as _requests
 
-    from email_mark import drive_client
+    from email_mark import drive_client, hubspot_social
     from email_mark.hubspot_marketing import find_first_image_url_in_email
 
     email_id = str(args.get("email_id", "")).strip()
@@ -1710,6 +1821,21 @@ def _tool_create_fb_post_from_email(args: Dict[str, Any]) -> Dict[str, Any]:
 
     filename = str(args.get("filename", "")).strip() or f"email-{email_id}.jpg"
     scheduled_ts = args.get("scheduled_publish_time")
+    trigger_at_unix = (
+        int(scheduled_ts) if scheduled_ts else int(time.time()) + 24 * 3600
+    )
+
+    # Channels — default to both FB + IG since HubSpot makes cross-posting easy
+    # and that's the typical organic-social workflow. Caller can override.
+    channels_arg = args.get("channels", ["facebook", "instagram"])
+    if isinstance(channels_arg, str):
+        channels = (
+            ["facebook", "instagram"]
+            if channels_arg.lower() == "both"
+            else [channels_arg.strip().lower()]
+        )
+    else:
+        channels = [str(c).strip().lower() for c in channels_arg if c]
 
     # Step 1 — find the image URL inside the email.
     try:
@@ -1725,7 +1851,9 @@ def _tool_create_fb_post_from_email(args: Dict[str, Any]) -> Dict[str, Any]:
             "failed_at": "step 1 of 3 (extract image from email)",
         }
 
-    # Step 2 — fetch the image bytes from the HubSpot CDN URL.
+    # Step 2 — fetch image bytes for the Drive audit copy. (We pass the
+    # original HubSpot CDN URL to broadcast directly; the Drive upload
+    # is purely for the team's record of "what social-mark touched".)
     try:
         resp = _requests.get(img_url, timeout=30)
         resp.raise_for_status()
@@ -1744,64 +1872,68 @@ def _tool_create_fb_post_from_email(args: Dict[str, Any]) -> Dict[str, Any]:
         }
     image_bytes = resp.content
 
-    # Step 3a — upload to Drive (so the team has a record).
+    # Step 3a — upload to Drive (audit trail; not used for the actual post).
+    drive_url = None
+    drive_file_id = None
     try:
-        file_id, drive_url = drive_client.upload_file(
+        drive_file_id, drive_url = drive_client.upload_file(
             image_bytes=image_bytes,
             filename=filename,
             mime_type=mime,
         )
     except drive_client.DriveError as exc:
-        return {
-            "error": f"Drive upload failed: {exc}",
-            "failed_at": "step 3a of 3 (upload to Drive)",
-            "image_url_from_email": img_url,
-        }
+        # Drive failure is non-fatal — we can still publish without an
+        # audit copy. Log it in the response but proceed.
+        drive_url = None
+        drive_error = str(exc)
+    else:
+        drive_error = None
 
-    # Step 3b — create the scheduled FB post using the same bytes.
-    try:
-        meta_result = meta_client.draft_facebook_post(
-            message=caption,
-            image_bytes=image_bytes,
-            image_filename=filename,
-            image_mime=mime,
-            scheduled_publish_time=int(scheduled_ts) if scheduled_ts else None,
-        )
-    except meta_client.MetaError as exc:
-        return {
-            "error": (
-                f"FB scheduling failed: {exc}. NOTE: image WAS saved to "
-                f"Drive at {drive_url}, so you can retry with "
-                f"draft_facebook_post directly using that drive_url."
-            ),
-            "failed_at": "step 3b of 3 (schedule FB post)",
-            "image_url_from_email": img_url,
-            "drive_file_id": file_id,
-            "drive_url": drive_url,
-        }
-
-    fire_ts = meta_result.get("scheduled_publish_time")
-    fire_human = (
-        datetime.fromtimestamp(fire_ts, tz=timezone.utc).strftime(
-            "%a %b %d %Y %H:%M UTC"
-        )
-        if fire_ts
-        else None
+    # Step 3b — schedule the social post(s) via HubSpot Broadcast API.
+    broadcast_results = hubspot_social.create_posts_to_channels(
+        channels=channels,
+        body=caption,
+        trigger_at_unix=trigger_at_unix,
+        photo_url=img_url,  # HubSpot CDN URL — HubSpot can fetch it
     )
+    channel_summaries = []
+    any_failed = False
+    for r in broadcast_results:
+        channel_name = r.get("_channel_name", "?")
+        if r.get("error"):
+            any_failed = True
+            channel_summaries.append({
+                "channel": channel_name,
+                "ok": False,
+                "error": r["error"],
+            })
+        else:
+            channel_summaries.append({
+                "channel": channel_name,
+                "ok": True,
+                "broadcast_guid": r.get("broadcastGuid"),
+                "status": r.get("status"),
+            })
+
+    fire_human = datetime.fromtimestamp(
+        trigger_at_unix, tz=timezone.utc
+    ).strftime("%a %b %d %Y %H:%M UTC")
 
     return {
-        "ok": True,
+        "ok": not any_failed,
         "email_id": email_id,
         "image_url_from_email": img_url,
-        "drive_file_id": file_id,
+        "drive_file_id": drive_file_id,
         "drive_url": drive_url,
-        "post_id": meta_result.get("id") or meta_result.get("post_id"),
+        "drive_error": drive_error,  # null if Drive upload succeeded
         "scheduled_for": fire_human,
-        "review_url": "https://business.facebook.com/latest/posts/scheduled_posts",
+        "channels": channel_summaries,
+        "review_url": "https://app.hubspot.com/social/8614495/manage",
         "note": (
-            f"Image extracted from email {email_id}, saved to Drive as "
-            f"'{filename}', and used in a scheduled FB post. Both the "
-            f"Drive file and the MBS scheduled post can be verified."
+            f"Image extracted from email {email_id}, staged in Drive as "
+            f"'{filename}' (audit), and scheduled in HubSpot for the "
+            f"team to review. HubSpot will publish to the connected "
+            f"accounts at the trigger time."
         ),
     }
 
@@ -3753,19 +3885,62 @@ TOOLS: List[Dict[str, Any]] = [
         },
     },
     {
+        "name": "schedule_hubspot_social_post",
+        "description": (
+            "Schedule a social post (FB / IG / both) via HubSpot's "
+            "Broadcast API. PRIMARY publish path — the team manages "
+            "social inside HubSpot, so this is where posts should land. "
+            "Use this when you have a finalized caption (and optionally "
+            "a public image URL) and want to schedule it. For posts "
+            "based on a HubSpot email's hero image, prefer "
+            "create_fb_post_from_email — it does the image extraction + "
+            "Drive staging + this scheduling in one call."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "body": {
+                    "type": "string",
+                    "description": "Composed caption in Glowforge social voice.",
+                },
+                "channels": {
+                    "type": "string",
+                    "description": (
+                        "'facebook', 'instagram', or 'both'. Default 'facebook'. "
+                        "Use 'both' to cross-post."
+                    ),
+                },
+                "scheduled_publish_time": {
+                    "type": "integer",
+                    "description": "Optional unix seconds. Default: 24h from now.",
+                },
+                "photo_url": {
+                    "type": "string",
+                    "description": (
+                        "Optional public image URL HubSpot can fetch. Must be "
+                        "directly fetchable (HubSpot CDN URLs are fine; Drive "
+                        "URLs are NOT — the folder isn't public)."
+                    ),
+                },
+            },
+            "required": ["body"],
+        },
+    },
+    {
         "name": "create_fb_post_from_email",
         "description": (
             "SINGLE-CALL composite tool — the PREFERRED way to create a "
-            "Facebook post from a HubSpot email's hero image. Does the "
-            "entire chain server-side: extracts the first image from the "
-            "email's widgets, saves it to the team's Drive folder, and "
-            "creates a scheduled FB post with that image. Use this "
-            "INSTEAD OF manually calling get_email_widget_html + "
-            "save_image_to_drive + draft_facebook_post — the chained "
-            "approach is unreliable. If the user says 'make a Facebook "
-            "post based on the [campaign name] email', this is the tool. "
-            "Returns drive_url + post_id + scheduled_for so the human "
-            "can verify both surfaces."
+            "social post (FB + IG by default) from a HubSpot email's "
+            "hero image. Does the entire chain server-side: extracts "
+            "the first image from the email's widgets, stages it in "
+            "the team's Drive folder for audit, and creates scheduled "
+            "HubSpot Broadcast posts that the team will see in HubSpot "
+            "→ Marketing → Social → Manage. Use this INSTEAD OF "
+            "manually calling get_email_widget_html + "
+            "save_image_to_drive + schedule_hubspot_social_post. If the "
+            "user says 'make a Facebook post based on the [campaign "
+            "name] email', this is the tool. Defaults to cross-posting "
+            "FB + IG; pass channels=['facebook'] to limit to one."
         ),
         "input_schema": {
             "type": "object",
@@ -3798,6 +3973,14 @@ TOOLS: List[Dict[str, Any]] = [
                     "description": (
                         "Optional unix seconds for scheduled publish. "
                         "Default: 24h from now."
+                    ),
+                },
+                "channels": {
+                    "type": "string",
+                    "description": (
+                        "'facebook', 'instagram', or 'both'. Default 'both' "
+                        "(cross-post). HubSpot publishes to the same Glowforge "
+                        "Page and Instagram that you'd post to directly."
                     ),
                 },
             },
@@ -3962,6 +4145,7 @@ TOOL_HANDLERS: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     "draft_facebook_post": _tool_draft_facebook_post,
     "save_image_to_drive": _tool_save_image_to_drive,
     "create_fb_post_from_email": _tool_create_fb_post_from_email,
+    "schedule_hubspot_social_post": _tool_schedule_hubspot_social_post,
 }
 
 
@@ -4077,18 +4261,29 @@ def _sanitize_history(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 # justifies the claim. The composite `create_fb_post_from_email` runs the
 # Drive upload AND the FB scheduling internally, so it satisfies both
 # kinds of markers in a single call.
+_PUBLISH_TOOLS = {
+    "draft_facebook_post",
+    "create_fb_post_from_email",
+    "schedule_hubspot_social_post",
+}
+_STAGE_TOOLS = {
+    "save_image_to_drive",
+    "create_fb_post_from_email",
+}
 _CONFABULATION_MARKERS = [
-    ("saved to drive", {"save_image_to_drive", "create_fb_post_from_email"}),
-    ("uploaded to drive", {"save_image_to_drive", "create_fb_post_from_email"}),
-    ("saved to google drive", {"save_image_to_drive", "create_fb_post_from_email"}),
-    ("image saved", {"save_image_to_drive", "create_fb_post_from_email"}),
-    ("drive url:", {"save_image_to_drive", "create_fb_post_from_email"}),
-    ("post is scheduled", {"draft_facebook_post", "create_fb_post_from_email"}),
-    ("post is now scheduled", {"draft_facebook_post", "create_fb_post_from_email"}),
-    ("scheduled the post", {"draft_facebook_post", "create_fb_post_from_email"}),
-    ("scheduled fb post", {"draft_facebook_post", "create_fb_post_from_email"}),
-    ("scheduled facebook post", {"draft_facebook_post", "create_fb_post_from_email"}),
-    ("draft created", {"draft_facebook_post", "create_fb_post_from_email", "post_draft_to_review_channel"}),
+    ("saved to drive", _STAGE_TOOLS),
+    ("uploaded to drive", _STAGE_TOOLS),
+    ("saved to google drive", _STAGE_TOOLS),
+    ("image saved", _STAGE_TOOLS),
+    ("drive url:", _STAGE_TOOLS),
+    ("post is scheduled", _PUBLISH_TOOLS),
+    ("post is now scheduled", _PUBLISH_TOOLS),
+    ("scheduled the post", _PUBLISH_TOOLS),
+    ("scheduled fb post", _PUBLISH_TOOLS),
+    ("scheduled facebook post", _PUBLISH_TOOLS),
+    ("scheduled in hubspot", _PUBLISH_TOOLS),
+    ("post is in hubspot", _PUBLISH_TOOLS),
+    ("draft created", _PUBLISH_TOOLS | {"post_draft_to_review_channel"}),
     ("posted to the review channel", {"post_draft_to_review_channel"}),
     ("posted to social-review", {"post_draft_to_review_channel"}),
 ]
