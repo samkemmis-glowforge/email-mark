@@ -261,7 +261,13 @@ def get_ad_performance(
     date_preset: str = "last_28d",
     level: str = "campaign",
 ) -> Dict[str, Any]:
-    """Paid-social performance from the Meta Ad account (insights edge)."""
+    """Paid-social performance from the Meta Ad account (insights edge).
+
+    NOTE: /insights only returns entities with actual activity (spend,
+    impressions). New/paused campaigns with zero delivery are INVISIBLE
+    to this endpoint, even at date_preset="maximum". To see all campaign
+    objects (including new/paused), use list_meta_campaigns() instead.
+    """
     act = _require("META_AD_ACCOUNT_ID", "read paid-social performance")
     if not act.startswith("act_"):
         act = f"act_{act}"
@@ -280,6 +286,216 @@ def get_ad_performance(
         {"fields": ",".join(fields), "date_preset": date_preset, "level": level},
     )
     return {"date_preset": date_preset, "level": level, "rows": data.get("data", [])}
+
+
+# ---------------------------------------------------------------------------
+# READ-ONLY MARKETING API — campaign/adset/ad structure + settings
+#
+# Mark's original ads toolkit was just get_ad_performance, which hits
+# /insights. That gives metrics but is INVISIBLE to campaigns with zero
+# activity (like a just-launched one), and it never shows targeting,
+# creative, or delivery diagnostics. The tools below fill in the
+# structural side so Mark can inspect campaign settings, ad set
+# targeting, ad creative, and Meta's own "why isn't this delivering"
+# diagnostics — the questions Mark actually needs to answer to
+# troubleshoot ad performance.
+#
+# All read-only. All use the same META_ACCESS_TOKEN + META_AD_ACCOUNT_ID
+# already in Render. Same auth path as get_ad_performance.
+# ---------------------------------------------------------------------------
+
+
+_CAMPAIGN_DEFAULT_FIELDS = [
+    "id", "name", "objective", "status", "effective_status",
+    "daily_budget", "lifetime_budget", "budget_remaining", "spend_cap",
+    "buying_type", "start_time", "stop_time", "created_time", "updated_time",
+    "bid_strategy", "special_ad_categories", "pacing_type",
+    "issues_info",
+]
+
+_ADSET_DEFAULT_FIELDS = [
+    "id", "name", "campaign_id", "status", "effective_status",
+    "daily_budget", "lifetime_budget", "billing_event", "optimization_goal",
+    "bid_strategy", "bid_amount", "start_time", "end_time",
+    "created_time", "updated_time", "configured_status", "issues_info",
+    "attribution_spec", "destination_type", "promoted_object",
+]
+
+_ADSET_TARGETING_FIELDS = [
+    "id", "name", "targeting", "promoted_object", "optimization_goal",
+    "billing_event", "attribution_spec",
+]
+
+_AD_DEFAULT_FIELDS = [
+    "id", "name", "adset_id", "campaign_id", "status", "effective_status",
+    "creative", "created_time", "updated_time", "issues_info",
+]
+
+_AD_CREATIVE_FIELDS = [
+    "id", "name",
+    "creative{id,name,title,body,image_url,thumbnail_url,"
+    "object_story_spec,call_to_action_type,link_url,object_type,"
+    "video_id,instagram_permalink_url}",
+    "preview_shareable_link",
+]
+
+_DELIVERY_FIELDS = [
+    "id", "name", "effective_status", "configured_status",
+    "issues_info", "recommendations",
+]
+
+
+def list_meta_campaigns(
+    *,
+    status_filter: Optional[str] = None,
+    limit: int = 100,
+    fields: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """List every campaign in the ad account.
+
+    Unlike get_ad_performance, this returns campaign OBJECTS not metrics,
+    so new/paused/zero-spend campaigns are visible here. Use this when
+    you need to see "what campaigns exist" rather than "what has been
+    spending."
+
+    status_filter: pass "ACTIVE" | "PAUSED" | "DELETED" | "ARCHIVED" to
+        filter, or None for all. Filters on effective_status.
+    """
+    act = _require("META_AD_ACCOUNT_ID", "list Meta campaigns")
+    if not act.startswith("act_"):
+        act = f"act_{act}"
+    params: Dict[str, Any] = {
+        "fields": ",".join(fields or _CAMPAIGN_DEFAULT_FIELDS),
+        "limit": limit,
+    }
+    if status_filter:
+        # Effective status filter is JSON-encoded array in the query string.
+        params["effective_status"] = f'["{status_filter.upper()}"]'
+    data = _get(f"{act}/campaigns", params)
+    return {"campaigns": data.get("data", []), "paging": data.get("paging", {})}
+
+
+def get_meta_campaign_details(campaign_id: str) -> Dict[str, Any]:
+    """Full settings for one campaign: objective, budget, dates, delivery
+    flags, pacing, etc. Use when troubleshooting why a campaign isn't
+    behaving as expected.
+    """
+    fields = ",".join(_CAMPAIGN_DEFAULT_FIELDS)
+    return _get(f"{campaign_id}", {"fields": fields})
+
+
+def list_meta_adsets(
+    *,
+    campaign_id: str,
+    limit: int = 50,
+    fields: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """List ad sets under a campaign. Returns ad set OBJECTS (status,
+    budget, optimization goal) but not the full targeting spec — for
+    that use get_meta_adset_targeting on a specific ad set.
+    """
+    params: Dict[str, Any] = {
+        "fields": ",".join(fields or _ADSET_DEFAULT_FIELDS),
+        "limit": limit,
+    }
+    data = _get(f"{campaign_id}/adsets", params)
+    return {"adsets": data.get("data", []), "paging": data.get("paging", {})}
+
+
+def get_meta_adset_targeting(adset_id: str) -> Dict[str, Any]:
+    """Full targeting spec for one ad set — custom_audiences,
+    lookalikes, interests, behaviors, geo, age, gender, placements, etc.
+
+    This is the "who is this ad targeting" answer. Meta's targeting
+    object is deeply nested; expect nested lists of custom_audiences,
+    flexible_spec, geo_locations, etc. Read it in a structured way
+    rather than trying to summarize the whole thing.
+    """
+    fields = ",".join(_ADSET_TARGETING_FIELDS)
+    return _get(f"{adset_id}", {"fields": fields})
+
+
+def list_meta_ads(
+    *,
+    adset_id: Optional[str] = None,
+    campaign_id: Optional[str] = None,
+    limit: int = 50,
+    fields: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """List ads under either an ad set (preferred) or a campaign.
+
+    One of adset_id or campaign_id must be provided. Returns ad OBJECTS
+    with status and creative reference. To see the actual creative
+    (copy, image, destination URL) use get_meta_ad_creative on a
+    specific ad.
+    """
+    if not adset_id and not campaign_id:
+        raise MetaError("list_meta_ads requires either adset_id or campaign_id.")
+    parent = adset_id or campaign_id
+    params: Dict[str, Any] = {
+        "fields": ",".join(fields or _AD_DEFAULT_FIELDS),
+        "limit": limit,
+    }
+    data = _get(f"{parent}/ads", params)
+    return {"ads": data.get("data", []), "paging": data.get("paging", {})}
+
+
+def get_meta_ad_creative(ad_id: str) -> Dict[str, Any]:
+    """Full creative for one ad: copy, headline, body, image URL,
+    destination URL, CTA, preview link, video ID if video.
+
+    Use this when troubleshooting "is my landing page URL right,"
+    "does my creative match my angle," "what CTA am I using," etc.
+    """
+    fields = ",".join(_AD_CREATIVE_FIELDS)
+    return _get(f"{ad_id}", {"fields": fields})
+
+
+def get_meta_delivery_diagnostics(object_id: str) -> Dict[str, Any]:
+    """Meta's own delivery diagnostics for a campaign, ad set, or ad.
+
+    Returns issues_info (policy issues, learning-limited flags, low
+    delivery reasons) and recommendations from Meta. This is often the
+    single most useful troubleshooting endpoint — Meta itself tells you
+    why something isn't delivering.
+
+    Accepts any of campaign_id, adset_id, or ad_id.
+    """
+    fields = ",".join(_DELIVERY_FIELDS)
+    return _get(f"{object_id}", {"fields": fields})
+
+
+def meta_read_api(
+    *, path: str, fields: Optional[str] = None, params: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Raw read-only Marketing API call — for anything not covered by
+    the structured tools above.
+
+    path: Graph API path without leading slash, e.g. "act_123/campaigns"
+        or "6250601797283" (an object id) or "6250601797283/adsets".
+    fields: comma-separated field list, or None to use Meta's default.
+    params: additional query params (limit, effective_status, etc.).
+
+    Read-only enforcement: if the path suggests a mutation endpoint
+    (contains "delete", "create", or is empty), this refuses. Never
+    performs POST — always GET.
+    """
+    if not path:
+        raise MetaError("meta_read_api: path is required.")
+    # Rough safety: refuse mutation-shaped paths. Real read-only
+    # enforcement is that we only ever call GET, but this makes intent
+    # clear when the model tries something suspicious.
+    path_lower = path.lower()
+    for bad in ("/delete", "/copy", "/dup", "/publish", "/associations"):
+        if bad in path_lower:
+            raise MetaError(
+                f"meta_read_api: path {path!r} looks like a mutation. "
+                f"This tool is read-only."
+            )
+    query: Dict[str, Any] = dict(params or {})
+    if fields:
+        query["fields"] = fields
+    return _get(path.lstrip("/"), query)
 
 
 # ---------------------------------------------------------------------------

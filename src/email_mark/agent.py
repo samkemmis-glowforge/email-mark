@@ -1429,6 +1429,34 @@ Two jobs:
    asked otherwise, and state the window. Never invent figures — if a Meta
    tool errors, say so.
 
+3. TROUBLESHOOT PAID CAMPAIGNS. get_ad_performance shows METRICS but is
+   INVISIBLE to campaigns without spend/activity, and it doesn't show
+   settings, targeting, or creative. When the user asks "why isn't this
+   campaign working" or "what's the targeting on X" or a similar
+   troubleshooting question, use the structural tools:
+
+     - list_meta_campaigns: every campaign object including new/paused
+       ones invisible to insights. Start here when the user names a
+       campaign that doesn't appear in get_ad_performance results.
+     - get_meta_campaign_details: full settings for one campaign.
+     - list_meta_adsets + get_meta_adset_targeting: audience spec,
+       optimization goal, bid strategy for a specific ad set.
+     - list_meta_ads + get_meta_ad_creative: the actual copy, image,
+       destination URL, CTA — for "is my link right" / "does the creative
+       match the angle" questions.
+     - get_meta_delivery_diagnostics: Meta's own delivery report. This
+       is often the single most useful troubleshooting call — Meta
+       itself tells you why something isn't delivering (learning-
+       limited, low delivery, policy issues, budget too tight, etc.).
+       Run this FIRST when a campaign has zero delivery.
+     - meta_read_api: raw fallback for anything not covered above (custom
+       audiences, pixels, saved audiences, ad rules).
+
+   Empty tool result never means "no access" — it means "no matching
+   data." A campaign with $0 spend has empty insights but is fully
+   visible via list_meta_campaigns. Confirm the underlying data before
+   blaming permissions.
+
 PUBLISHING is OFF by default (draft-only). The publish_to_meta tool is gated
 behind SOCIAL_MARK_ALLOW_PUBLISH and will refuse unless an admin enabled it;
 don't claim a post went live. The Email/ICYMI rows in the calendar are your
@@ -1695,6 +1723,99 @@ def _tool_get_ad_performance(args: Dict[str, Any]) -> Dict[str, Any]:
         date_preset=str(args.get("date_preset", "last_28d")),
         level=str(args.get("level", "campaign")),
     )
+
+
+def _tool_list_meta_campaigns(args: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        return meta_client.list_meta_campaigns(
+            status_filter=args.get("status_filter"),
+            limit=int(args.get("limit", 100)),
+        )
+    except meta_client.MetaError as exc:
+        return {"error": str(exc)}
+
+
+def _tool_get_meta_campaign_details(args: Dict[str, Any]) -> Dict[str, Any]:
+    campaign_id = str(args.get("campaign_id", "")).strip()
+    if not campaign_id:
+        return {"error": "campaign_id is required."}
+    try:
+        return meta_client.get_meta_campaign_details(campaign_id)
+    except meta_client.MetaError as exc:
+        return {"error": str(exc)}
+
+
+def _tool_list_meta_adsets(args: Dict[str, Any]) -> Dict[str, Any]:
+    campaign_id = str(args.get("campaign_id", "")).strip()
+    if not campaign_id:
+        return {"error": "campaign_id is required."}
+    try:
+        return meta_client.list_meta_adsets(
+            campaign_id=campaign_id, limit=int(args.get("limit", 50))
+        )
+    except meta_client.MetaError as exc:
+        return {"error": str(exc)}
+
+
+def _tool_get_meta_adset_targeting(args: Dict[str, Any]) -> Dict[str, Any]:
+    adset_id = str(args.get("adset_id", "")).strip()
+    if not adset_id:
+        return {"error": "adset_id is required."}
+    try:
+        return meta_client.get_meta_adset_targeting(adset_id)
+    except meta_client.MetaError as exc:
+        return {"error": str(exc)}
+
+
+def _tool_list_meta_ads(args: Dict[str, Any]) -> Dict[str, Any]:
+    adset_id = str(args.get("adset_id", "")).strip() or None
+    campaign_id = str(args.get("campaign_id", "")).strip() or None
+    if not adset_id and not campaign_id:
+        return {"error": "list_meta_ads requires either adset_id or campaign_id."}
+    try:
+        return meta_client.list_meta_ads(
+            adset_id=adset_id,
+            campaign_id=campaign_id,
+            limit=int(args.get("limit", 50)),
+        )
+    except meta_client.MetaError as exc:
+        return {"error": str(exc)}
+
+
+def _tool_get_meta_ad_creative(args: Dict[str, Any]) -> Dict[str, Any]:
+    ad_id = str(args.get("ad_id", "")).strip()
+    if not ad_id:
+        return {"error": "ad_id is required."}
+    try:
+        return meta_client.get_meta_ad_creative(ad_id)
+    except meta_client.MetaError as exc:
+        return {"error": str(exc)}
+
+
+def _tool_get_meta_delivery_diagnostics(args: Dict[str, Any]) -> Dict[str, Any]:
+    object_id = str(args.get("object_id", "")).strip()
+    if not object_id:
+        return {"error": "object_id (campaign/adset/ad id) is required."}
+    try:
+        return meta_client.get_meta_delivery_diagnostics(object_id)
+    except meta_client.MetaError as exc:
+        return {"error": str(exc)}
+
+
+def _tool_meta_read_api(args: Dict[str, Any]) -> Dict[str, Any]:
+    path = str(args.get("path", "")).strip()
+    if not path:
+        return {"error": "path is required."}
+    fields = args.get("fields")
+    params = args.get("params") or None
+    try:
+        return meta_client.meta_read_api(
+            path=path,
+            fields=str(fields) if fields else None,
+            params=params if isinstance(params, dict) else None,
+        )
+    except meta_client.MetaError as exc:
+        return {"error": str(exc)}
 
 
 def _tool_publish_to_meta(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -3855,7 +3976,10 @@ TOOLS: List[Dict[str, Any]] = [
         "description": (
             "Paid-social performance from the Meta Ad account (spend, "
             "impressions, reach, clicks, CPC, CTR, actions). date_preset like "
-            "'last_7d', 'last_28d', 'last_30d'; level 'campaign' | 'adset' | 'ad'."
+            "'last_7d', 'last_28d', 'last_30d'; level 'campaign' | 'adset' | 'ad'. "
+            "NOTE: /insights only returns entities with actual activity — "
+            "new/paused/zero-spend campaigns are invisible here. To see them, "
+            "use list_meta_campaigns instead."
         ),
         "input_schema": {
             "type": "object",
@@ -3864,6 +3988,151 @@ TOOLS: List[Dict[str, Any]] = [
                 "date_preset": {"type": "string"},
                 "level": {"type": "string"},
             },
+        },
+    },
+    {
+        "name": "list_meta_campaigns",
+        "description": (
+            "List every campaign in the Meta ad account, including "
+            "new/paused/zero-spend ones invisible to get_ad_performance. "
+            "Returns objects (status, budget, dates) not metrics."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "status_filter": {
+                    "type": "string",
+                    "description": "ACTIVE | PAUSED | DELETED | ARCHIVED. Omit for all.",
+                },
+                "limit": {"type": "integer", "description": "Default 100."},
+            },
+        },
+    },
+    {
+        "name": "get_meta_campaign_details",
+        "description": (
+            "Full settings for one campaign: objective, budget, dates, "
+            "delivery flags, pacing, issues_info. Use when troubleshooting "
+            "why a campaign isn't behaving as expected."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "campaign_id": {"type": "string"},
+            },
+            "required": ["campaign_id"],
+        },
+    },
+    {
+        "name": "list_meta_adsets",
+        "description": (
+            "List ad sets under a campaign. Returns objects with status, "
+            "budget, optimization goal — NOT the full targeting spec. For "
+            "targeting, use get_meta_adset_targeting on a specific ad set."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "campaign_id": {"type": "string"},
+                "limit": {"type": "integer", "description": "Default 50."},
+            },
+            "required": ["campaign_id"],
+        },
+    },
+    {
+        "name": "get_meta_adset_targeting",
+        "description": (
+            "Full targeting spec for one ad set — custom_audiences, "
+            "lookalikes, interests, behaviors, geo, age, gender, "
+            "placements, optimization goal. This is the answer to 'who is "
+            "this ad targeting.' Targeting object is deeply nested; read "
+            "it structurally, don't try to summarize the whole thing."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"adset_id": {"type": "string"}},
+            "required": ["adset_id"],
+        },
+    },
+    {
+        "name": "list_meta_ads",
+        "description": (
+            "List ads under an ad set (preferred) or a campaign. Returns "
+            "objects with status and creative reference. For the actual "
+            "creative (copy, image, destination URL) use "
+            "get_meta_ad_creative on a specific ad."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "adset_id": {"type": "string"},
+                "campaign_id": {"type": "string"},
+                "limit": {"type": "integer", "description": "Default 50."},
+            },
+        },
+    },
+    {
+        "name": "get_meta_ad_creative",
+        "description": (
+            "Full creative for one ad: copy, headline, body, image URL, "
+            "destination URL, CTA, preview link, video id. Use when "
+            "troubleshooting 'is my landing page URL right,' 'does my "
+            "creative match my angle,' 'what CTA am I using.'"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"ad_id": {"type": "string"}},
+            "required": ["ad_id"],
+        },
+    },
+    {
+        "name": "get_meta_delivery_diagnostics",
+        "description": (
+            "Meta's own delivery diagnostics for a campaign, ad set, or "
+            "ad: issues_info (policy issues, learning-limited flags, low "
+            "delivery reasons) + recommendations. Often the single most "
+            "useful troubleshooting endpoint — Meta itself tells you why "
+            "something isn't delivering. Accepts any object id "
+            "(campaign / adset / ad)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"object_id": {"type": "string"}},
+            "required": ["object_id"],
+        },
+    },
+    {
+        "name": "meta_read_api",
+        "description": (
+            "Raw read-only Marketing API call — the fallback for anything "
+            "not covered by the structured tools above. Same shape as "
+            "run_warehouse_query but for the Meta Graph API. Use when you "
+            "need a field the structured tools don't expose, or when "
+            "querying an object type without a dedicated tool (e.g. "
+            "custom_audiences, saved_audiences, pixels)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": (
+                        "Graph API path without leading slash. Examples: "
+                        "'act_27829552/customaudiences', "
+                        "'52607991847687' (an object id), "
+                        "'52607991847687/insights'."
+                    ),
+                },
+                "fields": {
+                    "type": "string",
+                    "description": "Comma-separated field list.",
+                },
+                "params": {
+                    "type": "object",
+                    "description": "Additional query params (limit, effective_status, etc.).",
+                },
+            },
+            "required": ["path"],
         },
     },
     {
@@ -4141,6 +4410,14 @@ TOOL_HANDLERS: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     "get_instagram_insights": _tool_get_instagram_insights,
     "get_recent_social_posts": _tool_get_recent_social_posts,
     "get_ad_performance": _tool_get_ad_performance,
+    "list_meta_campaigns": _tool_list_meta_campaigns,
+    "get_meta_campaign_details": _tool_get_meta_campaign_details,
+    "list_meta_adsets": _tool_list_meta_adsets,
+    "get_meta_adset_targeting": _tool_get_meta_adset_targeting,
+    "list_meta_ads": _tool_list_meta_ads,
+    "get_meta_ad_creative": _tool_get_meta_ad_creative,
+    "get_meta_delivery_diagnostics": _tool_get_meta_delivery_diagnostics,
+    "meta_read_api": _tool_meta_read_api,
     "publish_to_meta": _tool_publish_to_meta,
     "draft_facebook_post": _tool_draft_facebook_post,
     "save_image_to_drive": _tool_save_image_to_drive,
