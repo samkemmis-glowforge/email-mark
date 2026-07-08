@@ -49,6 +49,20 @@ def main() -> int:
             preheader=meta.get("preheader"),
             name=meta.get("name"),
         )
+    elif meta.get("clone_from_email_id"):
+        # Email type (BATCH vs AUTOMATED) is fixed at creation and clones
+        # inherit it — cloning an AUTOMATED_EMAIL is the only API route to
+        # a workflow-usable draft (see prompts/lessons_learned.md 2026-07-08).
+        cloned = hm.clone_marketing_email(
+            str(meta["clone_from_email_id"]), meta["name"]
+        )
+        result = hm.update_email_draft_v2(
+            email_id=str(cloned["id"]),
+            body_html=body_html,
+            subject=meta.get("subject"),
+            preheader=meta.get("preheader"),
+            name=meta.get("name"),
+        )
     else:
         result = hm.create_email_draft_v2(
             name=meta["name"],
@@ -56,10 +70,13 @@ def main() -> int:
             body_html=body_html,
             preheader=meta.get("preheader"),
         )
-        if result.get("email_id"):
-            meta["email_id"] = result["email_id"]
-            meta_path.write_text(json.dumps(meta, indent=2) + "\n")
-            print(f"Wrote email_id={result['email_id']} back to {meta_path}")
+
+    if not email_id and result.get("email_id"):
+        meta["email_id"] = result["email_id"]
+        meta_path.write_text(
+            json.dumps(meta, indent=2, ensure_ascii=False) + "\n"
+        )
+        print(f"Wrote email_id={result['email_id']} back to {meta_path}")
 
     print(json.dumps(result, indent=2))
     return 0 if "error" not in result else 1
