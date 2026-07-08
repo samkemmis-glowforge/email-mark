@@ -69,6 +69,20 @@ context to avoid the trap, not to teach the full topic.
   customer-level state for this reason.
   (Learned 2026-06-11)
 
+## HubSpot — marketing emails
+
+- An email's type (`BATCH_EMAIL` vs `AUTOMATED_EMAIL`, aka "save for
+  automation" / usable in workflows) is fixed at creation. PATCH-ing
+  `type`/`subcategory` on an existing email returns 200 OK but silently
+  changes nothing, and the v3 create endpoint silently ignores a
+  `type` field too. The only API route to an automated email is to
+  CLONE an existing `AUTOMATED_EMAIL` (clones inherit type) and then
+  overwrite its name/subject/content. To finish "saving for
+  automation," the email must also be published (state
+  `AUTOMATED_DRAFT` → live for workflows) — that's a deliberate
+  go-live action, not part of drafting.
+  (Learned 2026-07-08)
+
 ## HubSpot — billing levers
 
 - Marketing contact count is the dominant cost driver on Glowforge's
