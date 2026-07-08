@@ -1239,8 +1239,11 @@ def count_list_intersection(
 # To find a working ID: in HubSpot, open any minimal-template email
 # (header + footer + one custom-HTML body widget), and the ID is in
 # the edit URL: app.hubspot.com/email/8614495/edit/<ID>/content
+# 216753079928 = "Blank canvas template (Mark) — DO NOT SEND, clone source",
+# recreated 2026-07-08 from the archived original (214440003148), which
+# HubSpot trashed into an unclonable state.
 BLANK_CANVAS_TEMPLATE_ID = os.environ.get(
-    "HUBSPOT_BLANK_CANVAS_TEMPLATE_ID", "214440003148"
+    "HUBSPOT_BLANK_CANVAS_TEMPLATE_ID", "216753079928"
 )
 
 
@@ -1283,12 +1286,15 @@ def _find_custom_html_widget_id(widgets: Dict[str, Any]) -> Optional[str]:
     if not isinstance(widgets, dict):
         return None
 
-    # Strategy 1: explicit path match.
+    # Strategy 1: explicit path match. Some template configurations put
+    # the module path on widget.path, others on widget.body.path — check
+    # both.
     path_matches: List[str] = []
     for wid, widget in widgets.items():
         if not isinstance(widget, dict):
             continue
-        path = (widget.get("path") or "").lower()
+        body = widget.get("body") if isinstance(widget.get("body"), dict) else {}
+        path = (widget.get("path") or body.get("path") or "").lower()
         if path and (
             path == "@hubspot/raw_html_email"
             or "raw_html" in path
@@ -1317,6 +1323,8 @@ def _find_custom_html_widget_id(widgets: Dict[str, Any]) -> Optional[str]:
     for wid, widget in widgets.items():
         if not isinstance(widget, dict):
             continue
+        if (widget.get("type") or "").lower() == "text":
+            continue  # plain-text widget (e.g. preview_text) — never the HTML body
         body = widget.get("body") if isinstance(widget.get("body"), dict) else {}
         body_keys = set(body.keys()) if isinstance(body, dict) else set()
         if body_keys & _IMAGE_BODY_FIELDS:
