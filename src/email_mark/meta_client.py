@@ -99,9 +99,17 @@ def _handle(resp: requests.Response) -> Dict[str, Any]:
         raise MetaError(f"Non-JSON response (HTTP {resp.status_code}): {resp.text[:300]}")
     if isinstance(payload, dict) and payload.get("error"):
         err = payload["error"]
+        # error_user_title/msg carry Meta's actual explanation ("must
+        # specify X field") — without them error 100 is just "Invalid
+        # parameter" and undebuggable.
+        detail = ": ".join(
+            p for p in (err.get("error_user_title"), err.get("error_user_msg")) if p
+        )
         raise MetaError(
-            f"Graph API error {err.get('code')}: {err.get('message')} "
-            f"(type={err.get('type')})"
+            f"Graph API error {err.get('code')}"
+            f"{'/' + str(err.get('error_subcode')) if err.get('error_subcode') else ''}"
+            f": {err.get('message')} (type={err.get('type')})"
+            f"{' — ' + detail if detail else ''}"
         )
     if resp.status_code >= 400:
         raise MetaError(f"HTTP {resp.status_code}: {resp.text[:300]}")
@@ -781,6 +789,11 @@ def create_meta_campaign(
         data["daily_budget"] = int(daily_budget_cents)
     if lifetime_budget_cents is not None:
         data["lifetime_budget"] = int(lifetime_budget_cents)
+    else:
+        if daily_budget_cents is None:
+            # No CBO budget -> Meta requires this field (subcode 4834011).
+            # False = ad sets keep their own budgets, the conservative choice.
+            data["is_adset_budget_sharing_enabled"] = "false"
     result = _post(f"{_act()}/campaigns", data)
     return {
         "created": "campaign",
@@ -936,7 +949,10 @@ def create_meta_ad_creative(
         }
     spec: Dict[str, Any] = {"page_id": page, "link_data": link_data}
     if instagram_actor_id:
-        spec["instagram_actor_id"] = instagram_actor_id
+        # Meta renamed this: object_story_spec now takes instagram_user_id
+        # (the IG Business account id); instagram_actor_id is rejected with
+        # "must be a valid Instagram account id".
+        spec["instagram_user_id"] = instagram_actor_id
     data = {
         "access_token": _ads_token(),
         "name": _mark_name(name),
