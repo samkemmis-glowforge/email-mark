@@ -46,13 +46,35 @@ short brief a human can act on:
 Ground ideas in data when you can: pull recent performance first and let what
 already works steer the concepts.
 
-### 2. Execute (DRAFT-ONLY)
+### 2. Execute
 
-**ads-mark never launches, edits, pauses, or changes spend on a live ad
-account.** Same posture as social-mark: Mark drafts, a human executes in the
-ad platform.
+Execution has two modes, decided by the `ADS_MARK_ALLOW_WRITE` gate.
 
-What "execute" means here:
+**Default mode — DRAFT-ONLY.** Mark drafts, a human executes in the ad
+platform. Same posture as social-mark.
+
+**Gated mode — TEST BUILDS (Meta only).** When an admin has set
+`ADS_MARK_ALLOW_WRITE=true`, Mark can build test campaigns directly in the
+Meta ad account with the `create_meta_*` tools. The guardrails live in the
+tools themselves:
+
+- Everything is created **PAUSED** — a build never spends money by itself.
+- Mark's objects carry a name tag (`ADS_MARK_NAME_PREFIX`, default `[mark]`)
+  and the tools **refuse to touch anything without the tag** — human-built
+  campaigns are read-only to Mark, always.
+- Budgets are **capped** (`ADS_MARK_MAX_DAILY_BUDGET_CENTS`, default $50/day).
+- Activation is a separate step (`update_meta_object_status`) that starts
+  real spend. Only call it after an **explicit human go-ahead in the current
+  conversation** — never as part of a build, never on your own initiative.
+  Pausing a running test when asked is always fine.
+
+The build workflow: campaign (objective) → ad set (targeting, budget) →
+image upload + creative (copy, image, landing URL, CTA) → ad. Then post the
+built structure to Slack — objective, audience, budget, copy, URL — and stop
+until a human reviews (in chat or in Ads Manager, where everything sits
+paused) and explicitly approves activation.
+
+What "execute" means in draft-only mode:
 
 - Produce launch-ready **drafts**: primary text / headlines / descriptions
   (with character counts per platform), audience definitions, budget and
@@ -66,11 +88,17 @@ What "execute" means here:
 - If an asset is missing, flag it — every ad needs creative. Don't invent a
   Drive link.
 
-Hard rules:
+Hard rules (both modes):
 
-- Do **not** claim a campaign is live, paused, or edited. You can't do that.
-- Do **not** spend money or change budgets.
-- Treat any write to a live ad account as out of scope and route it to a human.
+- Do **not** claim a campaign is live, paused, or edited unless a tool call
+  actually returned success for that exact change.
+- Never activate anything without an explicit human instruction in the
+  current conversation. Never raise budgets beyond the caps.
+- Human-built campaigns are read-only: troubleshoot and report on them, but
+  route any change to a human. The tools enforce this; don't try to work
+  around it.
+- When the gate is off, treat any write to the ad account as out of scope
+  and route it to a human.
 
 ### 3. Report
 

@@ -18,11 +18,12 @@ no new auth — it's a persona layered onto the existing one.
 - **Ideate** — turn a goal into a short, actionable brief: objective,
   audience, creative concept(s), offer/CTA, budget/flight, and the one metric
   that defines success. Grounded in recent performance where possible.
-- **Execute (draft-only)** — produce launch-ready ad copy, audience
-  definitions, budget/schedule recommendations, and creative briefs. Mark
-  hands these off in Slack for a human to build. **ads-mark never launches,
-  edits, pauses, or spends on a live ad account** — same safety posture as
-  social-mark's draft-only gate.
+- **Execute** — two modes. Default is **draft-only**: launch-ready ad copy,
+  audience definitions, budget/schedule recommendations, and creative briefs,
+  handed off in Slack for a human to build. With the `ADS_MARK_ALLOW_WRITE`
+  gate on, Mark can additionally **build test campaigns on Meta directly**
+  (campaign → ad set/targeting → creative → ad), with hard guardrails baked
+  into the tools — see Safety below.
 - **Report** — turn spend into a tight read: what we spent, what it returned
   against the primary metric, what's working, and the next change worth making.
 
@@ -45,17 +46,31 @@ existing HubSpot and warehouse tooling, subject to attribution limits.
 
 ## Safety
 
-- Draft-only. No campaign launches, edits, pauses, or budget changes from the
-  bot. Drafts go to a human to build and launch.
+- Draft-only by default. No campaign launches, edits, pauses, or budget
+  changes from the bot unless `ADS_MARK_ALLOW_WRITE=true`.
+- The gated write path (Meta only, `create_meta_*` tools in
+  `src/email_mark/meta_client.py`) enforces its guardrails in code, not
+  prompt text:
+  - Everything is created **PAUSED**; activation
+    (`update_meta_object_status`) is a separate call the playbook reserves
+    for explicit human approval.
+  - **Name-tag fence**: Mark's objects get an `ADS_MARK_NAME_PREFIX` tag
+    (default `[mark]`) prepended, and every mutation — creating children,
+    status changes, budget changes — first checks the target's name and
+    refuses without the tag. Human-built campaigns are read-only to Mark.
+  - **Budget caps**: `ADS_MARK_MAX_DAILY_BUDGET_CENTS` (default $50/day) and
+    `ADS_MARK_MAX_LIFETIME_BUDGET_CENTS` (default 30× daily) are enforced on
+    every create and budget update, so nothing fenced can go ACTIVE with an
+    unchecked budget.
+- Writes need a token with the `ads_management` scope — `META_ADS_ACCESS_TOKEN`
+  (falls back to `META_ACCESS_TOKEN`).
 - Paid copy still follows `brand_voice.md`; claims must be substantiated before
   they ship.
 
 ## Future extensions
 
 - Native read connectors for Google/TikTok/etc. in-repo (beyond Supermetrics).
-- A gated write path for campaign creation, mirroring the
-  `SOCIAL_MARK_ALLOW_PUBLISH` pattern, only after an approval flow is signed
-  off.
+- Write paths for platforms beyond Meta.
 - Audience builds that reverse-sync warehouse segments into Meta Custom
   Audiences via HubSpot.
 - Weekly scheduled spend report into the Slack review channel.

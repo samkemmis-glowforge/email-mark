@@ -1457,6 +1457,28 @@ Two jobs:
    visible via list_meta_campaigns. Confirm the underlying data before
    blaming permissions.
 
+4. BUILD TEST CAMPAIGNS (GATED behind ADS_MARK_ALLOW_WRITE). When the ads
+   write gate is on, you can BUILD paid campaigns to test new targeting,
+   messaging, and creative. Guardrails are enforced by the tools, not by
+   you: everything is created PAUSED (nothing spends at creation), you can
+   only modify objects Mark built (name-tag fence — the tools refuse on
+   human-built campaigns), and budgets are capped.
+
+   Build order: create_meta_campaign -> create_meta_adset (the targeting)
+   -> upload_meta_ad_image (if there's an image asset) ->
+   create_meta_ad_creative (the messaging) -> create_meta_ad. Budgets are
+   in CENTS. Ad copy follows the ads playbook voice rules — substantiate
+   claims before they ship.
+
+   After building, post a summary of the structure in Slack (objective,
+   audience, budget, copy, landing URL, ad preview if available) and STOP.
+   Setting anything ACTIVE starts real spend: only call
+   update_meta_object_status with ACTIVE after an explicit human go-ahead
+   in the current conversation — never on your own initiative, and never
+   as part of the build. Pausing a running test on request is always fine.
+   If the gate is off the tools refuse; fall back to the draft-only
+   handoff (brief in Slack, human builds in Ads Manager).
+
 PUBLISHING is OFF by default (draft-only). The publish_to_meta tool is gated
 behind SOCIAL_MARK_ALLOW_PUBLISH and will refuse unless an admin enabled it;
 don't claim a post went live. The Email/ICYMI rows in the calendar are your
@@ -1813,6 +1835,113 @@ def _tool_meta_read_api(args: Dict[str, Any]) -> Dict[str, Any]:
             path=path,
             fields=str(fields) if fields else None,
             params=params if isinstance(params, dict) else None,
+        )
+    except meta_client.MetaError as exc:
+        return {"error": str(exc)}
+
+
+def _int_or_none(value: Any) -> Any:
+    """Coerce a tool arg to int, passing None through (for budget params)."""
+    return None if value is None else int(value)
+
+
+def _tool_create_meta_campaign(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Gated by ADS_MARK_ALLOW_WRITE. Always creates PAUSED."""
+    try:
+        return meta_client.create_meta_campaign(
+            name=str(args.get("name", "")),
+            objective=str(args.get("objective", "")),
+            daily_budget_cents=_int_or_none(args.get("daily_budget_cents")),
+            lifetime_budget_cents=_int_or_none(args.get("lifetime_budget_cents")),
+            special_ad_categories=args.get("special_ad_categories") or None,
+        )
+    except meta_client.MetaError as exc:
+        return {"error": str(exc)}
+
+
+def _tool_create_meta_adset(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Gated. Parent campaign must be Mark-built. Always creates PAUSED."""
+    targeting = args.get("targeting")
+    if not isinstance(targeting, dict):
+        return {"error": "targeting must be a Meta targeting-spec object."}
+    try:
+        return meta_client.create_meta_adset(
+            campaign_id=str(args.get("campaign_id", "")),
+            name=str(args.get("name", "")),
+            targeting=targeting,
+            optimization_goal=str(args.get("optimization_goal") or "LINK_CLICKS"),
+            billing_event=str(args.get("billing_event") or "IMPRESSIONS"),
+            daily_budget_cents=_int_or_none(args.get("daily_budget_cents")),
+            lifetime_budget_cents=_int_or_none(args.get("lifetime_budget_cents")),
+            start_time=args.get("start_time") or None,
+            end_time=args.get("end_time") or None,
+            bid_strategy=args.get("bid_strategy") or None,
+            promoted_object=args.get("promoted_object") or None,
+            destination_type=args.get("destination_type") or None,
+        )
+    except meta_client.MetaError as exc:
+        return {"error": str(exc)}
+
+
+def _tool_upload_meta_ad_image(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Gated. Uploads an image to the ad library, returns image_hash."""
+    try:
+        return meta_client.upload_meta_ad_image(
+            image_url=args.get("image_url") or None,
+            image_filename=str(args.get("image_filename") or "ad-image.jpg"),
+        )
+    except meta_client.MetaError as exc:
+        return {"error": str(exc)}
+
+
+def _tool_create_meta_ad_creative(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Gated. Creates a link-ad creative (copy + image + URL + CTA)."""
+    try:
+        return meta_client.create_meta_ad_creative(
+            name=str(args.get("name", "")),
+            message=str(args.get("message", "")),
+            link_url=str(args.get("link_url", "")),
+            headline=args.get("headline") or None,
+            description=args.get("description") or None,
+            image_hash=args.get("image_hash") or None,
+            image_url=args.get("image_url") or None,
+            call_to_action_type=str(args.get("call_to_action_type") or "LEARN_MORE"),
+            instagram_actor_id=args.get("instagram_actor_id") or None,
+        )
+    except meta_client.MetaError as exc:
+        return {"error": str(exc)}
+
+
+def _tool_create_meta_ad(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Gated. Parent ad set must be Mark-built. Always creates PAUSED."""
+    try:
+        return meta_client.create_meta_ad(
+            name=str(args.get("name", "")),
+            adset_id=str(args.get("adset_id", "")),
+            creative_id=str(args.get("creative_id", "")),
+        )
+    except meta_client.MetaError as exc:
+        return {"error": str(exc)}
+
+
+def _tool_update_meta_object_status(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Gated + fenced. ACTIVE only after explicit human approval in Slack."""
+    try:
+        return meta_client.update_meta_object_status(
+            object_id=str(args.get("object_id", "")),
+            status=str(args.get("status", "")),
+        )
+    except meta_client.MetaError as exc:
+        return {"error": str(exc)}
+
+
+def _tool_update_meta_budget(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Gated + fenced + capped budget change on a Mark-built object."""
+    try:
+        return meta_client.update_meta_budget(
+            object_id=str(args.get("object_id", "")),
+            daily_budget_cents=_int_or_none(args.get("daily_budget_cents")),
+            lifetime_budget_cents=_int_or_none(args.get("lifetime_budget_cents")),
         )
     except meta_client.MetaError as exc:
         return {"error": str(exc)}
@@ -4136,6 +4265,184 @@ TOOLS: List[Dict[str, Any]] = [
         },
     },
     {
+        "name": "create_meta_campaign",
+        "description": (
+            "GATED (ADS_MARK_ALLOW_WRITE) — create a new Meta campaign for "
+            "testing. Always created PAUSED with the ads-mark name tag; "
+            "budgets in cents and capped. Budget here = CBO; or omit and "
+            "set budgets per ad set. Build order: campaign -> adset -> "
+            "creative -> ad. Refuses when the gate is off — fall back to "
+            "the draft-only Slack handoff."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "objective": {
+                    "type": "string",
+                    "description": (
+                        "OUTCOME_TRAFFIC | OUTCOME_SALES | OUTCOME_LEADS | "
+                        "OUTCOME_AWARENESS | OUTCOME_ENGAGEMENT | "
+                        "OUTCOME_APP_PROMOTION"
+                    ),
+                },
+                "daily_budget_cents": {"type": "integer"},
+                "lifetime_budget_cents": {"type": "integer"},
+                "special_ad_categories": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Usually omit — Glowforge ads aren't in a special category.",
+                },
+            },
+            "required": ["name", "objective"],
+        },
+    },
+    {
+        "name": "create_meta_adset",
+        "description": (
+            "GATED — create an ad set (the TARGETING layer) under a "
+            "Mark-built campaign. Always PAUSED. targeting is Meta's full "
+            "spec object: geo_locations required, plus age_min/age_max, "
+            "genders, interests/flexible_spec, custom_audiences, "
+            "publisher_platforms. Needs a daily or lifetime budget unless "
+            "the campaign has CBO; lifetime budget requires end_time. "
+            "Refuses on human-built campaigns."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "campaign_id": {"type": "string"},
+                "name": {"type": "string"},
+                "targeting": {
+                    "type": "object",
+                    "description": (
+                        'e.g. {"geo_locations": {"countries": ["US"]}, '
+                        '"age_min": 25, "flexible_spec": [{"interests": '
+                        '[{"id": "...", "name": "Woodworking"}]}]}'
+                    ),
+                },
+                "optimization_goal": {
+                    "type": "string",
+                    "description": "Default LINK_CLICKS. e.g. OFFSITE_CONVERSIONS, REACH, LANDING_PAGE_VIEWS.",
+                },
+                "billing_event": {"type": "string", "description": "Default IMPRESSIONS."},
+                "daily_budget_cents": {"type": "integer"},
+                "lifetime_budget_cents": {"type": "integer"},
+                "start_time": {"type": "string", "description": "ISO 8601, optional."},
+                "end_time": {"type": "string", "description": "ISO 8601; required with lifetime budget."},
+                "bid_strategy": {"type": "string"},
+                "promoted_object": {
+                    "type": "object",
+                    "description": "For conversion goals: {pixel_id, custom_event_type}.",
+                },
+                "destination_type": {"type": "string"},
+            },
+            "required": ["campaign_id", "name", "targeting"],
+        },
+    },
+    {
+        "name": "upload_meta_ad_image",
+        "description": (
+            "GATED — upload an image to the ad account's library and get "
+            "back an image_hash for create_meta_ad_creative. Pass a "
+            "public/fetchable image_url (Drive share links won't work; "
+            "HubSpot CDN URLs do)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "image_url": {"type": "string"},
+                "image_filename": {"type": "string", "description": "Default ad-image.jpg."},
+            },
+            "required": ["image_url"],
+        },
+    },
+    {
+        "name": "create_meta_ad_creative",
+        "description": (
+            "GATED — create a link-ad creative: the MESSAGING layer. "
+            "message = primary text, headline = bold title, description = "
+            "secondary line, link_url = landing page, plus image "
+            "(image_hash preferred) and CTA. Runs nothing on its own — "
+            "attach it to an ad with create_meta_ad. Copy must follow the "
+            "ads playbook voice rules."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "message": {"type": "string", "description": "Primary text."},
+                "link_url": {"type": "string", "description": "Landing page URL."},
+                "headline": {"type": "string"},
+                "description": {"type": "string"},
+                "image_hash": {"type": "string", "description": "From upload_meta_ad_image. Preferred."},
+                "image_url": {"type": "string", "description": "Fallback if no hash; must be public."},
+                "call_to_action_type": {
+                    "type": "string",
+                    "description": "Default LEARN_MORE. e.g. SHOP_NOW, SIGN_UP, GET_OFFER.",
+                },
+                "instagram_actor_id": {
+                    "type": "string",
+                    "description": "Set to enable IG placements; omit for FB-only.",
+                },
+            },
+            "required": ["name", "message", "link_url"],
+        },
+    },
+    {
+        "name": "create_meta_ad",
+        "description": (
+            "GATED — attach a creative to a Mark-built ad set as an ad. "
+            "Always created PAUSED; activation is a separate human-approved "
+            "step via update_meta_object_status."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "adset_id": {"type": "string"},
+                "creative_id": {"type": "string", "description": "From create_meta_ad_creative."},
+            },
+            "required": ["name", "adset_id", "creative_id"],
+        },
+    },
+    {
+        "name": "update_meta_object_status",
+        "description": (
+            "GATED — set a Mark-built campaign/ad set/ad ACTIVE or PAUSED. "
+            "Refuses on anything not built by Mark (name-tag fence). "
+            "ACTIVE starts real spend: ONLY call it after an explicit "
+            "human go-ahead in this conversation, never on your own "
+            "initiative. PAUSE freely if the human asks to stop a test."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "object_id": {"type": "string"},
+                "status": {"type": "string", "description": "ACTIVE | PAUSED."},
+            },
+            "required": ["object_id", "status"],
+        },
+    },
+    {
+        "name": "update_meta_budget",
+        "description": (
+            "GATED — change the daily/lifetime budget (cents) on a "
+            "Mark-built campaign or ad set. Capped by "
+            "ADS_MARK_MAX_DAILY_BUDGET_CENTS; refuses on human-built "
+            "objects."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "object_id": {"type": "string"},
+                "daily_budget_cents": {"type": "integer"},
+                "lifetime_budget_cents": {"type": "integer"},
+            },
+            "required": ["object_id"],
+        },
+    },
+    {
         "name": "publish_to_meta",
         "description": (
             "GATED — publishing is disabled by default (draft-only). Refuses "
@@ -4418,6 +4725,13 @@ TOOL_HANDLERS: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
     "get_meta_ad_creative": _tool_get_meta_ad_creative,
     "get_meta_delivery_diagnostics": _tool_get_meta_delivery_diagnostics,
     "meta_read_api": _tool_meta_read_api,
+    "create_meta_campaign": _tool_create_meta_campaign,
+    "create_meta_adset": _tool_create_meta_adset,
+    "upload_meta_ad_image": _tool_upload_meta_ad_image,
+    "create_meta_ad_creative": _tool_create_meta_ad_creative,
+    "create_meta_ad": _tool_create_meta_ad,
+    "update_meta_object_status": _tool_update_meta_object_status,
+    "update_meta_budget": _tool_update_meta_budget,
     "publish_to_meta": _tool_publish_to_meta,
     "draft_facebook_post": _tool_draft_facebook_post,
     "save_image_to_drive": _tool_save_image_to_drive,

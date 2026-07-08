@@ -23,6 +23,7 @@ callers (agent tools) can surface a clean message.
 
 from __future__ import annotations
 
+import json
 import os
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional
@@ -616,3 +617,401 @@ def publish_instagram_post(*, image_url: str, caption: str) -> Dict[str, Any]:
     if not creation_id:
         raise MetaError(f"IG container creation returned no id: {container}")
     return _post(f"{ig_id}/media_publish", {"creation_id": creation_id})
+
+
+# ---------------------------------------------------------------------------
+# WRITING — Marketing API campaign builds (GATED behind ADS_MARK_ALLOW_WRITE)
+#
+# Lets Mark BUILD test campaigns — new targeting, messaging, creative —
+# without being able to touch anything a human built or spend money
+# unsupervised. Three guardrails are baked into every function here, not
+# left to the model's judgement:
+#
+#   1. GATE.   Every write refuses unless ADS_MARK_ALLOW_WRITE == "true"
+#              (mirrors SOCIAL_MARK_ALLOW_PUBLISH).
+#   2. PAUSED. Campaigns, ad sets, and ads are always created with
+#              status=PAUSED. Nothing spends at creation time. Activation
+#              is a separate, explicit call.
+#   3. FENCE.  Created objects get an ADS_MARK_NAME_PREFIX tag prepended
+#              to their name, and every mutation (child creation, status
+#              change, budget change) first fetches the target's name and
+#              refuses unless it carries the tag. Mark can never pause,
+#              edit, or add to a human-built live campaign.
+#
+# Budgets are capped: ADS_MARK_MAX_DAILY_BUDGET_CENTS (default 5000 =
+# $50/day) and ADS_MARK_MAX_LIFETIME_BUDGET_CENTS (default 30x daily cap).
+# Caps are enforced at create/update time, and only tag-fenced objects can
+# be activated, so an object can never go ACTIVE with an unchecked budget.
+#
+# Auth: writes need the ads_management scope. If the main
+# META_ACCESS_TOKEN is a Page token without it, put a System User token
+# with ads_management in META_ADS_ACCESS_TOKEN — writes prefer it and fall
+# back to META_ACCESS_TOKEN.
+# ---------------------------------------------------------------------------
+
+
+# ODAX objectives — the only ones creatable on current API versions.
+_VALID_OBJECTIVES = {
+    "OUTCOME_AWARENESS",
+    "OUTCOME_TRAFFIC",
+    "OUTCOME_ENGAGEMENT",
+    "OUTCOME_LEADS",
+    "OUTCOME_APP_PROMOTION",
+    "OUTCOME_SALES",
+}
+
+
+def ads_write_enabled() -> bool:
+    """True only when the ads write gate is explicitly flipped on."""
+    return os.environ.get("ADS_MARK_ALLOW_WRITE", "").strip().lower() == "true"
+
+
+def _guard_ads_write() -> None:
+    if not ads_write_enabled():
+        raise MetaError(
+            "Ads writes are disabled. ads-mark is in draft-only mode "
+            "(ADS_MARK_ALLOW_WRITE != 'true'). Hand the draft to a human to "
+            "build in Ads Manager, or have an admin flip the gate."
+        )
+
+
+def _ads_token() -> str:
+    return os.environ.get("META_ADS_ACCESS_TOKEN") or _token()
+
+
+def _act() -> str:
+    act = _require("META_AD_ACCOUNT_ID", "write to the Meta ad account")
+    return act if act.startswith("act_") else f"act_{act}"
+
+
+def _mark_prefix() -> str:
+    return os.environ.get("ADS_MARK_NAME_PREFIX", "[mark]").strip() or "[mark]"
+
+
+def _mark_name(name: str) -> str:
+    name = (name or "").strip()
+    if not name:
+        raise MetaError("A non-empty name is required.")
+    prefix = _mark_prefix()
+    return name if name.startswith(prefix) else f"{prefix} {name}"
+
+
+def _budget_caps() -> tuple:
+    daily = int(os.environ.get("ADS_MARK_MAX_DAILY_BUDGET_CENTS", "5000"))
+    lifetime = int(
+        os.environ.get("ADS_MARK_MAX_LIFETIME_BUDGET_CENTS", str(daily * 30))
+    )
+    return daily, lifetime
+
+
+def _check_budget(
+    daily_budget_cents: Optional[int], lifetime_budget_cents: Optional[int]
+) -> None:
+    daily_cap, lifetime_cap = _budget_caps()
+    if daily_budget_cents is not None:
+        if int(daily_budget_cents) <= 0:
+            raise MetaError("daily_budget_cents must be a positive integer.")
+        if int(daily_budget_cents) > daily_cap:
+            raise MetaError(
+                f"daily_budget_cents={daily_budget_cents} exceeds the ads-mark "
+                f"cap of {daily_cap} cents/day (ADS_MARK_MAX_DAILY_BUDGET_CENTS). "
+                f"Ask a human to raise the cap or lower the budget."
+            )
+    if lifetime_budget_cents is not None:
+        if int(lifetime_budget_cents) <= 0:
+            raise MetaError("lifetime_budget_cents must be a positive integer.")
+        if int(lifetime_budget_cents) > lifetime_cap:
+            raise MetaError(
+                f"lifetime_budget_cents={lifetime_budget_cents} exceeds the "
+                f"ads-mark cap of {lifetime_cap} cents "
+                f"(ADS_MARK_MAX_LIFETIME_BUDGET_CENTS)."
+            )
+
+
+def _require_mark_object(object_id: str, action: str) -> Dict[str, Any]:
+    """Fetch an object's name and refuse unless it carries the mark tag.
+
+    The fence that keeps Mark inside its own sandbox: humans build
+    campaigns without the tag, so those objects are immutable to Mark.
+    """
+    if not object_id:
+        raise MetaError(f"An object id is required to {action}.")
+    obj = _get(str(object_id), {"fields": "id,name", "access_token": _ads_token()})
+    name = obj.get("name") or ""
+    prefix = _mark_prefix()
+    if not name.startswith(prefix):
+        raise MetaError(
+            f"Refusing to {action}: object {object_id} ({name!r}) was not "
+            f"created by ads-mark (its name lacks the {prefix!r} tag). Mark "
+            f"only modifies campaigns/ad sets/ads it built itself."
+        )
+    return obj
+
+
+def create_meta_campaign(
+    *,
+    name: str,
+    objective: str,
+    daily_budget_cents: Optional[int] = None,
+    lifetime_budget_cents: Optional[int] = None,
+    special_ad_categories: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Create a new campaign — always PAUSED, always name-tagged.
+
+    Budget is optional at the campaign level: set it here for CBO
+    (Advantage campaign budget), or omit and set budgets per ad set.
+    Budgets are in the account's minor currency unit (cents for USD).
+    """
+    _guard_ads_write()
+    objective = (objective or "").strip().upper()
+    if objective not in _VALID_OBJECTIVES:
+        raise MetaError(
+            f"objective must be one of {sorted(_VALID_OBJECTIVES)}, "
+            f"got {objective!r}."
+        )
+    _check_budget(daily_budget_cents, lifetime_budget_cents)
+    data: Dict[str, Any] = {
+        "access_token": _ads_token(),
+        "name": _mark_name(name),
+        "objective": objective,
+        "status": "PAUSED",
+        "special_ad_categories": json.dumps(special_ad_categories or []),
+    }
+    if daily_budget_cents is not None:
+        data["daily_budget"] = int(daily_budget_cents)
+    if lifetime_budget_cents is not None:
+        data["lifetime_budget"] = int(lifetime_budget_cents)
+    result = _post(f"{_act()}/campaigns", data)
+    return {
+        "created": "campaign",
+        "id": result.get("id"),
+        "name": data["name"],
+        "objective": objective,
+        "status": "PAUSED",
+    }
+
+
+def create_meta_adset(
+    *,
+    campaign_id: str,
+    name: str,
+    targeting: Dict[str, Any],
+    optimization_goal: str = "LINK_CLICKS",
+    billing_event: str = "IMPRESSIONS",
+    daily_budget_cents: Optional[int] = None,
+    lifetime_budget_cents: Optional[int] = None,
+    start_time: Optional[str] = None,
+    end_time: Optional[str] = None,
+    bid_strategy: Optional[str] = None,
+    promoted_object: Optional[Dict[str, Any]] = None,
+    destination_type: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Create an ad set (the targeting layer) under a MARK-BUILT campaign.
+
+    `targeting` is Meta's full targeting spec dict — geo_locations is
+    required by Meta; age/gender/interests/custom_audiences/placements go
+    in here too. Budget rules: give the ad set a daily or lifetime budget
+    unless the parent campaign carries a CBO budget. A lifetime budget
+    requires end_time. Refuses if the parent campaign wasn't built by
+    Mark, so tests never graft onto live human campaigns.
+    """
+    _guard_ads_write()
+    _require_mark_object(campaign_id, "create an ad set under this campaign")
+    if not isinstance(targeting, dict) or not targeting:
+        raise MetaError(
+            "targeting must be a non-empty targeting-spec dict "
+            "(at minimum geo_locations, e.g. "
+            '{"geo_locations": {"countries": ["US"]}}).'
+        )
+    _check_budget(daily_budget_cents, lifetime_budget_cents)
+    data: Dict[str, Any] = {
+        "access_token": _ads_token(),
+        "campaign_id": campaign_id,
+        "name": _mark_name(name),
+        "status": "PAUSED",
+        "targeting": json.dumps(targeting),
+        "optimization_goal": optimization_goal,
+        "billing_event": billing_event,
+    }
+    if daily_budget_cents is not None:
+        data["daily_budget"] = int(daily_budget_cents)
+    if lifetime_budget_cents is not None:
+        data["lifetime_budget"] = int(lifetime_budget_cents)
+    if start_time:
+        data["start_time"] = start_time
+    if end_time:
+        data["end_time"] = end_time
+    if bid_strategy:
+        data["bid_strategy"] = bid_strategy
+    if promoted_object:
+        data["promoted_object"] = json.dumps(promoted_object)
+    if destination_type:
+        data["destination_type"] = destination_type
+    result = _post(f"{_act()}/adsets", data)
+    return {
+        "created": "adset",
+        "id": result.get("id"),
+        "name": data["name"],
+        "campaign_id": campaign_id,
+        "status": "PAUSED",
+    }
+
+
+def upload_meta_ad_image(
+    *,
+    image_url: Optional[str] = None,
+    image_bytes: Optional[bytes] = None,
+    image_filename: str = "ad-image.jpg",
+    image_mime: str = "image/jpeg",
+) -> Dict[str, Any]:
+    """Upload an image to the ad account's library; returns its image_hash.
+
+    Meta's /adimages takes file bytes, not URLs, so a URL gets downloaded
+    first. The returned hash goes into create_meta_ad_creative. Uploading
+    costs nothing and runs nothing, but it's still gated — it writes to
+    the ad account.
+    """
+    _guard_ads_write()
+    if image_bytes is None:
+        if not image_url:
+            raise MetaError("Provide image_url or image_bytes.")
+        resp = requests.get(image_url, timeout=60)
+        if resp.status_code >= 400:
+            raise MetaError(
+                f"Could not download image ({resp.status_code}): {image_url}"
+            )
+        image_bytes = resp.content
+    result = _post_multipart(
+        f"{_act()}/adimages",
+        {"access_token": _ads_token()},
+        image_bytes=image_bytes,
+        image_filename=image_filename,
+        image_mime=image_mime,
+    )
+    images = result.get("images") or {}
+    first = next(iter(images.values()), {})
+    if not first.get("hash"):
+        raise MetaError(f"adimages upload returned no hash: {result}")
+    return {"image_hash": first.get("hash"), "url": first.get("url")}
+
+
+def create_meta_ad_creative(
+    *,
+    name: str,
+    message: str,
+    link_url: str,
+    headline: Optional[str] = None,
+    description: Optional[str] = None,
+    image_hash: Optional[str] = None,
+    image_url: Optional[str] = None,
+    call_to_action_type: str = "LEARN_MORE",
+    page_id: Optional[str] = None,
+    instagram_actor_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Create a link-ad creative (the messaging layer): primary text,
+    headline, description, image, destination URL, CTA.
+
+    Prefer image_hash from upload_meta_ad_image; image_url as `picture`
+    is the fallback (Meta fetches it, so it must be public). A creative
+    on its own runs nothing — it only becomes visible when attached to an
+    ad. instagram_actor_id enables IG placements; omit for FB-only.
+    """
+    _guard_ads_write()
+    if not message or not link_url:
+        raise MetaError("message (primary text) and link_url are required.")
+    page = page_id or _require("META_PAGE_ID", "create an ad creative")
+    link_data: Dict[str, Any] = {"link": link_url, "message": message}
+    if headline:
+        link_data["name"] = headline
+    if description:
+        link_data["description"] = description
+    if image_hash:
+        link_data["image_hash"] = image_hash
+    elif image_url:
+        link_data["picture"] = image_url
+    if call_to_action_type:
+        link_data["call_to_action"] = {
+            "type": call_to_action_type,
+            "value": {"link": link_url},
+        }
+    spec: Dict[str, Any] = {"page_id": page, "link_data": link_data}
+    if instagram_actor_id:
+        spec["instagram_actor_id"] = instagram_actor_id
+    data = {
+        "access_token": _ads_token(),
+        "name": _mark_name(name),
+        "object_story_spec": json.dumps(spec),
+    }
+    result = _post(f"{_act()}/adcreatives", data)
+    return {"created": "creative", "id": result.get("id"), "name": data["name"]}
+
+
+def create_meta_ad(
+    *, name: str, adset_id: str, creative_id: str
+) -> Dict[str, Any]:
+    """Create an ad (creative attached to an ad set) — always PAUSED.
+
+    Refuses unless the parent ad set was built by Mark.
+    """
+    _guard_ads_write()
+    _require_mark_object(adset_id, "create an ad under this ad set")
+    if not creative_id:
+        raise MetaError("creative_id is required (from create_meta_ad_creative).")
+    data = {
+        "access_token": _ads_token(),
+        "name": _mark_name(name),
+        "adset_id": adset_id,
+        "creative": json.dumps({"creative_id": str(creative_id)}),
+        "status": "PAUSED",
+    }
+    result = _post(f"{_act()}/ads", data)
+    return {
+        "created": "ad",
+        "id": result.get("id"),
+        "name": data["name"],
+        "adset_id": adset_id,
+        "status": "PAUSED",
+    }
+
+
+def update_meta_object_status(*, object_id: str, status: str) -> Dict[str, Any]:
+    """Set a Mark-built campaign/ad set/ad ACTIVE or PAUSED.
+
+    Setting ACTIVE is the moment money can move — callers must only do it
+    after explicit human approval. Budgets were cap-checked when they
+    were written and only tag-fenced objects can be flipped, so the blast
+    radius of an activation is bounded by the ads-mark budget caps.
+    """
+    _guard_ads_write()
+    status = (status or "").strip().upper()
+    if status not in {"ACTIVE", "PAUSED"}:
+        raise MetaError("status must be ACTIVE or PAUSED.")
+    obj = _require_mark_object(object_id, f"set status to {status}")
+    _post(str(object_id), {"access_token": _ads_token(), "status": status})
+    return {"id": object_id, "name": obj.get("name"), "status": status}
+
+
+def update_meta_budget(
+    *,
+    object_id: str,
+    daily_budget_cents: Optional[int] = None,
+    lifetime_budget_cents: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Change the budget on a Mark-built campaign or ad set, within caps."""
+    _guard_ads_write()
+    if daily_budget_cents is None and lifetime_budget_cents is None:
+        raise MetaError("Provide daily_budget_cents or lifetime_budget_cents.")
+    _check_budget(daily_budget_cents, lifetime_budget_cents)
+    obj = _require_mark_object(object_id, "change the budget")
+    data: Dict[str, Any] = {"access_token": _ads_token()}
+    if daily_budget_cents is not None:
+        data["daily_budget"] = int(daily_budget_cents)
+    if lifetime_budget_cents is not None:
+        data["lifetime_budget"] = int(lifetime_budget_cents)
+    _post(str(object_id), data)
+    return {
+        "id": object_id,
+        "name": obj.get("name"),
+        "daily_budget_cents": daily_budget_cents,
+        "lifetime_budget_cents": lifetime_budget_cents,
+    }
