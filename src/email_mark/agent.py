@@ -4547,6 +4547,16 @@ _STAGE_TOOLS = {
     "save_image_to_drive",
     "create_fb_post_from_email",
 }
+# Email drafting tools — Mark also uses "draft created" when he lands a
+# HubSpot email draft, not just when he posts social. Include them in the
+# "draft created" marker so email drafting doesn't false-positive the
+# social confabulation guard.
+_EMAIL_DRAFT_TOOLS = {
+    "create_email_draft",
+    "create_email_draft_v2",
+    "update_email_draft_v2",
+    "create_icymi_draft",
+}
 _CONFABULATION_MARKERS = [
     ("saved to drive", _STAGE_TOOLS),
     ("uploaded to drive", _STAGE_TOOLS),
@@ -4560,7 +4570,14 @@ _CONFABULATION_MARKERS = [
     ("scheduled facebook post", _PUBLISH_TOOLS),
     ("scheduled in hubspot", _PUBLISH_TOOLS),
     ("post is in hubspot", _PUBLISH_TOOLS),
-    ("draft created", _PUBLISH_TOOLS | {"post_draft_to_review_channel"}),
+    # "draft created" is legitimately used for BOTH social drafts AND
+    # email drafts, so email draft tools also satisfy this marker.
+    (
+        "draft created",
+        _PUBLISH_TOOLS
+        | _EMAIL_DRAFT_TOOLS
+        | {"post_draft_to_review_channel"},
+    ),
     ("posted to the review channel", {"post_draft_to_review_channel"}),
     ("posted to social-review", {"post_draft_to_review_channel"}),
 ]
@@ -4569,9 +4586,9 @@ _CONFABULATION_MARKERS = [
 def _detect_confabulation(
     final_text: Optional[str], tools_called: List[str]
 ) -> Optional[str]:
-    """If the response claims a social action succeeded but the
-    corresponding tool wasn't called this turn, return a human-readable
-    explanation; otherwise None.
+    """If the response claims an action succeeded (social post, image
+    stage, email draft, etc.) but the corresponding tool wasn't called
+    this turn, return a human-readable explanation; otherwise None.
     """
     text = (final_text or "").lower()
     called = set(tools_called or [])
@@ -4892,7 +4909,7 @@ def _chat_inner(
         original = final_text or "(no response)"
         final_text = (
             ":warning: *Confabulation intercepted — nothing actually shipped.*\n\n"
-            "I was about to claim a social action succeeded, but I never "
+            "I was about to claim an action succeeded, but I never "
             "called the tool that would have performed it. Here's what I "
             "almost told you:\n\n"
             f"```\n{original.strip()[:1500]}\n```\n\n"
