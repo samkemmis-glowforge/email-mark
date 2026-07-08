@@ -5,10 +5,13 @@
 <style type="text/css">
   @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600&family=Space+Grotesk:wght@500;600&display=swap');
 </style>
+<!-- Width note: the widget already sits inside HubSpot's ~600px content
+     column — everything here is width:100% of that container. Never use
+     fixed pixel widths at the top level; they overflow the template. -->
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#FFFDF8;">
   <tr>
     <td align="center">
-      <table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" style="width:600px; max-width:100%;">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
 
         <!-- ============ HERO ============ -->
         <tr>
