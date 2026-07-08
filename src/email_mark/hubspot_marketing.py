@@ -1226,7 +1226,22 @@ def count_list_intersection(
 # (Mark's design surface), standard HubSpot footer. The custom-HTML widget
 # is identified at runtime by its type, so its specific widget id doesn't
 # need to be hard-coded — it's found dynamically.
-BLANK_CANVAS_TEMPLATE_ID = "214440003148"
+# Source email ID that create_email_draft_v2 clones as the seed for
+# every new draft. This is a hardcoded reference to a specific HubSpot
+# marketing email — when that email gets deleted/archived in HubSpot,
+# the clone call returns 404 and every v2 draft creation fails.
+#
+# Same brittleness as total_price_usd in warehouse.py (lessons_learned
+# 2026-06-24): a hardcoded reference that's silently right today, then
+# silently broken later. Mitigation: make it overridable via env var so
+# fixing it doesn't require a code deploy.
+#
+# To find a working ID: in HubSpot, open any minimal-template email
+# (header + footer + one custom-HTML body widget), and the ID is in
+# the edit URL: app.hubspot.com/email/8614495/edit/<ID>/content
+BLANK_CANVAS_TEMPLATE_ID = os.environ.get(
+    "HUBSPOT_BLANK_CANVAS_TEMPLATE_ID", "214440003148"
+)
 
 
 # Fields that strongly indicate a widget is an IMAGE module (rules it out
@@ -1469,7 +1484,18 @@ def create_email_draft_v2(
     try:
         cloned = clone_marketing_email(BLANK_CANVAS_TEMPLATE_ID, name)
     except Exception as exc:
-        return {"error": f"Failed to clone blank-canvas template: {exc}"}
+        return {
+            "error": (
+                f"Failed to clone blank-canvas template "
+                f"(id={BLANK_CANVAS_TEMPLATE_ID}): {exc}. "
+                "Most common cause: the source email was deleted or archived "
+                "in HubSpot, so the clone returns 404. To fix: find or create "
+                "a minimal blank-canvas email in HubSpot (just header + footer "
+                "+ a custom-HTML widget), copy its ID from the edit URL, and "
+                "set HUBSPOT_BLANK_CANVAS_TEMPLATE_ID in Render env vars to "
+                "that new ID. Then retry — no code deploy needed."
+            )
+        }
 
     new_id = cloned.get("id")
     if not new_id:
@@ -1921,13 +1947,12 @@ def update_email_body(email_id: str, new_body_text: str) -> Dict[str, Any]:
     if not best_widget_id:
         return {"error": "No text-bearing widget found to update."}
 
-    # Preserve the original <p> and <span> styling so the new copy looks right.
-    p_style_match = re.search(r'<p\s+style="([^"]*)"', best_html)
-    span_style_match = re.search(r'<span\s+style="([^"]*)"', best_html)
-    p_style = p_style_match.group(1) if p_style_match else ""
-    span_style = span_style_match.group(1) if span_style_match else ""
-
-    new_html = _build_body_html(new_body_text, p_style, span_style)
+    # _build_body_html now parses the original HTML itself to preserve
+    # per-paragraph tag structure (h1/h2/p) and per-paragraph <span>
+    # styling — pass best_html directly rather than pre-extracting a single
+    # p_style/span_style pair (that was the old 3-arg signature which no
+    # longer exists — see the current signature at the top of this file).
+    new_html = _build_body_html(new_body_text, best_html)
 
     # Build the updated content. Replace just the one widget; keep everything else.
     new_widgets = dict(widgets)
