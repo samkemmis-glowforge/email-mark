@@ -1441,6 +1441,21 @@ def _patch_blank_canvas_body(
         json={"content": new_content},
         timeout=30,
     )
+    draft_pending_publish = False
+    if (
+        patch_response.status_code == 400
+        and "Cannot directly update a published email" in patch_response.text
+    ):
+        # Published (live) email — edits go to the draft sub-resource and
+        # only take effect after POST /{id}/publish (a deliberate go-live
+        # step; see publish_email for the helper).
+        patch_response = requests.patch(
+            f"{HUBSPOT_BASE}/marketing/v3/emails/{email_id}/draft",
+            headers=_headers(),
+            json={"content": new_content},
+            timeout=30,
+        )
+        draft_pending_publish = True
     if patch_response.status_code != 200:
         return {
             "error": (
@@ -1453,6 +1468,7 @@ def _patch_blank_canvas_body(
     return {
         "widget_id": body_widget_id,
         "body_html_length": len(body_html),
+        "draft_pending_publish": draft_pending_publish,
         "status": "ok",
     }
 
@@ -1645,15 +1661,50 @@ def clone_marketing_email(source_id: str, new_name: str) -> Dict[str, Any]:
 
 
 def update_marketing_email(email_id: str, **fields: Any) -> Dict[str, Any]:
-    """Update fields on an existing marketing email (subject, name, etc.)."""
+    """Update fields on an existing marketing email (subject, name, etc.).
+
+    Published (live) emails can't be patched directly; falls back to the
+    draft sub-resource, in which case the change only takes effect after
+    publish_email() (or clicking Update in the HubSpot editor).
+    """
     response = requests.patch(
         f"{HUBSPOT_BASE}/marketing/v3/emails/{email_id}",
         headers=_headers(),
         json=fields,
         timeout=30,
     )
+    if (
+        response.status_code == 400
+        and "Cannot directly update a published email" in response.text
+    ):
+        response = requests.patch(
+            f"{HUBSPOT_BASE}/marketing/v3/emails/{email_id}/draft",
+            headers=_headers(),
+            json=fields,
+            timeout=30,
+        )
     response.raise_for_status()
     return response.json()
+
+
+def publish_email(email_id: str) -> Dict[str, Any]:
+    """Publish an email's pending draft changes so they go live.
+
+    For automated emails this is the "Save for automation" / "Update"
+    action — after it, workflows send the updated version. Deliberate
+    go-live step: call only with explicit user sign-off.
+    """
+    response = requests.post(
+        f"{HUBSPOT_BASE}/marketing/v3/emails/{email_id}/publish",
+        headers=_headers(),
+        timeout=30,
+    )
+    if response.status_code not in (200, 204):
+        return {
+            "error": f"Publish failed (HTTP {response.status_code}).",
+            "response_body": response.text[:500],
+        }
+    return {"email_id": str(email_id), "status": "published"}
 
 
 _TEXT_FIELDS_FOR_LENGTH = ("html", "text", "value")

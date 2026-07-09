@@ -83,6 +83,24 @@ context to avoid the trap, not to teach the full topic.
   go-live action, not part of drafting.
   (Learned 2026-07-08)
 
+- Clones inherit the source email's `from` (fromName + replyTo). The
+  blank-canvas template originally carried Sam's personal address, so
+  every drafted email silently sent from sam.kemmis@glowforge.com.
+  The template (216753079928) now carries "The Glowforge Team"
+  <hello@glowforge.com> — if a different sender is ever needed, patch
+  `from` on the draft explicitly; don't assume the default.
+  (Learned 2026-07-09)
+
+- Once an email is published (e.g. saved for automation, state
+  `AUTOMATED`), direct PATCHes return 400 "Cannot directly update a
+  published email." Edits must go to `PATCH /marketing/v3/emails/{id}/draft`
+  and only take effect after `POST /{id}/publish` — which changes what
+  live workflows send, so treat publish as a deliberate go-live step.
+  update_marketing_email/_patch_blank_canvas_body fall back to the
+  draft endpoint automatically; publish_email() is the explicit
+  publish helper.
+  (Learned 2026-07-09)
+
 ## HubSpot — billing levers
 
 - Marketing contact count is the dominant cost driver on Glowforge's
