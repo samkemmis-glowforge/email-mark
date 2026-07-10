@@ -384,6 +384,10 @@ def create_reddit_ad_group(
     interests: Optional[List[str]] = None,
     geolocations: Optional[List[str]] = None,
     bid_value_cents: Optional[int] = None,
+    bid_type: str = "CPC",
+    bid_strategy: Optional[str] = None,
+    start_time: Optional[str] = None,
+    end_time: Optional[str] = None,
     conversion_pixel_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create an ad group (targeting + budget layer) under a MARK campaign.
@@ -404,14 +408,30 @@ def create_reddit_ad_group(
         targeting["communities"] = communities
     if interests:
         targeting["interests"] = interests
+    # bid_strategy + bid_type are required by the live API (400 without
+    # them). Default: auto-bid CPC; manual only when a bid value is given.
+    if bid_strategy is None:
+        bid_strategy = "MANUAL_BIDDING" if bid_value_cents is not None else "MAXIMIZE_VOLUME"
     body: Dict[str, Any] = {
         "campaign_id": campaign_id,
         "name": _mark_name(name),
         "configured_status": "PAUSED",
         "goal_type": "DAILY_SPEND",
         "goal_value": _cents_to_micros(daily_budget_cents),
+        "bid_type": bid_type,
+        "bid_strategy": bid_strategy,
         "targeting": targeting,
     }
+    # start_time is required by the live API ("Input should be a valid
+    # datetime"). Default to now (UTC) — PAUSED status still controls
+    # when anything actually serves.
+    if not start_time:
+        from datetime import datetime, timezone
+
+        start_time = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    body["start_time"] = start_time
+    if end_time:
+        body["end_time"] = end_time
     if bid_value_cents is not None:
         if bid_value_cents <= 0:
             raise RedditError("bid_value_cents must be positive.")
@@ -428,6 +448,52 @@ def create_reddit_ad_group(
     }
 
 
+def create_reddit_ad_post(
+    *,
+    profile_id: str,
+    headline: str,
+    image_url: str,
+    destination_url: str,
+) -> Dict[str, Any]:
+    """Create an IMAGE ad post (the creative) under the advertiser profile.
+
+    Schema verified against the live API:
+      - Reddit ads must reference a post ('invalid post ID' otherwise);
+        valid post types are CAROUSEL/IMAGE/TEXT/VIDEO.
+      - Click-through ads need an IMAGE post: TEXT posts are 'free form
+        ads' that cannot carry a click url.
+      - The destination rides INSIDE the content item:
+        content=[{media_url, destination_url}]. Reddit downloads the
+        image from media_url and re-hosts it on i.redd.it.
+      - call_to_action belongs to the AD (create_reddit_ad), not the post.
+
+    Ad posts only reach feeds when a paying ad serves them, so the
+    PAUSED/fence guardrails on the ad + ad group control exposure. Gated
+    because it publishes advertiser content under the profile. The
+    headline is public-facing ad copy, so it is NOT name-tagged.
+
+    Discover profile_id via reddit_read_api on
+    'ad_accounts/{account}/profiles'.
+    """
+    _guard_write()
+    if not headline or not image_url or not destination_url:
+        raise RedditError("headline, image_url and destination_url are required.")
+    payload: Dict[str, Any] = {
+        "type": "IMAGE",
+        "headline": headline,
+        "content": [{"media_url": image_url, "destination_url": destination_url}],
+    }
+    result = _post(f"profiles/{profile_id}/posts", payload).get("data", {})
+    content = (result.get("content") or [{}])[0]
+    return {
+        "created": "post",
+        "id": result.get("id"),
+        "headline": headline,
+        "media_url": content.get("media_url"),
+        "destination_url": content.get("destination_url"),
+    }
+
+
 def create_reddit_ad(
     *,
     ad_group_id: str,
@@ -435,6 +501,7 @@ def create_reddit_ad(
     post_id: Optional[str] = None,
     headline: Optional[str] = None,
     destination_url: Optional[str] = None,
+    call_to_action: Optional[str] = None,
     thumbnail_url: Optional[str] = None,
     profile_id: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -468,6 +535,8 @@ def create_reddit_ad(
         body["creative"] = creative
     if destination_url and post_id:
         body["click_url"] = destination_url
+    if call_to_action:
+        body["call_to_action"] = call_to_action
     result = _post(f"ad_accounts/{_account()}/ads", body).get("data", {})
     return {
         "created": "ad",
