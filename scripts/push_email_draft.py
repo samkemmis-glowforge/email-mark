@@ -41,7 +41,21 @@ def main() -> int:
     meta = json.loads(meta_path.read_text())
 
     email_id = meta.get("email_id")
-    if email_id:
+    module_path = meta.get("cms_module_path")
+    if email_id and module_path:
+        # Programmable email: body.html is the SOURCE OF A CODED MODULE
+        # (contact properties resolve lazily in raw-HTML widgets, so
+        # personalization logic must live in a module). Upload the module
+        # source, then patch only the email's metadata.
+        module_result = hm.upload_module_file(module_path, "module.html", body_html)
+        result = hm.update_email_draft_v2(
+            email_id=str(email_id),
+            subject=meta.get("subject"),
+            preheader=meta.get("preheader"),
+            name=meta.get("name"),
+        )
+        result["module_upload"] = module_result
+    elif email_id:
         result = hm.update_email_draft_v2(
             email_id=str(email_id),
             body_html=body_html,

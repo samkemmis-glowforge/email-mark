@@ -1687,6 +1687,28 @@ def update_marketing_email(email_id: str, **fields: Any) -> Dict[str, Any]:
     return response.json()
 
 
+def upload_module_file(
+    module_path: str, filename: str, content: str
+) -> Dict[str, Any]:
+    """Upload one file of a Design Manager module via the CMS source-code
+    API (publishes immediately). Used for programmable email modules,
+    where personalization logic must live because contact properties
+    resolve lazily inside raw-HTML email widgets."""
+    path = f"{module_path.strip('/')}/{filename}"
+    response = requests.put(
+        f"{HUBSPOT_BASE}/cms/v3/source-code/published/content/{path}",
+        headers={"Authorization": _headers()["Authorization"]},
+        files={"file": (filename, content.encode(), "text/plain")},
+        timeout=30,
+    )
+    if response.status_code not in (200, 201):
+        return {
+            "error": f"Module upload failed (HTTP {response.status_code}).",
+            "response_body": response.text[:500],
+        }
+    return {"path": path, "bytes": len(content), "status": "uploaded"}
+
+
 def publish_email(email_id: str) -> Dict[str, Any]:
     """Publish an email's pending draft changes so they go live.
 
