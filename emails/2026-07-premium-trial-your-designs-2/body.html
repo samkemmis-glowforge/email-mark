@@ -2,12 +2,14 @@
      SOURCE TEMPLATE (Jinja, rendered by scripts/gen_your_designs_variants.py
      into ../2026-07-premium-trial-your-designs-{1,2,3}/body.html).
 
-     Personalization uses ONLY plain {{ contact.x }} tokens on
+     Personalization uses ONLY plain contact-property tokens on
      precomputed properties (gf_design_pref_*, written by
-     scripts/sync_design_prefs.py). No HubL logic on contact values:
+     scripts/sync_design_prefs.py). No template logic on contact values:
      recipient properties substitute AFTER template evaluation on this
      portal, so logic can never branch on them — the workflow branches
-     on gf_design_pref_count instead (see lessons_learned 2026-07-10). -->
+     on gf_design_pref_count instead (see lessons_learned 2026-07-10).
+     NEVER write token or template syntax in comments: HubSpot's
+     validator and renderer both parse comments. -->
 <style type="text/css">
   @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600&family=Space+Grotesk:wght@500;600&display=swap');
 </style>
