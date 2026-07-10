@@ -19,6 +19,7 @@ on:
 
 permissions:
   contents: write   # to commit design_catalog.json when new slugs appear
+  issues: write     # to open a loud failure issue
 
 jobs:
   sync:
@@ -47,4 +48,24 @@ jobs:
             git push
           else
             echo "catalog unchanged"
+          fi
+
+      - name: Open an issue on failure (loud, survives personnel changes)
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --search "sync-design-prefs failing in:title" --json number --jq '.[0].number // empty')
+          if [ -z "$existing" ]; then
+            gh issue create --repo "$GITHUB_REPOSITORY" \
+              --title "sync-design-prefs failing" \
+              --body "The daily design-preference sync failed: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+
+          Impact while broken: contacts who signed up after the last successful run won't have gf_design_pref_* properties, so the trial workflow's count branch sends them the generic Day 3 Catalog email instead of the personalized one. No broken emails go out.
+
+          Common causes: HUBSPOT_API_KEY secret missing/revoked, HubSpot API outage, or a schema change to gf_design_preferences."
+          else
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" \
+              --body "Still failing: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           fi
