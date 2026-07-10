@@ -28,7 +28,9 @@
 {% set prefs = cleaned|split(",") %}
 <!-- TEMP DEBUG STRIP — remove before wiring into the workflow -->
 <div style="background:#FFD6D6; color:#8B0000; font-family:monospace; font-size:12px; padding:8px 12px; border-radius:6px; margin-bottom:12px;">
-  DEBUG &middot; raw_len={{ raw_prefs|length }} &middot; cleaned=[{{ cleaned }}] &middot; count={{ prefs|length }}
+  DEBUG MODULE-V2 &middot; raw_len={{ raw_prefs|length }} &middot; count={{ prefs|length }}<br>
+  vid_len={{ contact.hs_object_id|length }} &middot; vid=[{{ contact.hs_object_id }}]<br>
+  email_len={{ contact.email|length }} &middot; slice2=[{{ raw_prefs[2:9] }}]
 </div>
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#FFFDF8;">
   <tr>
