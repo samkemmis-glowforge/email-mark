@@ -82,9 +82,38 @@ def _access_token() -> str:
     except ValueError:
         raise RedditError(f"Token refresh non-JSON (HTTP {resp.status_code}): {resp.text[:300]}")
     if resp.status_code >= 400 or "access_token" not in payload:
-        raise RedditError(f"Token refresh failed (HTTP {resp.status_code}): {payload}")
+        raise RedditError(
+            f"Token refresh failed (HTTP {resp.status_code}): {payload}. If this "
+            f"persists, the refresh token was likely rotated and lost — re-run "
+            f"scripts/reddit_oauth_bootstrap.py to mint a new one."
+        )
     _token_cache["access_token"] = payload["access_token"]
     _token_cache["expires_at"] = time.time() + int(payload.get("expires_in", 3600))
+    # Reddit ROTATES refresh tokens: a refresh response may carry a new
+    # refresh_token, and the old one is eventually invalidated. Losing the
+    # rotated value bricks auth (400 Bad Request on the next refresh), so
+    # persist it: process env always; the .env file when one exists.
+    rotated = payload.get("refresh_token")
+    if rotated and rotated != refresh_token:
+        os.environ["REDDIT_ADS_REFRESH_TOKEN"] = rotated
+        env_path = find_dotenv()
+        if env_path and os.path.isfile(env_path):
+            try:
+                with open(env_path) as fh:
+                    lines = fh.readlines()
+                key = "REDDIT_ADS_REFRESH_TOKEN="
+                lines = [l for l in lines if not l.startswith(key)]
+                lines.append(f"{key}{rotated}\n")
+                with open(env_path, "w") as fh:
+                    fh.writelines(lines)
+            except OSError:
+                pass
+        print(
+            "[reddit_client] refresh token ROTATED — new value persisted to "
+            "env/.env; update any external secret store (Render, environment "
+            "settings) with the new REDDIT_ADS_REFRESH_TOKEN.",
+            flush=True,
+        )
     return _token_cache["access_token"]
 
 
