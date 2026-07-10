@@ -1239,8 +1239,11 @@ def count_list_intersection(
 # To find a working ID: in HubSpot, open any minimal-template email
 # (header + footer + one custom-HTML body widget), and the ID is in
 # the edit URL: app.hubspot.com/email/8614495/edit/<ID>/content
+# 216753079928 = "Blank canvas template (Mark) — DO NOT SEND, clone source",
+# recreated 2026-07-08 from the archived original (214440003148), which
+# HubSpot trashed into an unclonable state.
 BLANK_CANVAS_TEMPLATE_ID = os.environ.get(
-    "HUBSPOT_BLANK_CANVAS_TEMPLATE_ID", "214440003148"
+    "HUBSPOT_BLANK_CANVAS_TEMPLATE_ID", "216753079928"
 )
 
 
@@ -1283,12 +1286,15 @@ def _find_custom_html_widget_id(widgets: Dict[str, Any]) -> Optional[str]:
     if not isinstance(widgets, dict):
         return None
 
-    # Strategy 1: explicit path match.
+    # Strategy 1: explicit path match. Some template configurations put
+    # the module path on widget.path, others on widget.body.path — check
+    # both.
     path_matches: List[str] = []
     for wid, widget in widgets.items():
         if not isinstance(widget, dict):
             continue
-        path = (widget.get("path") or "").lower()
+        body = widget.get("body") if isinstance(widget.get("body"), dict) else {}
+        path = (widget.get("path") or body.get("path") or "").lower()
         if path and (
             path == "@hubspot/raw_html_email"
             or "raw_html" in path
@@ -1317,6 +1323,8 @@ def _find_custom_html_widget_id(widgets: Dict[str, Any]) -> Optional[str]:
     for wid, widget in widgets.items():
         if not isinstance(widget, dict):
             continue
+        if (widget.get("type") or "").lower() == "text":
+            continue  # plain-text widget (e.g. preview_text) — never the HTML body
         body = widget.get("body") if isinstance(widget.get("body"), dict) else {}
         body_keys = set(body.keys()) if isinstance(body, dict) else set()
         if body_keys & _IMAGE_BODY_FIELDS:
@@ -1433,6 +1441,21 @@ def _patch_blank_canvas_body(
         json={"content": new_content},
         timeout=30,
     )
+    draft_pending_publish = False
+    if (
+        patch_response.status_code == 400
+        and "Cannot directly update a published email" in patch_response.text
+    ):
+        # Published (live) email — edits go to the draft sub-resource and
+        # only take effect after POST /{id}/publish (a deliberate go-live
+        # step; see publish_email for the helper).
+        patch_response = requests.patch(
+            f"{HUBSPOT_BASE}/marketing/v3/emails/{email_id}/draft",
+            headers=_headers(),
+            json={"content": new_content},
+            timeout=30,
+        )
+        draft_pending_publish = True
     if patch_response.status_code != 200:
         return {
             "error": (
@@ -1445,6 +1468,7 @@ def _patch_blank_canvas_body(
     return {
         "widget_id": body_widget_id,
         "body_html_length": len(body_html),
+        "draft_pending_publish": draft_pending_publish,
         "status": "ok",
     }
 
@@ -1637,15 +1661,72 @@ def clone_marketing_email(source_id: str, new_name: str) -> Dict[str, Any]:
 
 
 def update_marketing_email(email_id: str, **fields: Any) -> Dict[str, Any]:
-    """Update fields on an existing marketing email (subject, name, etc.)."""
+    """Update fields on an existing marketing email (subject, name, etc.).
+
+    Published (live) emails can't be patched directly; falls back to the
+    draft sub-resource, in which case the change only takes effect after
+    publish_email() (or clicking Update in the HubSpot editor).
+    """
     response = requests.patch(
         f"{HUBSPOT_BASE}/marketing/v3/emails/{email_id}",
         headers=_headers(),
         json=fields,
         timeout=30,
     )
+    if (
+        response.status_code == 400
+        and "Cannot directly update a published email" in response.text
+    ):
+        response = requests.patch(
+            f"{HUBSPOT_BASE}/marketing/v3/emails/{email_id}/draft",
+            headers=_headers(),
+            json=fields,
+            timeout=30,
+        )
     response.raise_for_status()
     return response.json()
+
+
+def upload_module_file(
+    module_path: str, filename: str, content: str
+) -> Dict[str, Any]:
+    """Upload one file of a Design Manager module via the CMS source-code
+    API (publishes immediately). Used for programmable email modules,
+    where personalization logic must live because contact properties
+    resolve lazily inside raw-HTML email widgets."""
+    path = f"{module_path.strip('/')}/{filename}"
+    response = requests.put(
+        f"{HUBSPOT_BASE}/cms/v3/source-code/published/content/{path}",
+        headers={"Authorization": _headers()["Authorization"]},
+        files={"file": (filename, content.encode(), "text/plain")},
+        timeout=30,
+    )
+    if response.status_code not in (200, 201):
+        return {
+            "error": f"Module upload failed (HTTP {response.status_code}).",
+            "response_body": response.text[:500],
+        }
+    return {"path": path, "bytes": len(content), "status": "uploaded"}
+
+
+def publish_email(email_id: str) -> Dict[str, Any]:
+    """Publish an email's pending draft changes so they go live.
+
+    For automated emails this is the "Save for automation" / "Update"
+    action — after it, workflows send the updated version. Deliberate
+    go-live step: call only with explicit user sign-off.
+    """
+    response = requests.post(
+        f"{HUBSPOT_BASE}/marketing/v3/emails/{email_id}/publish",
+        headers=_headers(),
+        timeout=30,
+    )
+    if response.status_code not in (200, 204):
+        return {
+            "error": f"Publish failed (HTTP {response.status_code}).",
+            "response_body": response.text[:500],
+        }
+    return {"email_id": str(email_id), "status": "published"}
 
 
 _TEXT_FIELDS_FOR_LENGTH = ("html", "text", "value")

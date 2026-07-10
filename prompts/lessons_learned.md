@@ -69,6 +69,50 @@ context to avoid the trap, not to teach the full topic.
   customer-level state for this reason.
   (Learned 2026-06-11)
 
+## HubSpot — marketing emails
+
+- An email's type (`BATCH_EMAIL` vs `AUTOMATED_EMAIL`, aka "save for
+  automation" / usable in workflows) is fixed at creation. PATCH-ing
+  `type`/`subcategory` on an existing email returns 200 OK but silently
+  changes nothing, and the v3 create endpoint silently ignores a
+  `type` field too. The only API route to an automated email is to
+  CLONE an existing `AUTOMATED_EMAIL` (clones inherit type) and then
+  overwrite its name/subject/content. To finish "saving for
+  automation," the email must also be published (state
+  `AUTOMATED_DRAFT` → live for workflows) — that's a deliberate
+  go-live action, not part of drafting.
+  (Learned 2026-07-08)
+
+- Clones inherit the source email's `from` (fromName + replyTo). The
+  blank-canvas template originally carried Sam's personal address, so
+  every drafted email silently sent from sam.kemmis@glowforge.com.
+  The template (216753079928) now carries "The Glowforge Team"
+  <hello@glowforge.com> — if a different sender is ever needed, patch
+  `from` on the draft explicitly; don't assume the default.
+  (Learned 2026-07-09)
+
+- Once an email is published (e.g. saved for automation, state
+  `AUTOMATED`), direct PATCHes return 400 "Cannot directly update a
+  published email." Edits must go to `PATCH /marketing/v3/emails/{id}/draft`
+  and only take effect after `POST /{id}/publish` — which changes what
+  live workflows send, so treat publish as a deliberate go-live step.
+  update_marketing_email/_patch_blank_canvas_body fall back to the
+  draft endpoint automatically; publish_email() is the explicit
+  publish helper.
+  (Learned 2026-07-09)
+
+- Recipient contact properties in marketing emails are substituted
+  AFTER HubL evaluation — in raw-HTML widgets AND in coded/programmable
+  modules on this portal. At template time `contact.x` is the literal
+  token string (e.g. `contact.email|length` = 17), so printing works
+  but parsing, string filters, and branching on the VALUE silently
+  operate on the token text and fail. Value-dependent personalization
+  must be PRECOMPUTED onto the contact (script writes flat derived
+  properties; see scripts/sync_design_prefs.py), with the email using
+  plain tokens and the workflow branching on a derived property (e.g.
+  gf_design_pref_count -> 1/2/3-card email variants).
+  (Learned 2026-07-10)
+
 ## HubSpot — billing levers
 
 - Marketing contact count is the dominant cost driver on Glowforge's

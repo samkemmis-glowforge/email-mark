@@ -1,0 +1,8 @@
+{
+  "name": "Premium Trial — Your picked designs (3 designs, automated)",
+  "subject": "The designs you picked are free with your trial",
+  "preheader": "Remember the designs that caught your eye? They're unlocked.",
+  "clone_from_email_id": "216751522376",
+  "note": "Variant for gf_design_pref_count = 3. Generated from ../2026-07-premium-trial-your-designs/template.html by scripts/gen_your_designs_variants.py — edit the template, not this body.html. Requires scripts/sync_design_prefs.py to have populated the derived properties.",
+  "email_id": "216899724433"
+}

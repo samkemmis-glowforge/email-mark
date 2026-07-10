@@ -1,0 +1,50 @@
+# Daily sync: expand gf_design_preferences into the flat contact
+# properties the personalized trial emails use (gf_design_pref_count,
+# _1.._3_{name,url,img}). Must run at least once between a contact's
+# trial signup and their Day 3 send — daily gives ~3 chances.
+#
+# Requires the HUBSPOT_API_KEY repository secret (Settings → Secrets and
+# variables → Actions): the same portal-owned Private App token the
+# email tooling uses. Private App tokens belong to the HubSpot portal,
+# not a person, so this keeps running through team changes.
+#
+# NOTE: scheduled workflows only run from the repo's DEFAULT branch —
+# this activates once merged to main.
+name: sync-design-prefs
+
+on:
+  schedule:
+    - cron: "17 6 * * *"   # daily 06:17 UTC (odd minute avoids GitHub's on-the-hour congestion)
+  workflow_dispatch: {}
+
+permissions:
+  contents: write   # to commit design_catalog.json when new slugs appear
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install requests python-dotenv
+
+      - name: Sync design preferences to derived properties
+        env:
+          HUBSPOT_API_KEY: ${{ secrets.HUBSPOT_API_KEY }}
+        run: python scripts/sync_design_prefs.py
+
+      - name: Commit catalog additions (new slugs fetched from the shop)
+        run: |
+          if ! git diff --quiet -- emails/2026-07-premium-trial-your-designs/design_catalog.json; then
+            git config user.name "email-mark sync bot"
+            git config user.email "actions@github.com"
+            git add emails/2026-07-premium-trial-your-designs/design_catalog.json
+            git commit -m "design_catalog: add slugs discovered during sync"
+            git push
+          else
+            echo "catalog unchanged"
+          fi
