@@ -1,0 +1,94 @@
+<!-- Premium trial — "Your designs" personalized Catalog email.
+     Replaces the generic Day 3 email for contacts WITH gf_design_preferences
+     (workflow branches on the property; empty-property contacts get the
+     generic email, so no fallback rendering here beyond a defensive guard).
+
+     PERSONALIZATION: the HubL block below parses the contact's
+     gf_design_preferences (a JSON array of shop.glowforge.com product
+     slugs) and renders a card per design. Name + URL derive from the
+     slug, so new onboarding designs keep working; the CATALOG map only
+     enriches known slugs with real titles + product images. Regenerate
+     the map from design_catalog.json (see git history for the generator).
+
+     VERIFY BEFORE USE: preview-as-contact in the HubSpot editor with a
+     contact that has the property set (e.g. justine@compoundloop.ai).
+     If raw curly-brace template tags appear in the preview, HubL isn't
+     enabled for this module type on the portal — stop and switch to a
+     programmable email module. (Never put literal template-tag syntax
+     in comments here: HubL parses comments too.) -->
+<style type="text/css">
+  @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600&family=Space+Grotesk:wght@500;600&display=swap');
+</style>
+{% set CATALOG = {"family-monogram-last-name-sign-version-2":{"t":"Family Monogram &amp; Last Name Sign Version 2","i":"https://shop.glowforge.com/cdn/shop/products/family-Monogram-and-Last-Name-Round-Sign-3-square_grande.jpg?v=1671251881"},"ornate-standing-picture-frame":{"t":"Ornate Standing Picture Frame","i":"https://shop.glowforge.com/cdn/shop/files/ornate-standing-picture-frame-2_grande.jpg?v=1724623139"},"something-to-read-wear-want-need-gift-tags-set-of-8":{"t":"Something to Read, Wear, Want, Need Gift Tags (set of 8)","i":"https://shop.glowforge.com/cdn/shop/products/SomethingtoReadWearWantNeedGiftTags3square_grande.jpg?v=1655125619"},"happiness-is-homemade-patterned-sign":{"t":"Happiness is Homemade Patterned Sign","i":"https://shop.glowforge.com/cdn/shop/products/IMG_1266_grande.jpg?v=1700443916"},"summer-days-layered-window-picture":{"t":"Summer Days Layered Window Picture","i":"https://shop.glowforge.com/cdn/shop/products/03_grande.png?v=1624648132"},"welcome-sign-with-sunflowers":{"t":"Welcome Sign with Sunflowers","i":"https://shop.glowforge.com/cdn/shop/products/welcomesunflower3square_grande.jpg?v=1653605784"},"personalized-leather-wallet":{"t":"Personalized Leather Wallet","i":"https://shop.glowforge.com/cdn/shop/products/Leather-Wallet-5square_grande.jpg?v=1638215497"},"rainbow-weaving-loom":{"t":"Rainbow Weaving Loom","i":"https://shop.glowforge.com/cdn/shop/products/01_2379801b-4274-422a-9817-0a878af87a33_grande.jpg?v=1625618092"},"bountiful-harvest-garden-stakes-set-of-22":{"t":"Bountiful Harvest Garden Stakes (set of 22)","i":"https://shop.glowforge.com/cdn/shop/products/33_grande.png?v=1619509196"},"flexible-flat-pack-tablet-stand":{"t":"Flexible, Flat-Pack Tablet Stand","i":"https://shop.glowforge.com/cdn/shop/products/Catalog_Photo-3_2fbc32e9-c9f9-4e2c-bc4d-2b1a7a0441f1_grande.jpg?v=1619509302"},"japanese-tea-light-candle-box":{"t":"Japanese Tea Light Candle Box","i":"https://shop.glowforge.com/cdn/shop/products/JapaneseTeaLightBox_Cherry_OnWhite_1_grande.png?v=1700516146"},"decorative-layered-vase":{"t":"Decorative Layered Vase","i":"https://shop.glowforge.com/cdn/shop/products/03_0c5b3832-d3ce-4173-871c-51b9bad8defc_grande.jpg?v=1625533176"},"we-still-do-anniversary-cake-or-dessert-topper":{"t":"&quot;We Still Do&quot; Anniversary Cake or Dessert Topper","i":"https://shop.glowforge.com/cdn/shop/products/onwhite_grande.jpg?v=1623251267"},"comical-mustache-photobooth-props":{"t":"Comical Mustache Photobooth Props (Set of 5)","i":"https://shop.glowforge.com/cdn/shop/products/20210831_183018_grande.jpg?v=1630512799"},"happy-birthday-hearts-cake-topper":{"t":"Happy Birthday Hearts Cake Topper","i":"https://shop.glowforge.com/cdn/shop/products/02_c5c25919-f0ae-4173-902e-c35597a8208b_grande.jpg?v=1624663187"},"delicate-etched-bud-vase":{"t":"Delicate Etched Bud Vase","i":"https://shop.glowforge.com/cdn/shop/products/3_detail1_grande.jpg?v=1658177089"},"daddy-hammer-keychain-fathers-day-gift":{"t":"Daddy Hammer Keychain - Father&#39;s Day Gift","i":"https://shop.glowforge.com/cdn/shop/files/daddy-hammer-keychain_grande.jpg?v=1779890837"},"welcome-patriotic-sign":{"t":"Welcome Patriotic Sign","i":"https://shop.glowforge.com/cdn/shop/products/PatrioticWelcomeeSign03_grande.png?v=1653423499"},"4th-of-july-door-sign":{"t":"4th of July Door Sign","i":"https://shop.glowforge.com/cdn/shop/products/3_79d8baec-25da-468d-91a6-a7ffdd595859_grande.jpg?v=1644803077"},"personalized-sticky-note-pen-holder":{"t":"Personalized Sticky Note &amp; Pen Holder","i":"https://shop.glowforge.com/cdn/shop/products/StickyNotePenHolder1square_grande.jpg?v=1700514603"},"helpful-animal-cell-study-guide-puzzle":{"t":"Helpful Animal Cell Study Guide Puzzle","i":"https://shop.glowforge.com/cdn/shop/files/helpful-animal-cell-study-guide-puzzle-3-square_grande.jpg?v=1705952304"},"frog-dissection-small":{"t":"Frog Dissection Small (Set of 4)","i":"https://shop.glowforge.com/cdn/shop/products/6_e289845d-4361-43d3-9aba-fd39ce1d8976_grande.jpg?v=1664993732"},"alphabet-writing-practice-board":{"t":"Alphabet Writing Practice Board","i":"https://shop.glowforge.com/cdn/shop/products/board2square_grande.jpg?v=1645180306"},"single-and-triple-bubble-wand":{"t":"Single and Triple Bubble Wand","i":"https://shop.glowforge.com/cdn/shop/products/31_grande.png?v=1619509385"},"millennimal-keychain-diantha-the-bear":{"t":"Millennimal Keychain - Diantha the Bear","i":"https://shop.glowforge.com/cdn/shop/products/1_f7a48d50-24ae-44dc-8a79-d5fdde1a9726_grande.jpg?v=1651619964"},"dog-house-3d-puzzle-light-plywood":{"t":"Dog house (3D puzzle) - Light Plywood (3/25&quot;)","i":"https://shop.glowforge.com/cdn/shop/files/Screenshot2023-11-12at6.31.12PM_e4f16003-7483-47de-9e5c-e5614c328b21_grande.png?v=1699835285"},"layered-mandala-art":{"t":"Layered Mandala Art","i":"https://shop.glowforge.com/cdn/shop/products/4_5d6919cb-92cb-4236-beee-be03fcc74f60_grande.jpg?v=1633994723"},"tree-of-life-wedding-guest-book-with-easel":{"t":"Tree Of Life Wedding Guest Book With Easel","i":"https://shop.glowforge.com/cdn/shop/products/TreeofLife-03_grande.png?v=1652905511"},"abstract-geometric-art-paper-lantern":{"t":"Abstract Geometric Art Paper Lantern","i":"https://shop.glowforge.com/cdn/shop/products/PaperLanternFrame-large_grande.jpg?v=1635192009"},"tangram-puzzle":{"t":"Tangram Puzzle","i":"https://shop.glowforge.com/cdn/shop/products/tangram_catalog_white2.1_grande.png?v=1631821893"},"three-axis-spinner-toy":{"t":"Three-Axis Spinner","i":"https://shop.glowforge.com/cdn/shop/products/PXL_20210410_191631287_grande.jpg?v=1620741889"},"unisex-baby-birth-announcement-with-lovely-eucalyptus-branches-version-1":{"t":"Unisex Baby Birth Announcement with Lovely Eucalyptus Branches Version #1","i":"https://shop.glowforge.com/cdn/shop/files/unisex-baby-birth-announcement-with-lovely-eucalyptus-branches-version-3_grande.jpg?v=1712490799"},"bubble-letter-name-keychains":{"t":"Bubble Letter Name Keychains","i":"https://shop.glowforge.com/cdn/shop/products/bubblelettername1square_grande.jpg?v=1654782193"},"all-occasion-layered-gift-tag-customizable":{"t":"All Occasion Layered Gift Tag, Customizable","i":"https://shop.glowforge.com/cdn/shop/products/All-Occasion-Layered-Gift-Tag-Customizable-3-square_grande.jpg?v=1669113481"},"fathers-day-award-medallions-set-of-4":{"t":"Father&#39;s Day Award Medallions (Set of 4)","i":"https://shop.glowforge.com/cdn/shop/products/Father_s-Day-Award-Medallions-_Set-of-4_-1-square_grande.jpg?v=1700428969"},"intricate-mandala-earrings":{"t":"Intricate Mandala Earrings","i":"https://shop.glowforge.com/cdn/shop/products/25_85be94dc-6f16-4e67-aab3-09830885fead_grande.png?v=1619512778"},"mechanical-marble-run-game":{"t":"Mechanical Marble Run Game","i":"https://shop.glowforge.com/cdn/shop/products/Catalog_Photo_grande.jpg?v=1619513610"},"beachy-baby-sea-turtle-earrings-with-flower-cut-out":{"t":"Beachy Baby Sea Turtle Earrings With Flower Cut Out","i":"https://shop.glowforge.com/cdn/shop/products/04_4e93ad01-c677-4a77-b3a2-53c416018613_grande.jpg?v=1629416412"},"wooden-abc-puzzle":{"t":"Wooden ABC puzzle","i":"https://shop.glowforge.com/cdn/shop/products/2_1656da54-34e8-460f-9292-32f648ee2349_grande.jpg?v=1622420410"},"go-game":{"t":"Go Game","i":"https://shop.glowforge.com/cdn/shop/files/20231201_184308_grande.jpg?v=1701475039"},"airplane-3d-puzzle-medium-draftboard":{"t":"Airplane (3D puzzle) Medium Draftboard","i":"https://shop.glowforge.com/cdn/shop/files/Screenshot2023-12-11at4.38.19PM_grande.png?v=1702334233"},"millennimal-keychain-journi-the-llama":{"t":"Millennimal Keychain - Journi the Llama","i":"https://shop.glowforge.com/cdn/shop/products/Millenial-Keychain---Journi-The-Llama-3-square_grande.jpg?v=1673833477"},"3d-patriotic-stars-shelf-sitters-set-of-5-for-thick-proofgrade":{"t":"3D Patriotic Stars Shelf Sitters (Set of 5) For Thick Proofgrade","i":"https://shop.glowforge.com/cdn/shop/files/3DPatrioticStarsShelfSitters_Setof5_ForThickProofgrade2square_grande.jpg?v=1700424875"},"circle-pattern-puzzle":{"t":"Circle Pattern Puzzle","i":"https://shop.glowforge.com/cdn/shop/files/20231203_151320_grande.jpg?v=1701635284"},"london-double-decker-bus":{"t":"London Double Decker Bus","i":"https://shop.glowforge.com/cdn/shop/products/DoubleDecker-12_grande.jpg?v=1649349012"},"spiral-maker":{"t":"Spiral Drawing Set","i":"https://shop.glowforge.com/cdn/shop/products/SpiralMaker02_grande.png?v=1626732005"},"abstract-geometric-earrings":{"t":"Abstract Geometric Earrings","i":"https://shop.glowforge.com/cdn/shop/products/Catalog_Photo_9ba6bc15-a8f5-4335-8599-b60a0c9979c9_grande.jpg?v=1619509028"}} %}
+{% set raw_prefs = contact.gf_design_preferences %}
+{% set prefs = raw_prefs|fromjson if raw_prefs and "[" in raw_prefs else [] %}
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#FFFDF8;">
+  <tr>
+    <td align="center">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+
+        <!-- ============ HERO ============ -->
+        <tr>
+          <td style="background-color:#350B46; border-radius:12px; padding:48px 44px 44px 44px;" align="left">
+            <p style="margin:0 0 14px 0; font-family:'Poppins',Arial,sans-serif; font-size:13px; letter-spacing:2px; color:#CCA1DD; text-transform:uppercase;">Glowforge Premium &middot; your trial</p>
+            <h1 style="margin:0 0 18px 0; font-family:'Space Grotesk',Arial,sans-serif; font-weight:600; font-size:36px; line-height:1.2; color:#FFE56E;">You already picked your first project</h1>
+            <p style="margin:0; font-family:'Poppins',Arial,sans-serif; font-size:17px; line-height:1.55; color:#FFF5C7;">When you signed up, you chose {% if prefs|length == 1 %}a design{% else %}a few designs{% endif %} that caught your eye. Good news: {% if prefs|length == 1 %}it&rsquo;s{% else %}they&rsquo;re{% endif %} free with your Premium trial &mdash; ready to personalize and print today.</p>
+          </td>
+        </tr>
+
+        <!-- ============ YOUR PICKS ============ -->
+        <tr>
+          <td style="padding:32px 0 0 0;">
+            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#FFF5C7; border-radius:12px;">
+              <tr>
+                <td style="padding:44px 44px 12px 44px;" align="left">
+                  <h2 style="margin:0 0 10px 0; font-family:'Space Grotesk',Arial,sans-serif; font-weight:600; font-size:28px; line-height:1.25; color:#350B46;">{% if prefs|length == 1 %}Your pick{% else %}Your picks{% endif %}</h2>
+                  <p style="margin:0 0 30px 0; font-family:'Poppins',Arial,sans-serif; font-size:16px; line-height:1.55; color:#22072D;">Open one, make it yours, and print it &mdash; no extra cost while your trial is on.</p>
+{% for slug in prefs %}
+{% set info = CATALOG[slug] %}
+{% set design_url = "https://shop.glowforge.com/products/" ~ slug %}
+{% set design_name = info.t if info else slug|replace("-", " ")|title %}
+                  {% if info and info.i %}<a href="{{ design_url }}" target="_blank"><img src="{{ info.i }}" width="460" alt="{{ design_name }}" style="display:block; width:100%; height:auto; border-radius:8px; margin:0 0 14px 0;"></a>
+                  {% endif %}<p style="margin:0 0 4px 0; font-family:'Poppins',Arial,sans-serif; font-size:13px; letter-spacing:2px; color:#8107AC; text-transform:uppercase;">Free with your trial</p>
+                  <h3 style="margin:0 0 8px 0; font-family:'Space Grotesk',Arial,sans-serif; font-weight:600; font-size:20px; line-height:1.3;"><a href="{{ design_url }}" target="_blank" style="color:#350B46; text-decoration:underline;">{{ design_name }}</a></h3>
+                  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr><td style="font-size:26px; line-height:26px;">&nbsp;</td></tr></table>
+{% endfor %}
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>
+
+        <!-- ============ CTA + SIGN-OFF ============ -->
+        <tr>
+          <td align="center" style="padding:44px 12px 8px 12px;">
+            <table role="presentation" cellpadding="0" cellspacing="0" border="0">
+              <tr>
+                <td bgcolor="#FFE56E" style="border-radius:8px;">
+                  <a href="{% if prefs %}https://shop.glowforge.com/products/{{ prefs[0] }}{% else %}https://catalog.glowforge.com/{% endif %}" target="_blank" style="display:inline-block; padding:16px 46px; font-family:'Poppins',Arial,sans-serif; font-size:17px; font-weight:600; color:#22072D; text-decoration:none; border-radius:8px;">Open {% if prefs|length == 1 %}your design{% else %}your first design{% endif %}</a>
+                </td>
+              </tr>
+            </table>
+            <p style="margin:30px 0 0 0; font-family:'Poppins',Arial,sans-serif; font-size:16px; line-height:1.55; color:#22072D;">And when you&rsquo;re ready for more: the whole Catalog is open during your trial, with thousands of ready-to-print designs to personalize.</p>
+            <p style="margin:26px 0 0 0; font-family:'Poppins',Arial,sans-serif; font-size:16px; line-height:1.55; color:#22072D;">Happy making,<br>Glowforge</p>
+          </td>
+        </tr>
+
+        <!-- ============ TRIAL EXTENSION NOTE ============ -->
+        <tr>
+          <td style="padding:28px 12px 48px 12px;">
+            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="border-top:2px solid #CCA1DD;">
+              <tr>
+                <td style="padding:28px 32px 0 32px;" align="center">
+                  <h3 style="margin:0 0 8px 0; font-family:'Space Grotesk',Arial,sans-serif; font-weight:600; font-size:19px; line-height:1.3; color:#350B46;">Want more, for free?</h3>
+                  <p style="margin:0; font-family:'Poppins',Arial,sans-serif; font-size:15px; line-height:1.55; color:#22072D;">Enter your payment info to extend your trial by another 30 days. You won&rsquo;t be charged until the end of the trial. You can cancel anytime.</p>
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>
+
+      </table>
+    </td>
+  </tr>
+</table>

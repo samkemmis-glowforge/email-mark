@@ -1,0 +1,8 @@
+{
+  "name": "Premium Trial — Your picked designs, free with your trial (personalized, automated)",
+  "subject": "The designs you picked are free with your trial",
+  "preheader": "Remember the designs that caught your eye? They're unlocked.",
+  "clone_from_email_id": "216751522376",
+  "note": "Personalized Day 3 replacement for contacts WITH gf_design_preferences (workflow branch). HubL renders one card per selected design; design_catalog.json is the slug->title/image map source. VERIFY HubL renders via preview-as-contact before wiring into the workflow.",
+  "email_id": "216897752981"
+}
