@@ -36,7 +36,7 @@ no new auth — it's a persona layered onto the existing one.
 | TikTok | Supermetrics connector | Via Supermetrics |
 | LinkedIn | Supermetrics connector | Via Supermetrics |
 | Pinterest | Supermetrics connector | Via Supermetrics |
-| Reddit | Supermetrics connector | Via Supermetrics |
+| Reddit | `reddit_client.py` (native reads + gated writes; Supermetrics as cross-check) | Native, wiring up |
 
 Meta is wired directly into the repo through the existing
 `get_ad_performance` tool against `META_AD_ACCOUNT_ID`. The other platforms are
