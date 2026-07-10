@@ -63,8 +63,63 @@ def _require(env_var: str, human: str) -> str:
 
 _token_cache: Dict[str, Any] = {"access_token": None, "expires_at": 0.0}
 
+# Access tokens live ~1h but our processes are short-lived, so an
+# in-memory cache alone means one token-endpoint hit per process. Reddit's
+# token endpoint is anti-abuse-sensitive (opaque 400s after bursts of
+# refreshes — learned live), so the cache is also persisted to a
+# gitignored file next to .env and shared across processes. The token
+# endpoint is then touched at most ~once an hour.
+_CACHE_FILENAME = ".reddit_token_cache.json"
+
+
+def _cache_path() -> Optional[str]:
+    env_path = find_dotenv()
+    if env_path:
+        return os.path.join(os.path.dirname(env_path), _CACHE_FILENAME)
+    return None
+
+
+def _load_disk_cache() -> None:
+    path = _cache_path()
+    if not path or not os.path.isfile(path):
+        return
+    try:
+        import json as _json
+
+        with open(path) as fh:
+            data = _json.load(fh)
+        if data.get("access_token") and float(data.get("expires_at", 0)) > time.time():
+            _token_cache.update(
+                access_token=data["access_token"], expires_at=float(data["expires_at"])
+            )
+    except (ValueError, OSError):
+        pass
+
+
+def save_token_cache(access_token: str, expires_in: int) -> None:
+    """Persist an access token for cross-process reuse. Also used by the
+    bootstrap script so the exchange's own access token isn't wasted."""
+    _token_cache["access_token"] = access_token
+    _token_cache["expires_at"] = time.time() + int(expires_in)
+    path = _cache_path()
+    if not path:
+        return
+    try:
+        import json as _json
+
+        with open(path, "w") as fh:
+            _json.dump(
+                {"access_token": access_token, "expires_at": _token_cache["expires_at"]},
+                fh,
+            )
+    except OSError:
+        pass
+
 
 def _access_token() -> str:
+    if _token_cache["access_token"] and time.time() < _token_cache["expires_at"] - 60:
+        return _token_cache["access_token"]
+    _load_disk_cache()
     if _token_cache["access_token"] and time.time() < _token_cache["expires_at"] - 60:
         return _token_cache["access_token"]
     client_id = _require("REDDIT_ADS_CLIENT_ID", "authenticate to the Reddit Ads API")
@@ -87,8 +142,7 @@ def _access_token() -> str:
             f"persists, the refresh token was likely rotated and lost — re-run "
             f"scripts/reddit_oauth_bootstrap.py to mint a new one."
         )
-    _token_cache["access_token"] = payload["access_token"]
-    _token_cache["expires_at"] = time.time() + int(payload.get("expires_in", 3600))
+    save_token_cache(payload["access_token"], int(payload.get("expires_in", 3600)))
     # Reddit ROTATES refresh tokens: a refresh response may carry a new
     # refresh_token, and the old one is eventually invalidated. Losing the
     # rotated value bricks auth (400 Bad Request on the next refresh), so
@@ -288,18 +342,19 @@ def reddit_read_api(*, path: str, params: Optional[Dict[str, Any]] = None) -> Di
 
 # --- WRITING (GATED) ---------------------------------------------------------
 
+# Verified against the live API (error message enumerates the valid set).
 _VALID_OBJECTIVES = {
-    "TRAFFIC",
-    "CONVERSIONS",
-    "BRAND_AWARENESS_AND_REACH",
-    "VIDEO_VIEWABLE_IMPRESSIONS",
-    "ENGAGEMENT",
     "APP_INSTALLS",
+    "CATALOG_SALES",
+    "CLICKS",
+    "CONVERSIONS",
+    "IMPRESSIONS",
     "LEAD_GENERATION",
+    "VIDEO_VIEWABLE_IMPRESSIONS",
 }
 
 
-def create_reddit_campaign(*, name: str, objective: str = "TRAFFIC") -> Dict[str, Any]:
+def create_reddit_campaign(*, name: str, objective: str = "CLICKS") -> Dict[str, Any]:
     """Create a campaign — PAUSED, name-tagged. Budget lives on ad groups."""
     _guard_write()
     objective = (objective or "").strip().upper()

@@ -37,3 +37,4 @@ Thumbs.db
 # Local data / scratch
 scratch/
 data/local/
+.reddit_token_cache.json
