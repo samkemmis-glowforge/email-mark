@@ -101,6 +101,18 @@ context to avoid the trap, not to teach the full topic.
   publish helper.
   (Learned 2026-07-09)
 
+- Recipient contact properties in marketing emails are substituted
+  AFTER HubL evaluation — in raw-HTML widgets AND in coded/programmable
+  modules on this portal. At template time `contact.x` is the literal
+  token string (e.g. `contact.email|length` = 17), so printing works
+  but parsing, string filters, and branching on the VALUE silently
+  operate on the token text and fail. Value-dependent personalization
+  must be PRECOMPUTED onto the contact (script writes flat derived
+  properties; see scripts/sync_design_prefs.py), with the email using
+  plain tokens and the workflow branching on a derived property (e.g.
+  gf_design_pref_count -> 1/2/3-card email variants).
+  (Learned 2026-07-10)
+
 ## HubSpot — billing levers
 
 - Marketing contact count is the dominant cost driver on Glowforge's

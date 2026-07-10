@@ -1,9 +1,0 @@
-{
-  "name": "Premium Trial — Your picked designs, free with your trial (personalized, automated)",
-  "subject": "The designs you picked are free with your trial",
-  "preheader": "Remember the designs that caught your eye? They're unlocked.",
-  "clone_from_email_id": "216751522376",
-  "note": "Personalized Day 3 replacement for contacts WITH gf_design_preferences (workflow branch). BODY LIVES IN A PROGRAMMABLE EMAIL MODULE (Design Manager: /email-mark/your-designs, id 216902164578) because contact properties resolve lazily in raw-HTML widgets — string filters/parsing silently no-op there. body.html here is the module source; the push script uploads it via the CMS source-code API. design_catalog.json is the slug->title/image map source.",
-  "email_id": "216897752981",
-  "cms_module_path": "email-mark/your-designs.module"
-}
