@@ -569,9 +569,11 @@ def update_reddit_ad_group_budget(
     _guard_write()
     _check_daily_budget(daily_budget_cents)
     obj = _require_mark_object("ad_group", ad_group_id, "change the budget")
+    # PATCH accepts only the changed value — resending goal_type errors
+    # with 'Unknown Attribute' (verified live).
     _patch(
         f"ad_groups/{ad_group_id}",
-        {"goal_type": "DAILY_SPEND", "goal_value": _cents_to_micros(daily_budget_cents)},
+        {"goal_value": _cents_to_micros(daily_budget_cents)},
     )
     return {
         "id": ad_group_id,
