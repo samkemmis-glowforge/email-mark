@@ -73,6 +73,12 @@ _CACHE_FILENAME = ".reddit_token_cache.json"
 
 
 def _cache_path() -> Optional[str]:
+    # REDDIT_TOKEN_CACHE_PATH lets deployments point the cache at a
+    # persistent disk (e.g. /data on Render) so token chain state
+    # survives restarts and deploys. Falls back to alongside .env.
+    override = os.environ.get("REDDIT_TOKEN_CACHE_PATH")
+    if override:
+        return override
     env_path = find_dotenv()
     if env_path:
         return os.path.join(os.path.dirname(env_path), _CACHE_FILENAME)
@@ -92,13 +98,18 @@ def _load_disk_cache() -> None:
             _token_cache.update(
                 access_token=data["access_token"], expires_at=float(data["expires_at"])
             )
+        # The cached refresh token is the newest link in the chain —
+        # newer than whatever a restarted process inherited from its env.
+        if data.get("refresh_token"):
+            os.environ["REDDIT_ADS_REFRESH_TOKEN"] = data["refresh_token"]
     except (ValueError, OSError):
         pass
 
 
 def save_token_cache(access_token: str, expires_in: int) -> None:
-    """Persist an access token for cross-process reuse. Also used by the
-    bootstrap script so the exchange's own access token isn't wasted."""
+    """Persist the access token AND current refresh token for reuse across
+    processes/restarts. Also used by the bootstrap script so the code
+    exchange's own access token isn't wasted."""
     _token_cache["access_token"] = access_token
     _token_cache["expires_at"] = time.time() + int(expires_in)
     path = _cache_path()
@@ -109,11 +120,34 @@ def save_token_cache(access_token: str, expires_in: int) -> None:
 
         with open(path, "w") as fh:
             _json.dump(
-                {"access_token": access_token, "expires_at": _token_cache["expires_at"]},
+                {
+                    "access_token": access_token,
+                    "expires_at": _token_cache["expires_at"],
+                    "refresh_token": os.environ.get("REDDIT_ADS_REFRESH_TOKEN"),
+                },
                 fh,
             )
     except OSError:
         pass
+
+
+def refresh_keepalive() -> bool:
+    """Force one refresh-token grant to keep the refresh token young.
+
+    Reddit refresh tokens die after roughly an hour of disuse (learned
+    live — every refresh inside the first hour succeeded, every one after
+    failed with an opaque 400). A long-running process should call this
+    every ~25 minutes; chain state persists via the token cache. Returns
+    True on success.
+    """
+    _load_disk_cache()
+    _token_cache["access_token"] = None  # force the refresh path
+    try:
+        _access_token()
+        return True
+    except RedditError as exc:
+        print(f"[reddit_client] keepalive refresh FAILED: {exc}", flush=True)
+        return False
 
 
 def _access_token() -> str:
@@ -142,11 +176,9 @@ def _access_token() -> str:
             f"persists, the refresh token was likely rotated and lost — re-run "
             f"scripts/reddit_oauth_bootstrap.py to mint a new one."
         )
-    save_token_cache(payload["access_token"], int(payload.get("expires_in", 3600)))
-    # Reddit ROTATES refresh tokens: a refresh response may carry a new
-    # refresh_token, and the old one is eventually invalidated. Losing the
-    # rotated value bricks auth (400 Bad Request on the next refresh), so
-    # persist it: process env always; the .env file when one exists.
+    # Reddit MAY rotate refresh tokens: a refresh response can carry a new
+    # refresh_token, invalidating the old one. Handle rotation BEFORE
+    # saving the cache so the cache always holds the newest chain link.
     rotated = payload.get("refresh_token")
     if rotated and rotated != refresh_token:
         os.environ["REDDIT_ADS_REFRESH_TOKEN"] = rotated
@@ -163,11 +195,12 @@ def _access_token() -> str:
             except OSError:
                 pass
         print(
-            "[reddit_client] refresh token ROTATED — new value persisted to "
-            "env/.env; update any external secret store (Render, environment "
-            "settings) with the new REDDIT_ADS_REFRESH_TOKEN.",
+            "[reddit_client] refresh token ROTATED — new value persisted; "
+            "update any external secret store (Render env) if this process "
+            "won't survive to keep the chain.",
             flush=True,
         )
+    save_token_cache(payload["access_token"], int(payload.get("expires_in", 3600)))
     return _token_cache["access_token"]
 
 

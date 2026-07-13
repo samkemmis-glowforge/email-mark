@@ -355,7 +355,33 @@ def handle_dm(event, say):
     )))
 
 
+def _start_reddit_keepalive() -> None:
+    """Keep the Reddit Ads refresh token alive from this long-running process.
+
+    Reddit refresh tokens die after ~1h of disuse, so ads tooling in
+    short-lived scripts kept losing auth. The bot process refreshes every
+    25 minutes; chain state persists to the token cache file
+    (REDDIT_TOKEN_CACHE_PATH — point it at a persistent disk in prod so
+    restarts resume the chain). No-op when Reddit creds aren't configured.
+    """
+    if not os.environ.get("REDDIT_ADS_REFRESH_TOKEN"):
+        return
+    import threading
+    import time
+
+    from email_mark import reddit_client
+
+    def _loop() -> None:
+        while True:
+            ok = reddit_client.refresh_keepalive()
+            logging.info("Reddit token keepalive: %s", "ok" if ok else "FAILED")
+            time.sleep(25 * 60)
+
+    threading.Thread(target=_loop, daemon=True, name="reddit-keepalive").start()
+
+
 def main() -> None:
+    _start_reddit_keepalive()
     handler = SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"])
     print("Bot starting... ctrl+C to stop.")
     handler.start()
