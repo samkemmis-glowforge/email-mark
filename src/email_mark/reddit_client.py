@@ -387,8 +387,38 @@ _VALID_OBJECTIVES = {
 }
 
 
-def create_reddit_campaign(*, name: str, objective: str = "CLICKS") -> Dict[str, Any]:
-    """Create a campaign — PAUSED, name-tagged. Budget lives on ad groups."""
+def get_servable_funding_instrument() -> str:
+    """Return the account's first servable funding instrument id.
+
+    Campaigns created without funding_instrument_id sit at zero delivery
+    with every status green and no error anywhere (learned live over four
+    dark days). reasons_not_servable on this endpoint is also the
+    diagnostic to check when delivery is mysteriously zero.
+    """
+    data = _get(f"ad_accounts/{_account()}/funding_instruments").get("data", [])
+    for fi in data:
+        if fi.get("is_servable"):
+            return str(fi["id"])
+    details = [(fi.get("id"), fi.get("reasons_not_servable")) for fi in data]
+    raise RedditError(
+        f"No servable funding instrument on the ad account — campaigns "
+        f"cannot deliver. Check billing in Reddit Ads Manager. Found: {details}"
+    )
+
+
+def create_reddit_campaign(
+    *,
+    name: str,
+    objective: str = "CLICKS",
+    funding_instrument_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Create a campaign — PAUSED, name-tagged. Budget lives on ad groups.
+
+    The funding instrument (campaign-level payment method) is REQUIRED
+    for delivery but not for creation; omitting it creates a campaign
+    that silently never serves. Auto-discovers the account's servable
+    instrument when not given.
+    """
     _guard_write()
     objective = (objective or "").strip().upper()
     if objective not in _VALID_OBJECTIVES:
@@ -397,6 +427,7 @@ def create_reddit_campaign(*, name: str, objective: str = "CLICKS") -> Dict[str,
         "name": _mark_name(name),
         "objective": objective,
         "configured_status": "PAUSED",
+        "funding_instrument_id": funding_instrument_id or get_servable_funding_instrument(),
     }
     result = _post(f"ad_accounts/{_account()}/campaigns", body).get("data", {})
     return {
