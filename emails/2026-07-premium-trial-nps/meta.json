@@ -1,0 +1,8 @@
+{
+  "name": "Premium Trial — NPS survey (automated)",
+  "subject": "How's your Premium trial going?",
+  "preheader": "One quick tap — how likely are you to recommend Glowforge Premium?",
+  "clone_from_email_id": "216751522376",
+  "note": "NPS survey. 0-10 buttons link to landing page /premium-nps?nps_score=N (HubSpot form GUID cac5e501-5d25-4433-8a13-5722fbb95502, prefills hidden nps_score, asks open-ended nps_reason). Writes nps_score/nps_reason to contact -> warehouse. Place near end of trial (~day 12).",
+  "email_id": "217550208018"
+}
