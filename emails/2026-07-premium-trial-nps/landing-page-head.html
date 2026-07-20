@@ -1,0 +1,26 @@
+<!-- Paste into the /premium-nps landing page: Settings → Advanced options →
+     "Head HTML" (aka Additional code snippets → Head), then publish.
+
+     Option A "capture score on load": reads ?nps_score=N&email=... from the
+     URL and submits {email, nps_score} to the Premium Trial NPS Survey form
+     the instant the page loads — so a tap in the email records the score even
+     if the visitor never fills in / submits the comment. The visible form
+     still collects the open-ended nps_reason as an optional second step.
+     sessionStorage guards against double-firing on refresh. Submits only to
+     HubSpot's own form endpoint; no third parties. -->
+<script>
+(function(){try{
+  var q=new URLSearchParams(window.location.search);
+  var score=q.get('nps_score'), email=q.get('email');
+  if(score===null||score===''||!email) return;
+  var key='npsCap:'+email+':'+score;
+  if(sessionStorage.getItem(key)) return;
+  fetch('https://api.hsforms.com/submissions/v3/integration/submit/8614495/cac5e501-5d25-4433-8a13-5722fbb95502',{
+    method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({fields:[
+      {objectTypeId:'0-1',name:'email',value:email},
+      {objectTypeId:'0-1',name:'nps_score',value:score}
+    ],context:{pageUri:window.location.href,pageName:'Premium Trial NPS Survey'}})
+  }).then(function(r){ if(r.ok) sessionStorage.setItem(key,'1'); }).catch(function(){});
+}catch(e){}})();
+</script>
