@@ -50,6 +50,33 @@ def _token() -> str:
     return token
 
 
+_page_token_cache: Optional[str] = None
+
+
+def _page_token() -> str:
+    """Token for Page-scoped endpoints (insights, posts, feed, photos).
+
+    Page endpoints reject plain user/system-user tokens. When
+    META_ACCESS_TOKEN is a system-user token (the org-owned setup), the
+    Page token is derived once via GET /{page_id}?fields=access_token and
+    cached for the process lifetime; a Page token derived from a
+    never-expiring system-user token never expires either. If the exchange
+    fails, fall back to META_ACCESS_TOKEN itself — correct when it already
+    IS a Page token (the legacy setup).
+    """
+    global _page_token_cache
+    if _page_token_cache:
+        return _page_token_cache
+    page_id = _require("META_PAGE_ID", "derive a Page access token")
+    try:
+        data = _get(page_id, {"fields": "access_token"})
+        tok = data.get("access_token")
+    except MetaError:
+        tok = None
+    _page_token_cache = tok or _token()
+    return _page_token_cache
+
+
 def _require(env_var: str, human: str) -> str:
     val = os.environ.get(env_var)
     if not val:
@@ -132,11 +159,9 @@ def get_page_insights(
     page_id = _require("META_PAGE_ID", "read Facebook Page insights")
     # Late-2025 Meta purge killed `page_impressions*`, `page_fans`,
     # `page_views_total`, `page_fan_adds`, `page_consumptions`. These four
-    # are the empirically-confirmed survivors as of v21.0. Also note:
-    # Page Insights REQUIRE a Page Access Token (not a System User token).
-    # Generate via GET /me/accounts with your system user token; the
-    # `access_token` field in the response for your Page is what goes
-    # in META_ACCESS_TOKEN.
+    # are the empirically-confirmed survivors as of v21.0. Page Insights
+    # REQUIRE a Page Access Token — _page_token() derives it from the
+    # system-user token automatically.
     metrics = metrics or [
         "page_post_engagements",
         "page_video_views",
@@ -147,7 +172,8 @@ def get_page_insights(
     since = since or (date.today() - timedelta(days=28)).isoformat()
     data = _get(
         f"{page_id}/insights",
-        {"metric": ",".join(metrics), "since": since, "until": until, "period": period},
+        {"metric": ",".join(metrics), "since": since, "until": until,
+         "period": period, "access_token": _page_token()},
     )
     return {"since": since, "until": until, "metrics": data.get("data", [])}
 
@@ -251,7 +277,10 @@ def get_recent_posts(*, platform: str = "facebook", limit: int = 10) -> Dict[str
         "id,message,created_time,permalink_url,"
         "insights.metric(post_impressions,post_engaged_users){name,values}"
     )
-    data = _get(f"{page_id}/posts", {"fields": fields, "limit": limit})
+    data = _get(
+        f"{page_id}/posts",
+        {"fields": fields, "limit": limit, "access_token": _page_token()},
+    )
     return {"platform": "facebook", "posts": data.get("data", [])}
 
 
@@ -520,8 +549,11 @@ def publish_facebook_post(
     _guard_publish()
     page_id = _require("META_PAGE_ID", "publish to the Facebook Page")
     if image_url:
-        return _post(f"{page_id}/photos", {"caption": message, "url": image_url})
-    return _post(f"{page_id}/feed", {"message": message})
+        return _post(
+            f"{page_id}/photos",
+            {"caption": message, "url": image_url, "access_token": _page_token()},
+        )
+    return _post(f"{page_id}/feed", {"message": message, "access_token": _page_token()})
 
 
 def draft_facebook_post(
@@ -574,7 +606,7 @@ def draft_facebook_post(
     if image_bytes is not None:
         photo = _post_multipart(
             f"{page_id}/photos",
-            {"published": "false"},
+            {"published": "false", "access_token": _page_token()},
             image_bytes=image_bytes,
             image_filename=image_filename,
             image_mime=image_mime,
@@ -583,7 +615,7 @@ def draft_facebook_post(
     elif image_url:
         photo = _post(
             f"{page_id}/photos",
-            {"published": "false", "url": image_url},
+            {"published": "false", "url": image_url, "access_token": _page_token()},
         )
         media_fbid = photo.get("id")
 
@@ -591,6 +623,7 @@ def draft_facebook_post(
         "message": message,
         "published": "false",
         "scheduled_publish_time": scheduled_publish_time,
+        "access_token": _page_token(),
     }
     if media_fbid:
         # Meta accepts attached_media as a JSON-encoded list of refs.
