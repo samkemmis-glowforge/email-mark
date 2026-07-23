@@ -30,8 +30,10 @@ ENV_FILE="${ENV_FILE:-}"
 
 # --- Config lookup: shell env first, then the env file ---
 _from_file() {
+  # Never returns non-zero: a var absent from the file is just "empty",
+  # not an error (set -e would otherwise silently kill the script here).
   [ -n "${ENV_FILE}" ] && [ -f "${ENV_FILE}" ] || return 0
-  grep -m1 "^$1=" "${ENV_FILE}" | cut -d= -f2-
+  { grep -m1 "^$1=" "${ENV_FILE}" || true; } | cut -d= -f2-
 }
 cfg() {
   local v="${!1:-}"
