@@ -99,10 +99,22 @@ def _load_credentials(scopes: list):
             path, scopes=scopes
         )
 
+    # Cloud Run / GCE: no key file and no env JSON. Fall back to the runtime
+    # service account's Application Default Credentials, so no downloaded key
+    # is needed in production (the service runs AS marketing-slack-bot).
+    try:
+        import google.auth
+
+        creds, _ = google.auth.default(scopes=scopes)
+        return creds
+    except Exception:
+        pass
+
     raise DriveError(
         "No Google service-account credentials found. Set either "
         "GCP_SERVICE_ACCOUNT_JSON (entire JSON key as an env var) or "
-        "GOOGLE_APPLICATION_CREDENTIALS (path to the JSON key file). "
+        "GOOGLE_APPLICATION_CREDENTIALS (path to the JSON key file), or run "
+        "on a host with Application Default Credentials (Cloud Run). "
         "Then share the relevant Drive folders with the service "
         "account's client_email."
     )

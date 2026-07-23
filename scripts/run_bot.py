@@ -355,7 +355,34 @@ def handle_dm(event, say):
     )))
 
 
+def _start_health_listener() -> None:
+    """Bind $PORT so Cloud Run's startup probe passes.
+
+    Socket Mode holds an outbound WebSocket and needs no inbound port, but
+    Cloud Run kills any container that doesn't listen on $PORT at startup.
+    A tiny always-200 server on a daemon thread satisfies the probe.
+    """
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    import threading
+
+    port = int(os.environ.get("PORT", "8080"))
+
+    class _Health(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, *args):  # silence per-request access logs
+            pass
+
+    server = HTTPServer(("0.0.0.0", port), _Health)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    logging.info("health listener on :%d", port)
+
+
 def main() -> None:
+    _start_health_listener()
     handler = SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"])
     print("Bot starting... ctrl+C to stop.")
     handler.start()
