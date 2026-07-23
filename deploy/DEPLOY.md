@@ -113,3 +113,11 @@ Then DM the bot or @-mention it in Slack.
   would open a duplicate Slack socket.
 - In-memory conversation state resets on redeploy; the bot rehydrates thread
   history from Slack on the next message, so this is invisible to users.
+
+## Cron job: materials → Proofgrade sync
+
+The old Render cron (daily 09:00 UTC, `python scripts/sync_materials_to_proofgrade.py`)
+is ported by `deploy/cron_jobs.sh`: a Cloud Run job on a Cloud Scheduler trigger,
+running as `marketing-slack-bot` (keyless BigQuery + HubSpot key from Secret
+Manager). Deploy with `./deploy/cron_jobs.sh`; test with
+`gcloud run jobs execute email-mark-materials-sync --region us-central1 --wait`.
